@@ -1,0 +1,53 @@
+{
+  "ObjectDetection": {
+    "enabled": true,
+    "enable_perf_log": true,
+    "perf_log_every_n": 300,
+    "debug_publish_raw_objects": false,
+    "loop_sleep_ms": 20,
+    "backend": "rknn",
+    "platform_profile": "orangepi5b_rk3588",
+    "strict_config_validation": true,
+    "model_root": "/home/orangepi/Desktop/TMVisionary/models",
+    "detectors": "person_primary,pallet_primary,cad_table_primary",
+    "source_name": "CameraRGBD",
+    "image_encoding": "bgr8",
+    "default_interval_ms": 100,
+    "default_confidence_threshold": 0.45,
+    "default_nms_threshold": 0.45,
+    "default_max_detections": 50
+  },
+  "ObjectDetection_person_primary": {
+    "enabled": true,
+    "model_package": "object_detection/person/v1",
+    "model_variant": "fp",
+    "enabled_classes": "person",
+    "application": "none",
+    "interval_ms": 100,
+    "confidence_threshold": 0.45,
+    "nms_threshold": 0.45,
+    "max_detections": 50
+  },
+  "ObjectDetection_pallet_primary": {
+    "enabled": true,
+    "model_package": "object_detection/pallet/v3",
+    "model_variant": "int8",
+    "enabled_classes": "block,front",
+    "application": "pallet",
+    "interval_ms": 200,
+    "confidence_threshold": 0.60,
+    "nms_threshold": 0.70,
+    "max_detections": 50
+  },
+  "ObjectDetection_cad_table_primary": {
+    "enabled": true,
+    "model_package": "object_detection/cad_pose/table_cad/v1",
+    "model_variant": "fp16",
+    "enabled_classes": "table",
+    "application": "cad_pose",
+    "interval_ms": 50,
+    "confidence_threshold": 0.35,
+    "nms_threshold": 0.45,
+    "max_detections": 10
+  }
+}

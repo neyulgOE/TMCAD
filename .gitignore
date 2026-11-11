@@ -1,0 +1,44 @@
+# Build directories
+build/
+bin/
+*.o
+*.a
+*.so
+*.so.*
+
+# Third-party precompiled heavy libraries (>100MB)
+libs/
+
+# Datasets and bag recordings
+dataset/
+*.bag
+*.zip
+*.tar.gz
+*.7z
+
+# Debug and temporary logs
+debug/
+logs/
+MUJOCO_LOG.TXT
+*.log
+dump_*.png
+dump_meta.txt
+
+# CAD preprocessor generated cache files
+*.cadasset
+CAD_DATA/*/*.npz
+CAD_DATA/engine_block/*.ply
+CAD_DATA/TABLE-DEMO/*.ply
+
+# Python bytecode and checkpoints
+__pycache__/
+*.py[cod]
+*$py.class
+deep_learning/checkpoints/
+
+# IDE and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

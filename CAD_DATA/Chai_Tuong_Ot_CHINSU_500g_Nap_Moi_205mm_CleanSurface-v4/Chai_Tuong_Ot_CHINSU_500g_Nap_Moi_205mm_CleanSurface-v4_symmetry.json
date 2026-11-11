@@ -1,0 +1,25 @@
+{
+    "cad_name": "Chai_Tuong_Ot_CHINSU_500g_Nap_Moi_205mm_CleanSurface-v4",
+    "is_symmetric": false,
+    "symmetry_transforms": [
+        [
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1
+        ]
+    ],
+    "symmetry_type": "None"
+}

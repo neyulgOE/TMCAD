@@ -1,0 +1,117 @@
+    // ─────────────────────────────────────────────────────────────────────────
+    // 1. Draw 3D Structural CAD Frame (Upper Beams Box + 4 Legs + Base)
+    // ─────────────────────────────────────────────────────────────────────────
+    const double cad_x0 = _cad_min[0], cad_x1 = _cad_max[0];
+    const double cad_y0 = _cad_min[1], cad_y1 = _cad_max[1];
+    const double z_top  = _cad_max[2];
+    const double z_bot  = _cad_min[2];
+    const double z_beam = std::clamp(_beam_z, z_bot, z_top);
+
+    auto proj = [&](double x, double y, double z) -> cv::Point {
+        cv::Vec3d pt_cam = pose.R * cv::Vec3d(x, y, z) + pose.t;
+        double z_eff = std::max(0.05, pt_cam[2]);
+        int u = static_cast<int>(std::round(intr.fx * pt_cam[0] / z_eff + intr.ppx));
+        int v = static_cast<int>(std::round(intr.fy * pt_cam[1] / z_eff + intr.ppy));
+        return cv::Point(u, v);
+    };
+
+    // Determine which CAD X side faces the camera (front face has smaller Z in camera coordinates)
+    cv::Vec3d p_pos = pose.R * cv::Vec3d(cad_x1, 0, 0) + pose.t;
+    cv::Vec3d p_neg = pose.R * cv::Vec3d(cad_x0, 0, 0) + pose.t;
+    const double x_front = (p_pos[2] < p_neg[2]) ? cad_x1 : cad_x0;
+    const double x_rear  = (p_pos[2] < p_neg[2]) ? cad_x0 : cad_x1;
+
+    // 4 corners of FRONT FACE (hình bình hành / tứ giác phối cảnh mặt trước: W=830mm, H=505mm)
+    cv::Point p_f_tr = proj(x_front, cad_y0, z_top);
+    cv::Point p_f_tl = proj(x_front, cad_y1, z_top);
+    cv::Point p_f_bl = proj(x_front, cad_y1, z_bot);
+    cv::Point p_f_br = proj(x_front, cad_y0, z_bot);
+    std::vector<cv::Point> poly_front_face = {p_f_tr, p_f_tl, p_f_bl, p_f_br};
+
+    // 4 corners of REAR FACE (mặt sau: lùi sâu D=440mm)
+    cv::Point p_r_tr = proj(x_rear, cad_y0, z_top);
+    cv::Point p_r_tl = proj(x_rear, cad_y1, z_top);
+    cv::Point p_r_bl = proj(x_rear, cad_y1, z_bot);
+    cv::Point p_r_br = proj(x_rear, cad_y0, z_bot);
+    std::vector<cv::Point> poly_rear_face = {p_r_tr, p_r_tl, p_r_bl, p_r_br};
+
+    // Tabletop surface (mặt trên)
+    std::vector<cv::Point> poly_top = {p_f_tr, p_f_tl, p_r_tl, p_r_tr};
+
+    // Floor contact frame (mặt đáy tiếp xúc sàn - nối 4 chân)
+    std::vector<cv::Point> poly_floor = {p_f_bl, p_f_br, p_r_br, p_r_bl};
+
+    // Horizontal beam underside
+    cv::Point p_f_beam_tr = proj(x_front, cad_y0, z_beam);
+    cv::Point p_f_beam_tl = proj(x_front, cad_y1, z_beam);
+    cv::Point p_r_beam_tr = proj(x_rear, cad_y0, z_beam);
+    cv::Point p_r_beam_tl = proj(x_rear, cad_y1, z_beam);
+    std::vector<cv::Point> poly_front_beam = {p_f_tr, p_f_tl, p_f_beam_tl, p_f_beam_tr};
+
+    bool valid_pts = true;
+    for (const auto& pt : poly_front_face) {
+        if (pt.x < -400 || pt.x > img.cols + 400 || pt.y < -400 || pt.y > img.rows + 400) {
+            valid_pts = false; break;
+        }
+    }
+    for (const auto& pt : poly_rear_face) {
+        if (pt.x < -400 || pt.x > img.cols + 400 || pt.y < -400 || pt.y > img.rows + 400) {
+            valid_pts = false; break;
+        }
+    }
+
+    if (valid_pts) {
+        const cv::Scalar front_highlight(0, 255, 255);
+        const cv::Scalar cyan(255, 229, 0);
+        const cv::Scalar neon_green(0, 255, 0);
+        const cv::Scalar rear_green(0, 255, 128);
+        const cv::Scalar extrude_color(0, 165, 255);
+        const cv::Scalar white(255, 255, 255);
+
+        cv::Mat overlay = img.clone();
+
+        // 1a. Shaded Tabletop (Top face)
+        cv::fillConvexPoly(overlay, poly_top, cyan);
+
+        // 1b. Shaded Upper Beam band (golden front) - only the beam, not the empty air under the table!
+        cv::fillConvexPoly(overlay, poly_front_beam, front_highlight);
+
+        cv::addWeighted(overlay, 0.30, img, 0.70, 0, img);
+
+        // 1c. Floor Contact Frame (Mặt đáy tiếp xúc sàn - xanh lá sáng nối 4 chân)
+        cv::polylines(img, poly_floor, true, neon_green, 2, cv::LINE_AA);
+
+        // 1d. Tabletop Frame (Mặt trên bàn - Cyan)
+        cv::polylines(img, poly_top, true, cyan, 2, cv::LINE_AA);
+
+        // 1e. 3D Depth Extrusion Lines (4 đường nối mặt trước ra mặt sau)
+        cv::line(img, p_f_tr, p_r_tr, extrude_color, 2, cv::LINE_AA);
+        cv::line(img, p_f_tl, p_r_tl, extrude_color, 2, cv::LINE_AA);
+        cv::line(img, p_f_br, p_r_br, extrude_color, 2, cv::LINE_AA);
+        cv::line(img, p_f_bl, p_r_bl, extrude_color, 2, cv::LINE_AA);
+
+        // 1f. Rear Face Frame (Mặt sau - xanh neon rõ nét)
+        cv::polylines(img, poly_rear_face, true, rear_green, 2, cv::LINE_AA);
+
+        // 1g. 4 Vertical Legs (Chân bàn)
+        // 2 Front legs (chân trước): dày và nổi bật
+        cv::line(img, p_f_tl, p_f_bl, front_highlight, 3, cv::LINE_AA);
+        cv::line(img, p_f_tr, p_f_br, front_highlight, 3, cv::LINE_AA);
+        // 2 Rear legs (chân sau)
+        cv::line(img, p_r_tl, p_r_bl, rear_green, 2, cv::LINE_AA);
+        cv::line(img, p_r_tr, p_r_br, rear_green, 2, cv::LINE_AA);
+
+        // 1h. Front Face Frame Quadrangle
+        cv::polylines(img, poly_front_face, true, front_highlight, 3, cv::LINE_AA);
+        cv::polylines(img, poly_front_beam, true, white, 1, cv::LINE_AA);
+
+        // 1i. 4 Feet Pads on Floor (Đế chân bàn chạm sàn)
+        for (const auto& pt : poly_floor) {
+            cv::circle(img, pt, 5, front_highlight, -1, cv::LINE_AA);
+            cv::circle(img, pt, 7, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+        }
+        // Top corners
+        for (const auto& pt : poly_top) {
+            cv::circle(img, pt, 4, white, -1, cv::LINE_AA);
+        }
+    }

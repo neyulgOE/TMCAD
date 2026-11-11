@@ -1,0 +1,87 @@
+{
+  "schema_version": 2,
+  "model_id": "table_cad_v1",
+  "model_name": "CAD-Native 6DoF Pose Estimator",
+  "version": "v1",
+  "task_type": "cad_6dof",
+  "object_type": "table",
+  "adapter": "cad_hierarchy_v1",
+  "camera_mechanical_offset": {
+    "depth_to_front_glass_centerline_x_m": 0.0175,
+    "depth_to_front_glass_centerline_y_m": 0.0,
+    "depth_to_front_glass_z_m": 0.0
+  },
+  "cad_metadata": {
+    "cad_name": "TABLE-DEMO",
+    "descriptors_bin": "cad_data/TABLE-DEMO_cad_descriptors.bin",
+    "centroids_npy": "cad_data/TABLE-DEMO_key_centroids.npy",
+    "dimensions_json": "cad_data/table_dimensions.json",
+    "tabletop_center_offset_z_m": 0.1665,
+    "ground_contact_offset_z_m": -0.3385
+  },
+  "input": {
+    "num_inputs": 2,
+    "format": "static_graph_point_cloud",
+    "type": "heterogeneous"
+  },
+  "inputs": [
+    {
+      "name": "obs_pts",
+      "shape": [1, 3, 1024],
+      "format": "point_cloud_3d",
+      "layout": "ncw",
+      "type": "float32"
+    },
+    {
+      "name": "idx",
+      "shape": [1024, 20],
+      "format": "knn_indices_2d",
+      "layout": "hw",
+      "type": "int64"
+    }
+  ],
+  "output": {
+    "type": "cad_hierarchy_v1",
+    "num_classes": 1,
+    "descriptors": {
+      "name": "obs_descriptors",
+      "shape": [1, 1024, 128],
+      "type": "float32"
+    }
+  },
+  "labels": "labels.txt",
+  "metadata": {
+    "runtime_role": "cad_6dof_pose",
+    "representation": "table_cad_demo"
+  },
+  "artifacts": {
+    "profiles": {
+      "orangepi5b_rk3588": {
+        "profile_id": "orangepi5b_rk3588",
+        "backend": "rknn",
+        "target_platform": "rk3588",
+        "default": "fp16",
+        "default_variant": "fp16",
+        "variants": {
+          "fp16": "artifacts/orangepi5b_rk3588/model_obs_rk3588.rknn"
+        },
+        "inputs": [
+          {
+            "name": "obs_pts",
+            "shape": [1, 3, 1024],
+            "format": "point_cloud_3d",
+            "layout": "ncw",
+            "type": "float32"
+          },
+          {
+            "name": "idx",
+            "shape": [1024, 20],
+            "format": "knn_indices_2d",
+            "layout": "hw",
+            "type": "int64"
+          }
+        ]
+      }
+    }
+  }
+}

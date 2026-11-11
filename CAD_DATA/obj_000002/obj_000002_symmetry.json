@@ -1,0 +1,25 @@
+{
+    "cad_name": "obj_000002",
+    "is_symmetric": false,
+    "symmetry_transforms": [
+        [
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1
+        ]
+    ],
+    "symmetry_type": "None"
+}

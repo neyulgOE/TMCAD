@@ -1,0 +1,31 @@
+{
+  "ObjectDetection": {
+    "enabled": true,
+    "enable_perf_log": true,
+    "perf_log_every_n": 300,
+    "debug_publish_raw_objects": false,
+    "loop_sleep_ms": 20,
+    "backend": "rknn",
+    "platform_profile": "orangepi5b_rk3588",
+    "strict_config_validation": true,
+    "model_root": "/home/orangepi/Desktop/TMVisionary/models",
+    "detectors": "cad_table_primary",
+    "source_name": "CameraRGBD",
+    "image_encoding": "bgr8",
+    "default_interval_ms": 50,
+    "default_confidence_threshold": 0.35,
+    "default_nms_threshold": 0.45,
+    "default_max_detections": 10
+  },
+  "ObjectDetection_cad_table_primary": {
+    "enabled": true,
+    "model_package": "object_detection/cad_pose/table_cad/v1",
+    "model_variant": "fp16",
+    "enabled_classes": "table",
+    "application": "cad_pose",
+    "interval_ms": 50,
+    "confidence_threshold": 0.35,
+    "nms_threshold": 0.45,
+    "max_detections": 10
+  }
+}

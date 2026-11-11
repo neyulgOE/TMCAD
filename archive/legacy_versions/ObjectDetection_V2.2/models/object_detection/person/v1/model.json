@@ -1,0 +1,46 @@
+{
+  "schema_version": 2,
+  "model_id": "person_v1",
+  "model_name": "Person Detector V1",
+  "version": "v1",
+  "task_type": "bbox",
+  "object_type": "person",
+  "adapter": "cxcywh_class_scores_v1",
+  "preprocess": {
+    "type": "letterbox",
+    "mean": [0, 0, 0],
+    "std": [255, 255, 255],
+    "padding_value": 114,
+    "keep_aspect_ratio": true
+  },
+  "output": {
+    "type": "cxcywh_class_scores_v1",
+    "num_classes": 80
+  },
+  "labels": "labels.txt",
+  "metadata": {
+    "runtime_role": "person_detection",
+    "representation": "coco80"
+  },
+  "artifacts": {
+    "profiles": {
+      "orangepi5b_rk3588": {
+        "backend": "rknn",
+        "target_platform": "rk3588",
+        "default": "int8",
+        "variants": {
+          "fp": "artifacts/orangepi5b_rk3588/model_fp.rknn",
+          "int8": "artifacts/orangepi5b_rk3588/model_int8.rknn"
+        },
+        "input": {
+          "width": 640,
+          "height": 640,
+          "channels": 3,
+          "format": "RGB",
+          "layout": "NHWC",
+          "type": "uint8"
+        }
+      }
+    }
+  }
+}
