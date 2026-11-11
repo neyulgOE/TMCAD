@@ -161,6 +161,11 @@ private:
                                 double min_edge_len_m = 0.008);
     bool unpackBlackBoxOnnx();
 
+    bool loadUniversalCadProfile(const std::string& profile_json_path);
+    void refinePoseUniversalCrease2D3D(TablePose& pose,
+                                       const cv::Mat& rgb,
+                                       const CameraIntrinsics& intr) const;
+
     TablePose refinePoseWith2DEdges(const TablePose& init_pose,
                                     const cv::Mat& rgb,
                                     const CameraIntrinsics& intr,
@@ -224,6 +229,12 @@ private:
     std::string _model_name = "TABLE-DEMO";
     std::string _loaded_onnx_path;
     bool _is_table_frame = true;
+    bool _is_floor_standing = true;
+    bool _enable_2d_frame_anchor = true;
+    std::string _topology_type = "FRAME_HOLLOW";
+    double _real_bounding_diag_m = 1.07;
+    std::vector<cv::Vec3f> _crease_pts_3d;
+    std::vector<cv::Vec3f> _crease_normals_3d;
     int _symmetry_code = 1;
     double _plate_h = 0.0055;
     double _beam_h = 0.0455;

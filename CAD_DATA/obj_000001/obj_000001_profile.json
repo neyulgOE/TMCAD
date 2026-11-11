@@ -1,0 +1,37 @@
+{
+  "cad_name": "obj_000001",
+  "topology_type": "COMPLEX_SOLID",
+  "placement_mode": "FREE_6DOF",
+  "real_bounding_diag_m": 0.128074,
+  "extents_xyz_m": [
+    0.071121,
+    0.066056,
+    0.083555
+  ],
+  "cad_min_xyz_m": [
+    -0.031528,
+    -0.03278,
+    -0.051029
+  ],
+  "cad_max_xyz_m": [
+    0.039593,
+    0.033276,
+    0.032526
+  ],
+  "top_offset_z_m": 0.032526,
+  "bottom_offset_z_m": -0.051029,
+  "surface_area_m2": 0.025726,
+  "bbox_fill_ratio": 0.6093,
+  "num_triangles": 13860,
+  "num_crease_points": 1200,
+  "adaptive_solver_params": {
+    "voxel_size_m": 0.001,
+    "ransac_thresh_m": 0.00448,
+    "icp_coarse_corr_m": 0.006,
+    "icp_fine_corr_m": 0.0025,
+    "cluster_merge_dx_m": 0.0768,
+    "cluster_merge_dz_m": 0.0826,
+    "enable_2d_frame_anchor": false,
+    "enable_2d_crease_refinement": true
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "cad_name": "Chai_Tuong_Ot_CHINSU_500g_Nap_Moi_205mm_CleanSurface-v4",
+  "topology_type": "COMPLEX_SOLID",
+  "placement_mode": "FREE_6DOF",
+  "real_bounding_diag_m": 0.235,
+  "extents_xyz_m": [
+    0.096332,
+    0.06261,
+    0.205
+  ],
+  "cad_min_xyz_m": [
+    -0.04816,
+    -0.031305,
+    -0.106184
+  ],
+  "cad_max_xyz_m": [
+    0.048172,
+    0.031305,
+    0.098816
+  ],
+  "top_offset_z_m": 0.098816,
+  "bottom_offset_z_m": -0.106184,
+  "surface_area_m2": 0.048555,
+  "bbox_fill_ratio": 0.5777,
+  "num_triangles": 101880,
+  "num_crease_points": 1200,
+  "adaptive_solver_params": {
+    "voxel_size_m": 0.00129,
+    "ransac_thresh_m": 0.00822,
+    "icp_coarse_corr_m": 0.01057,
+    "icp_fine_corr_m": 0.00423,
+    "cluster_merge_dx_m": 0.104,
+    "cluster_merge_dz_m": 0.0783,
+    "enable_2d_frame_anchor": false,
+    "enable_2d_crease_refinement": true
+  }
+}

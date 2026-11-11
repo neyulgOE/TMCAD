@@ -1,0 +1,37 @@
+{
+  "cad_name": "ASYMMETRIC",
+  "topology_type": "COMPLEX_SOLID",
+  "placement_mode": "FREE_6DOF",
+  "real_bounding_diag_m": 1.136438,
+  "extents_xyz_m": [
+    0.6,
+    0.682455,
+    0.682455
+  ],
+  "cad_min_xyz_m": [
+    -0.3,
+    -0.341228,
+    -0.341228
+  ],
+  "cad_max_xyz_m": [
+    0.3,
+    0.341228,
+    0.341228
+  ],
+  "top_offset_z_m": 0.341228,
+  "bottom_offset_z_m": -0.341228,
+  "surface_area_m2": 1.507246,
+  "bbox_fill_ratio": 0.2166,
+  "num_triangles": 224,
+  "num_crease_points": 1200,
+  "adaptive_solver_params": {
+    "voxel_size_m": 0.00625,
+    "ransac_thresh_m": 0.03978,
+    "icp_coarse_corr_m": 0.05114,
+    "icp_fine_corr_m": 0.02046,
+    "cluster_merge_dx_m": 0.7371,
+    "cluster_merge_dz_m": 0.75,
+    "enable_2d_frame_anchor": false,
+    "enable_2d_crease_refinement": true
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "cad_name": "Nap_Moi_CHINSU_250g",
+  "topology_type": "COMPLEX_SOLID",
+  "placement_mode": "FREE_6DOF",
+  "real_bounding_diag_m": 0.070987,
+  "extents_xyz_m": [
+    0.036319,
+    0.036319,
+    0.049
+  ],
+  "cad_min_xyz_m": [
+    -0.017908,
+    -0.01816,
+    -0.022214
+  ],
+  "cad_max_xyz_m": [
+    0.01841,
+    0.018159,
+    0.026786
+  ],
+  "top_offset_z_m": 0.026786,
+  "bottom_offset_z_m": -0.022214,
+  "surface_area_m2": 0.006089,
+  "bbox_fill_ratio": 0.4513,
+  "num_triangles": 61200,
+  "num_crease_points": 1200,
+  "adaptive_solver_params": {
+    "voxel_size_m": 0.001,
+    "ransac_thresh_m": 0.004,
+    "icp_coarse_corr_m": 0.006,
+    "icp_fine_corr_m": 0.0025,
+    "cluster_merge_dx_m": 0.0392,
+    "cluster_merge_dz_m": 0.0454,
+    "enable_2d_frame_anchor": false,
+    "enable_2d_crease_refinement": true
+  }
+}

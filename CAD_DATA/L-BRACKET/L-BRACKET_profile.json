@@ -1,0 +1,37 @@
+{
+  "cad_name": "L-BRACKET",
+  "topology_type": "COMPLEX_SOLID",
+  "placement_mode": "FREE_6DOF",
+  "real_bounding_diag_m": 0.87178,
+  "extents_xyz_m": [
+    0.6,
+    0.6,
+    0.2
+  ],
+  "cad_min_xyz_m": [
+    -0.3,
+    -0.3,
+    -0.1
+  ],
+  "cad_max_xyz_m": [
+    0.3,
+    0.3,
+    0.1
+  ],
+  "top_offset_z_m": 0.1,
+  "bottom_offset_z_m": -0.1,
+  "surface_area_m2": 0.8,
+  "bbox_fill_ratio": 0.3194,
+  "num_triangles": 36,
+  "num_crease_points": 1200,
+  "adaptive_solver_params": {
+    "voxel_size_m": 0.00479,
+    "ransac_thresh_m": 0.03051,
+    "icp_coarse_corr_m": 0.03923,
+    "icp_fine_corr_m": 0.01569,
+    "cluster_merge_dx_m": 0.648,
+    "cluster_merge_dz_m": 0.75,
+    "enable_2d_frame_anchor": false,
+    "enable_2d_crease_refinement": true
+  }
+}

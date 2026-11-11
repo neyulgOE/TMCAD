@@ -433,6 +433,136 @@ bool TablePoseEstimator::unpackBlackBoxOnnx()
     }
 }
 
+bool TablePoseEstimator::loadUniversalCadProfile(const std::string& profile_json_path)
+{
+    std::ifstream ifs(profile_json_path);
+    if (!ifs.is_open()) return false;
+    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+
+    auto extractNumber = [&](const std::string& key, double default_val) -> double {
+        size_t pos = content.find("\"" + key + "\"");
+        if (pos == std::string::npos) return default_val;
+        size_t colon = content.find(':', pos);
+        if (colon == std::string::npos) return default_val;
+        try {
+            return std::stod(content.substr(colon + 1));
+        } catch (...) {
+            return default_val;
+        }
+    };
+
+    auto extractVec3 = [&](const std::string& key, cv::Vec3d& out_vec) -> bool {
+        size_t pos = content.find("\"" + key + "\"");
+        if (pos == std::string::npos) return false;
+        size_t lb = content.find('[', pos);
+        size_t rb = content.find(']', lb);
+        if (lb == std::string::npos || rb == std::string::npos) return false;
+        std::string arr = content.substr(lb + 1, rb - lb - 1);
+        std::replace(arr.begin(), arr.end(), ',', ' ');
+        std::istringstream iss(arr);
+        return static_cast<bool>(iss >> out_vec[0] >> out_vec[1] >> out_vec[2]);
+    };
+
+    extractVec3("cad_min_xyz_m", _cad_min);
+    extractVec3("cad_max_xyz_m", _cad_max);
+    _top_z = extractNumber("top_offset_z_m", _cad_max[2]);
+    _bot_z = extractNumber("bottom_offset_z_m", _cad_min[2]);
+    _cad_min[2] = _bot_z;
+    _cad_max[2] = _top_z;
+
+    _half_w = 0.5 * (_cad_max[0] - _cad_min[0]);
+    _half_l = 0.5 * (_cad_max[1] - _cad_min[1]);
+
+    _real_bounding_diag_m = extractNumber("real_bounding_diag_m", 2.0 * std::hypot(_half_w, _half_l));
+    _is_floor_standing = (content.find("\"FLOOR_STANDING\"") != std::string::npos);
+    _enable_2d_frame_anchor = (content.find("\"enable_2d_frame_anchor\": true") != std::string::npos);
+    _is_table_frame = _is_floor_standing;
+    _topology_type = (content.find("\"FRAME_HOLLOW\"") != std::string::npos) ? "FRAME_HOLLOW" : "COMPLEX_SOLID";
+
+    std::cout << "[TablePoseEstimator] Loaded Universal CAD Profile (" << profile_json_path << "):\n"
+              << "  -> Bounds: [" << _cad_min[0] << ", " << _cad_min[1] << ", " << _cad_min[2] << "] to ["
+              << _cad_max[0] << ", " << _cad_max[1] << ", " << _cad_max[2] << "] m\n"
+              << "  -> Diag: " << _real_bounding_diag_m << " m, Mode: " << (_is_floor_standing ? "FLOOR_STANDING" : "FREE_6DOF")
+              << ", FrameAnchor: " << (_enable_2d_frame_anchor ? "YES" : "NO") << std::endl;
+    return true;
+}
+
+void TablePoseEstimator::refinePoseUniversalCrease2D3D(TablePose& pose,
+                                                       const cv::Mat& rgb,
+                                                       const CameraIntrinsics& intr) const
+{
+    if (!pose.valid || rgb.empty() || _cad_feature_edges.empty()) return;
+
+    cv::Mat gray, edges, binary_inv, dist_map;
+    if (rgb.channels() == 3) {
+        cv::cvtColor(rgb, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = rgb;
+    }
+    cv::GaussianBlur(gray, gray, cv::Size(3, 3), 0.8);
+    cv::Canny(gray, edges, 40.0, 120.0);
+    cv::threshold(edges, binary_inv, 127, 255, cv::THRESH_BINARY_INV);
+    cv::distanceTransform(binary_inv, dist_map, cv::DIST_L2, 3);
+
+    auto evaluateChamferCost = [&](const cv::Matx33d& R_cand, const cv::Vec3d& t_cand) -> double {
+        double total_cost = 0.0;
+        int valid_count = 0;
+        const size_t num_edges = _cad_feature_edges.size();
+        const size_t step = std::max<size_t>(1, num_edges / 120);
+
+        for (size_t i = 0; i < num_edges; i += step) {
+            const auto& edge = _cad_feature_edges[i];
+            for (float alpha : {0.2f, 0.5f, 0.8f}) {
+                cv::Vec3d p_cad(
+                    edge.p0[0] + alpha * (edge.p1[0] - edge.p0[0]),
+                    edge.p0[1] + alpha * (edge.p1[1] - edge.p0[1]),
+                    edge.p0[2] + alpha * (edge.p1[2] - edge.p0[2])
+                );
+                cv::Vec3d p_cam = R_cand * p_cad + t_cand;
+                if (p_cam[2] <= 0.20) continue;
+
+                int u = static_cast<int>(std::round(intr.fx * p_cam[0] / p_cam[2] + intr.ppx));
+                int v = static_cast<int>(std::round(intr.fy * p_cam[1] / p_cam[2] + intr.ppy));
+                if (u >= 2 && u < dist_map.cols - 2 && v >= 2 && v < dist_map.rows - 2) {
+                    float d = dist_map.at<float>(v, u);
+                    total_cost += (d < 18.0f) ? static_cast<double>(d) : (18.0 + 0.25 * (d - 18.0));
+                    valid_count++;
+                }
+            }
+        }
+        return (valid_count >= 15) ? (total_cost / valid_count) : 1e6;
+    };
+
+    double best_cost = evaluateChamferCost(pose.R, pose.t);
+    for (int iter = 0; iter < 2; ++iter) {
+        double step_t = (iter == 0) ? 0.008 : 0.003;
+        for (int axis = 0; axis < 3; ++axis) {
+            for (double dir : {-1.0, 1.0}) {
+                cv::Vec3d t_try = pose.t;
+                t_try[axis] += dir * step_t;
+                double c = evaluateChamferCost(pose.R, t_try);
+                if (c < best_cost) {
+                    best_cost = c;
+                    pose.t = t_try;
+                }
+            }
+        }
+        if (!_is_floor_standing) {
+            double step_rad = (iter == 0) ? 0.020 : 0.008;
+            for (double dyaw : {-step_rad, step_rad}) {
+                double cs = std::cos(dyaw), sn = std::sin(dyaw);
+                cv::Matx33d dR(cs, -sn, 0, sn, cs, 0, 0, 0, 1);
+                cv::Matx33d R_try = pose.R * dR;
+                double c = evaluateChamferCost(R_try, pose.t);
+                if (c < best_cost) {
+                    best_cost = c;
+                    pose.R = R_try;
+                }
+            }
+        }
+    }
+}
+
 bool TablePoseEstimator::initialize(const std::string& models_dir)
 {
     std::string req = models_dir;
@@ -508,6 +638,19 @@ bool TablePoseEstimator::initialize(const std::string& models_dir)
                   << "  -> Bounds: [" << _cad_min[0] << ", " << _cad_min[1] << ", " << _cad_min[2] << "] to ["
                   << _cad_max[0] << ", " << _cad_max[1] << ", " << _cad_max[2] << "] m "
                   << "(Archetype: " << (_is_table_frame ? "TABLE_FRAME" : "GENERIC_CAD") << ")" << std::endl;
+
+        // Load Universal CAD Profile if available (Zero-Hardcode scale-adaptive parameters)
+        std::vector<std::string> profile_candidates = {
+            models_dir + "/" + _model_name + "_profile.json",
+            "/home/huyen1905/TMCAD/CAD_DATA/" + _model_name + "/" + _model_name + "_profile.json",
+            "/home/huyen1905/TMCAD/CAD_DATA/" + _model_name + "_profile.json"
+        };
+        for (const auto& pc : profile_candidates) {
+            if (fileExists(pc)) {
+                loadUniversalCadProfile(pc);
+                break;
+            }
+        }
 
         std::string tpl_err;
         _template_detector.initialize("", _cad_centroids, _half_w, _half_l, _top_z, _bot_z, tpl_err);
@@ -3236,14 +3379,25 @@ TablePose TablePoseEstimator::runMeshAwareRefinement(const cv::Mat& depth_z16,
     }
 
     const std::string python = "/home/huyen1905/TMCAD/scripts/infer_hierarchy.py";
-    const std::string cad = "/home/huyen1905/TMCAD/CAD_DATA/TABLE-DEMO/TABLE-DEMO.stl";
-    const std::string checkpoint = "/home/huyen1905/TMCAD/deep_learning/checkpoints/TABLE-DEMO/best_hierarchy_model.pth";
     std::ostringstream cmd;
     cmd << "python3 " << python
-        << " --input " << input_ply
-        << " --cad " << cad
-        << " --checkpoint " << checkpoint
-        << " --output-json " << output_json
+        << " --input " << input_ply;
+
+    if (!_loaded_onnx_path.empty() && std::ifstream(_loaded_onnx_path).good()) {
+        cmd << " --onnx " << _loaded_onnx_path;
+    } else {
+        std::string cad = "/home/huyen1905/TMCAD/CAD_DATA/" + _model_name + "/" + _model_name + ".stl";
+        if (!std::ifstream(cad).good()) {
+            cad = "/home/huyen1905/TMCAD/CAD_DATA/" + _model_name + "/" + _model_name + ".ply";
+        }
+        std::string checkpoint = "/home/huyen1905/TMCAD/deep_learning/checkpoints/" + _model_name + "/best_hierarchy_model.pth";
+        if (!std::ifstream(checkpoint).good()) {
+            checkpoint = "/home/huyen1905/TMCAD/models/" + _model_name + ".onnx";
+        }
+        cmd << " --cad " << cad << " --checkpoint " << checkpoint;
+    }
+
+    cmd << " --output-json " << output_json
         << " --output-cloud " << output_cloud
         << " --real-sensor --fixed-height -1 --max-depth 3.5"
         // Match Qt App (MainWindow.cpp): Do not apply restrictive horizontal crop that chops table edges
@@ -3661,6 +3815,7 @@ TablePose TablePoseEstimator::estimate(const cv::Mat& rgb,
     {
         const cv::Vec4d* floor_ptr = seg_res.floor_detected ? &seg_res.floor_plane : nullptr;
         best_pose = refinePoseWith2DEdges(best_pose, rgb, intr, floor_ptr);
+        refinePoseUniversalCrease2D3D(best_pose, rgb, intr);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

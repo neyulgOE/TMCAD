@@ -22,6 +22,47 @@ if project_root not in sys.path:
 
 from deep_learning.model_hierarchy import CADHierarchyCorrespondenceModel
 
+try:
+    from scripts.build_cad_profile import build_cad_profile
+except ImportError:
+    build_cad_profile = None
+
+def load_or_create_cad_profile(cad_path, cad_stem, root_dir):
+    """
+    Tự động đọc <CAD_NAME>_profile.json (hoặc tự tạo nếu chưa có)
+    để lấy thông tin hình học, ngưỡng RANSAC/ICP thích ứng tỉ lệ và chế độ đặt.
+    """
+    candidate_paths = []
+    if cad_path and os.path.exists(cad_path):
+        cad_dir = os.path.dirname(os.path.abspath(cad_path))
+        candidate_paths.append(os.path.join(cad_dir, f"{cad_stem}_profile.json"))
+        candidate_paths.append(os.path.join(cad_dir, "profile.json"))
+    candidate_paths.append(os.path.join(root_dir, "CAD_DATA", cad_stem, f"{cad_stem}_profile.json"))
+    candidate_paths.append(os.path.join(root_dir, "CAD_DATA", f"{cad_stem}_profile.json"))
+
+    for p in candidate_paths:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    prof = json.load(f)
+                    print(f"[CAD PROFILE] Loaded profile from {p} (mode={prof.get('placement_mode')}, diag={prof.get('real_bounding_diag_m', 0.0):.3f}m)")
+                    return prof
+            except Exception as e:
+                print(f"[WARN] Failed to read {p}: {e}")
+
+    # Nếu chưa có profile và có thể tạo tự động
+    if build_cad_profile is not None:
+        try:
+            target_dir = os.path.join(root_dir, "CAD_DATA", cad_stem)
+            if os.path.exists(target_dir):
+                prof = build_cad_profile(target_dir, cad_stem)
+                print(f"[CAD PROFILE] Generated profile on the fly for {cad_stem}")
+                return prof
+        except Exception as e:
+            print(f"[WARN] Auto-build profile failed: {e}")
+
+    return None
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Inference: CAD-Aware Hierarchical Correspondence 6DoF Pose (Supports Black-Box .onnx)")
     parser.add_argument("--input", type=str, default=None, help="Input scene point cloud (.ply)")
@@ -134,7 +175,15 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
         cad_stem = os.path.splitext(os.path.basename(args.checkpoint))[0]
     else:
         cad_stem = "TABLE-DEMO"
-    is_table = "TABLE" in cad_stem.upper()
+    if cad_stem.endswith("_mesh"):
+        cad_stem = cad_stem[:-5]
+
+    profile = load_or_create_cad_profile(args.cad, cad_stem, project_root)
+    placement_mode = profile.get("placement_mode", "FLOOR_STANDING" if "TABLE" in cad_stem.upper() else "FREE_6DOF") if profile else ("FLOOR_STANDING" if "TABLE" in cad_stem.upper() else "FREE_6DOF")
+    topology_type = profile.get("topology_type", "FRAME_HOLLOW" if "TABLE" in cad_stem.upper() else "COMPLEX_SOLID") if profile else ("FRAME_HOLLOW" if "TABLE" in cad_stem.upper() else "COMPLEX_SOLID")
+    adaptive_params = profile.get("adaptive_solver_params", {}) if profile else {}
+    real_cad_diag = float(profile.get("real_bounding_diag_m", 1.07 if "TABLE" in cad_stem.upper() else 0.20)) if profile else (1.07 if "TABLE" in cad_stem.upper() else 0.20)
+    is_table = (placement_mode == "FLOOR_STANDING") and ("TABLE" in cad_stem.upper())
 
     # 4. Load & sample Scene Point Cloud
     scene_pcd = o3d.io.read_point_cloud(args.input)
@@ -225,7 +274,10 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
                     rem_pts = np.asarray(rem_pcd.points)
                     cad_max_val = blackbox_ctx.get("cad_max", None) if blackbox_ctx else None
                     cad_min_val = blackbox_ctx.get("cad_min", None) if blackbox_ctx else None
-                    target_cad_diag = float(np.linalg.norm(cad_max_val - cad_min_val)) if cad_max_val is not None and cad_min_val is not None else 0.20
+                    if cad_max_val is not None and cad_min_val is not None:
+                        target_cad_diag = float(np.linalg.norm(cad_max_val - cad_min_val))
+                    else:
+                        target_cad_diag = real_cad_diag
                     for l in valid_labels:
                         l_idx = np.where(labels == l)[0]
                         c_pts = rem_pts[l_idx]
@@ -350,10 +402,14 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
     conf_nms = conf_np[keep_mask]
 
     # 5. RANSAC + Kabsch SVD
+    ransac_thresh = args.ransac_thresh
+    if args.ransac_thresh == 0.04 and "ransac_thresh_m" in adaptive_params:
+        ransac_thresh = float(adaptive_params["ransac_thresh_m"])
+
     t_solver_start = time.time()
     T_coarse, inliers, c_src, c_dst = kabsch_ransac(
         pts_obs_nms, pts_cad_nms, conf_nms,
-        max_iter=3000, distance_threshold=args.ransac_thresh
+        max_iter=3000, distance_threshold=ransac_thresh
     )
     num_inliers = int(np.sum(inliers))
 
@@ -506,8 +562,9 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
     sub_scene = scene_pts[np.random.choice(len(scene_pts), n_sub, replace=(len(scene_pts) < n_sub))]
     pts_in_cad = (T_inv_curr[:3, :3] @ sub_scene.T).T + T_inv_curr[:3, 3]
 
+    fg_thresh = float(adaptive_params.get("icp_coarse_corr_m", max(0.015, 0.045 * real_cad_diag)))
     fg_mask = np.array([
-        cad_tree_coarse.search_knn_vector_3d(pt, 1)[2][0] < (0.045 ** 2)
+        cad_tree_coarse.search_knn_vector_3d(pt, 1)[2][0] < (fg_thresh ** 2)
         for pt in pts_in_cad
     ])
 
@@ -518,12 +575,15 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
     if np.sum(fg_mask) >= min_fg:
         pcd_fg = o3d.geometry.PointCloud()
         pcd_fg.points = o3d.utility.Vector3dVector(sub_scene[fg_mask])
-        pcd_fg.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.035, max_nn=30))
+        pcd_fg.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(0.012, fg_thresh * 0.8), max_nn=30))
 
         # 5. Multi-Scale Point-to-Plane ICP with Robust Tukey Loss & Adaptive Early Exit
+        coarse_corr = float(adaptive_params.get("icp_coarse_corr_m", max(0.015, 0.045 * real_cad_diag)))
+        fine_corr = float(adaptive_params.get("icp_fine_corr_m", max(0.003, 0.018 * real_cad_diag)))
+        dist_schedule = [coarse_corr, coarse_corr * 0.55, coarse_corr * 0.30, fine_corr * 1.5, fine_corr]
         T_inv = T_inv_curr.copy()
-        for dist_th in [0.050, 0.025, 0.012, 0.006, 0.003]:
-            loss_k = max(0.003, dist_th / 2.0)
+        for dist_th in dist_schedule:
+            loss_k = max(0.002, dist_th / 2.0)
             icp_res = o3d.pipelines.registration.registration_icp(
                 pcd_fg, cad_target, dist_th, T_inv,
                 o3d.pipelines.registration.TransformationEstimationPointToPlane(
@@ -700,10 +760,11 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
                         T_final[:3, 3] += v_up * drift
                         print(f"[CONTACT SNAP] Snapped object base flush onto support plane ({drift*1000.0:+.2f} mm).")
 
-    # 5.1 Gravity Plane Alignment: Enforce table CAD Z axis collinear with floor normal
-    # Real-world tables stand on the floor. Due to asymmetric point clouds (e.g. occluded rear leg),
-    # unconstrained ICP can introduce 1-3 deg artificial roll. Aligning CAD Z to floor normal fixes this.
-    if is_table and floor_normal is not None:
+    # 5.1 Gravity Plane Alignment: Enforce CAD Z axis collinear with floor normal
+    # Chỉ áp dụng khi vật thể đứng sàn (placement_mode == 'FLOOR_STANDING', ví dụ TABLE-DEMO).
+    # Các vật thể FREE_6DOF giữ nguyên tư thế 6 bậc tự do từ ICP.
+    is_floor_standing = (placement_mode == "FLOOR_STANDING")
+    if is_floor_standing and floor_normal is not None:
         cad_z = T_final[:3, 2].copy()
         up_target = floor_normal / np.linalg.norm(floor_normal)
         if up_target[1] > 0:
@@ -727,13 +788,15 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
                 T_final[:3, :3] = R_align @ T_final[:3, :3]
                 print(f"[GRAVITY] Aligned CAD Z with floor normal (cos={cos_th:.4f}, corrected: {np.degrees(np.arccos(np.clip(cos_th, -1.0, 1.0))):.2f}°)")
 
-    # 5.2 Front-Face Anchoring & Fine Alignment (chỉ áp dụng riêng cho CAD TABLE-DEMO)
-    if is_table and pcd_fg is not None and len(pcd_fg.points) >= 32:
+    # 5.2 Front-Face Anchoring & Fine Alignment (chỉ bật khi FLOOR_STANDING và enable_2d_frame_anchor == True)
+    enable_anchor = bool(adaptive_params.get("enable_2d_frame_anchor", is_table))
+    if is_floor_standing and enable_anchor and pcd_fg is not None and len(pcd_fg.points) >= 32:
+        cad_half_w = float(profile.get("cad_max_xyz_m", [0.22, 0.415, 0.166])[0]) if profile else 0.220
         R_curr = T_final[:3, :3]
         t_curr = T_final[:3, 3]
-        p_pos_x = R_curr @ np.array([0.220, 0.0, 0.0]) + t_curr
-        p_neg_x = R_curr @ np.array([-0.220, 0.0, 0.0]) + t_curr
-        hx_front = 0.220 if p_pos_x[2] < p_neg_x[2] else -0.220
+        p_pos_x = R_curr @ np.array([cad_half_w, 0.0, 0.0]) + t_curr
+        p_neg_x = R_curr @ np.array([-cad_half_w, 0.0, 0.0]) + t_curr
+        hx_front = cad_half_w if p_pos_x[2] < p_neg_x[2] else -cad_half_w
         hx_rear = -hx_front
         v_depth_sign = 1.0 if hx_front > 0 else -1.0
 
@@ -818,7 +881,14 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
     z_bot = float(cad_min[2])
     z_top = float(cad_max[2])
 
-    if is_table:
+    if profile and "cad_min_xyz_m" in profile and "cad_max_xyz_m" in profile:
+        cad_x0 = float(profile["cad_min_xyz_m"][0])
+        cad_x1 = float(profile["cad_max_xyz_m"][0])
+        cad_y0 = float(profile["cad_min_xyz_m"][1])
+        cad_y1 = float(profile["cad_max_xyz_m"][1])
+        z_bot = float(profile.get("bottom_offset_z_m", profile["cad_min_xyz_m"][2]))
+        z_top = float(profile.get("top_offset_z_m", profile["cad_max_xyz_m"][2]))
+    elif is_table:
         dim_candidates = [
             os.path.join(cad_dir, "table_dimensions.json"),
             os.path.join(cad_dir, "TABLE-DEMO", "table_dimensions.json"),
@@ -1005,6 +1075,10 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
         "axis_arrow_2d": axis_arrow_2d,
         "front_face_2d": front_face_2d,
         "rear_face_2d": rear_face_2d,
+        "cad_name": str(cad_stem),
+        "topology_type": str(topology_type),
+        "placement_mode": str(placement_mode),
+        "real_bounding_diag_m": float(round(real_cad_diag, 4)),
         "is_table": bool(is_table),
         "cad_min": [float(cad_x0), float(cad_y0), float(z_bot)],
         "cad_max": [float(cad_x1), float(cad_y1), float(z_top)],

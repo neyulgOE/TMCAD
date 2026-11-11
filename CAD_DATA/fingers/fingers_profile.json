@@ -1,0 +1,37 @@
+{
+  "cad_name": "fingers",
+  "topology_type": "COMPLEX_SOLID",
+  "placement_mode": "FREE_6DOF",
+  "real_bounding_diag_m": 0.180572,
+  "extents_xyz_m": [
+    0.104099,
+    0.1041,
+    0.104561
+  ],
+  "cad_min_xyz_m": [
+    -0.052044,
+    -0.052622,
+    -0.090792
+  ],
+  "cad_max_xyz_m": [
+    0.052055,
+    0.051477,
+    0.013769
+  ],
+  "top_offset_z_m": 0.013769,
+  "bottom_offset_z_m": -0.090792,
+  "surface_area_m2": 0.026182,
+  "bbox_fill_ratio": 0.266,
+  "num_triangles": 40,
+  "num_crease_points": 1200,
+  "adaptive_solver_params": {
+    "voxel_size_m": 0.001,
+    "ransac_thresh_m": 0.00632,
+    "icp_coarse_corr_m": 0.00813,
+    "icp_fine_corr_m": 0.00325,
+    "cluster_merge_dx_m": 0.1124,
+    "cluster_merge_dz_m": 0.1301,
+    "enable_2d_frame_anchor": false,
+    "enable_2d_crease_refinement": true
+  }
+}

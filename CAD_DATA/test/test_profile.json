@@ -1,0 +1,37 @@
+{
+  "cad_name": "test",
+  "topology_type": "COMPLEX_SOLID",
+  "placement_mode": "FREE_6DOF",
+  "real_bounding_diag_m": 0.236676,
+  "extents_xyz_m": [
+    0.104099,
+    0.1041,
+    0.185317
+  ],
+  "cad_min_xyz_m": [
+    -0.052044,
+    -0.052622,
+    -0.093334
+  ],
+  "cad_max_xyz_m": [
+    0.052055,
+    0.051477,
+    0.091984
+  ],
+  "top_offset_z_m": 0.091984,
+  "bottom_offset_z_m": -0.093334,
+  "surface_area_m2": 0.098146,
+  "bbox_fill_ratio": 0.1882,
+  "num_triangles": 16481,
+  "num_crease_points": 1200,
+  "adaptive_solver_params": {
+    "voxel_size_m": 0.0013,
+    "ransac_thresh_m": 0.00828,
+    "icp_coarse_corr_m": 0.01065,
+    "icp_fine_corr_m": 0.00426,
+    "cluster_merge_dx_m": 0.1124,
+    "cluster_merge_dz_m": 0.1301,
+    "enable_2d_frame_anchor": false,
+    "enable_2d_crease_refinement": true
+  }
+}

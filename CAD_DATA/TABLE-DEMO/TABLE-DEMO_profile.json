@@ -1,0 +1,37 @@
+{
+  "cad_name": "TABLE-DEMO",
+  "topology_type": "FRAME_HOLLOW",
+  "placement_mode": "FLOOR_STANDING",
+  "real_bounding_diag_m": 1.066548,
+  "extents_xyz_m": [
+    0.44,
+    0.83,
+    0.505
+  ],
+  "cad_min_xyz_m": [
+    -0.220651,
+    -0.415397,
+    -0.3385
+  ],
+  "cad_max_xyz_m": [
+    0.219349,
+    0.414603,
+    0.1665
+  ],
+  "top_offset_z_m": 0.1665,
+  "bottom_offset_z_m": -0.3385,
+  "surface_area_m2": 3.442298,
+  "bbox_fill_ratio": 0.0234,
+  "num_triangles": 247952,
+  "num_crease_points": 1200,
+  "adaptive_solver_params": {
+    "voxel_size_m": 0.00587,
+    "ransac_thresh_m": 0.03733,
+    "icp_coarse_corr_m": 0.04799,
+    "icp_fine_corr_m": 0.0192,
+    "cluster_merge_dx_m": 0.8964,
+    "cluster_merge_dz_m": 0.55,
+    "enable_2d_frame_anchor": true,
+    "enable_2d_crease_refinement": true
+  }
+}

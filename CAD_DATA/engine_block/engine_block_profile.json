@@ -1,0 +1,37 @@
+{
+  "cad_name": "engine_block",
+  "topology_type": "COMPLEX_SOLID",
+  "placement_mode": "FREE_6DOF",
+  "real_bounding_diag_m": 0.160379,
+  "extents_xyz_m": [
+    0.09658,
+    0.108987,
+    0.067198
+  ],
+  "cad_min_xyz_m": [
+    -0.050656,
+    -0.051231,
+    -0.029712
+  ],
+  "cad_max_xyz_m": [
+    0.045924,
+    0.057756,
+    0.037486
+  ],
+  "top_offset_z_m": 0.037486,
+  "bottom_offset_z_m": -0.029712,
+  "surface_area_m2": 0.111074,
+  "bbox_fill_ratio": 0.1991,
+  "num_triangles": 411042,
+  "num_crease_points": 1200,
+  "adaptive_solver_params": {
+    "voxel_size_m": 0.001,
+    "ransac_thresh_m": 0.00561,
+    "icp_coarse_corr_m": 0.00722,
+    "icp_fine_corr_m": 0.00289,
+    "cluster_merge_dx_m": 0.1177,
+    "cluster_merge_dz_m": 0.1207,
+    "enable_2d_frame_anchor": false,
+    "enable_2d_crease_refinement": true
+  }
+}
