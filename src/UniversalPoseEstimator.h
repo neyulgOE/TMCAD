@@ -75,8 +75,9 @@ public:
                         double depth_scale,
                         const CameraIntrinsics& intr)
     {
-        (void)depth_scale;
-        return estimate(rgb, depth_z16, intr);
+        CameraIntrinsics intr_copy = intr;
+        if (depth_scale > 0.0) intr_copy.depth_scale = depth_scale;
+        return estimate(rgb, depth_z16, intr_copy);
     }
 
     // One-shot snapshot estimation for TMVis
@@ -85,8 +86,9 @@ public:
                                 double depth_scale,
                                 const CameraIntrinsics& intr)
     {
-        (void)depth_scale;
-        return estimate(rgb, depth_z16, intr);
+        CameraIntrinsics intr_copy = intr;
+        if (depth_scale > 0.0) intr_copy.depth_scale = depth_scale;
+        return estimate(rgb, depth_z16, intr_copy);
     }
 
     // TMVis async refinement polling stub
@@ -153,7 +155,7 @@ private:
                                      int img_h,
                                      std::vector<cv::Point2f>* out_corners = nullptr) const;
 
-    static cv::Vec3d rotationMatrixToEulerDeg(const cv::Matx33d& R);
+    static cv::Vec3d rotationMatrixToEulerDeg(const cv::Matx33d& R, bool fold_c2_yaw = false);
 
 private:
     Ort::Env _ort_env;
@@ -163,9 +165,12 @@ private:
     bool _initialized{false};
 
     std::string _model_name{"GENERIC_CAD"};
+    std::string _loaded_onnx_path;
     std::string _topology_type{"COMPLEX_SOLID"};
     bool _is_floor_standing{false};
     bool _enable_2d_frame_anchor{false};
+    bool _meta_unpacked{false};
+    int _symmetry_code{0};
 
     size_t _num_obs_points{1024};
     size_t _num_cad_samples{0};

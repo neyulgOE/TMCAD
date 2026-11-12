@@ -48,6 +48,18 @@ static bool extractJsonString(const std::string& content, const std::string& key
     return false;
 }
 
+static bool extractJsonVec3(const std::string& content, const std::string& key, double& x, double& y, double& z) {
+    std::regex re("\"" + key + "\"\\s*:\\s*\\[\\s*([-+]?[0-9]*\\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\\s*,\\s*([-+]?[0-9]*\\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\\s*,\\s*([-+]?[0-9]*\\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\\s*\\]");
+    std::smatch match;
+    if (std::regex_search(content, match, re) && match.size() >= 4) {
+        x = std::stod(match[1].str());
+        y = std::stod(match[2].str());
+        z = std::stod(match[3].str());
+        return true;
+    }
+    return false;
+}
+
 } // anonymous namespace
 
 bool CADSceneSegmenter::loadProfileConfig(const std::string& profile_json_path) {
@@ -60,9 +72,10 @@ bool CADSceneSegmenter::loadProfileConfig(const std::string& profile_json_path) 
     std::string content = ss.str();
 
     double lx = 0.0, ly = 0.0, lz = 0.0, diag = 0.0;
-    if (extractJsonNumber(content, "extent_x_m", lx) &&
-        extractJsonNumber(content, "extent_y_m", ly) &&
-        extractJsonNumber(content, "extent_z_m", lz)) {
+    if (extractJsonVec3(content, "extents_xyz_m", lx, ly, lz) ||
+        (extractJsonNumber(content, "extent_x_m", lx) &&
+         extractJsonNumber(content, "extent_y_m", ly) &&
+         extractJsonNumber(content, "extent_z_m", lz))) {
         _expected_width_m  = static_cast<float>(std::min(lx, ly));
         _expected_length_m = static_cast<float>(std::max(lx, ly));
         _expected_height_m = static_cast<float>(lz);
@@ -84,6 +97,11 @@ bool CADSceneSegmenter::loadProfileConfig(const std::string& profile_json_path) 
     if (!_floor_standing_mode && _bounding_diag_m < 0.45f) {
         _min_depth_m = 0.25f;
         _max_depth_m = 1.85f;
+        _left_margin_ratio = 0.02f;
+        _right_margin_ratio = 0.02f;
+    } else if (!_floor_standing_mode) {
+        _min_depth_m = 0.30f;
+        _max_depth_m = 2.50f;
         _left_margin_ratio = 0.02f;
         _right_margin_ratio = 0.02f;
     } else {
@@ -111,6 +129,23 @@ void CADSceneSegmenter::setExpectedObjectDimensions(float length_m, float width_
     _expected_height_m = height_m;
     _bounding_diag_m = std::sqrt(length_m * length_m + width_m * width_m + height_m * height_m);
     _floor_standing_mode = floor_standing;
+
+    if (!_floor_standing_mode && _bounding_diag_m < 0.45f) {
+        _min_depth_m = 0.25f;
+        _max_depth_m = 1.85f;
+        _left_margin_ratio = 0.02f;
+        _right_margin_ratio = 0.02f;
+    } else if (!_floor_standing_mode) {
+        _min_depth_m = 0.30f;
+        _max_depth_m = 2.50f;
+        _left_margin_ratio = 0.02f;
+        _right_margin_ratio = 0.02f;
+    } else {
+        _min_depth_m = 0.45f;
+        _max_depth_m = 2.10f;
+        _left_margin_ratio = 0.08f;
+        _right_margin_ratio = 0.04f;
+    }
 }
 
 void CADSceneSegmenter::setMultiInstanceMode(bool enable, int max_instances) {
@@ -150,7 +185,7 @@ void CADSceneSegmenter::extractDepthPoints(const cv::Mat& depth_z16,
         y1 = std::min(h, roi_hint.y + roi_hint.height);
     }
 
-    const int stride = (w >= 1024) ? 2 : 2;
+    const int stride = (!_floor_standing_mode && _bounding_diag_m < 0.35f && w <= 848) ? 1 : 2;
     out_pts.reserve(((x1 - x0) / stride) * ((y1 - y0) / stride));
 
     for (int v = y0; v < y1; v += stride) {
@@ -422,6 +457,9 @@ void CADSceneSegmenter::clusterAndMergeTarget(const std::vector<cv::Vec3f>& fg_p
             } else {
                 out_multi_clusters.push_back(raw_clusters[i]);
             }
+        }
+        if (out_multi_clusters.empty()) {
+            out_multi_clusters.push_back(raw_clusters[0]);
         }
         out_merged_dense = out_multi_clusters.front().points;
     }
