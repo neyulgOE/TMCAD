@@ -496,3 +496,4 @@ SegmentationResult CADSceneSegmenter::segment(const cv::Mat& depth_z16,
 }
 
 } // namespace tmcad
+

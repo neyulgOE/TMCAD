@@ -11,6 +11,11 @@ libs/
 
 # Datasets and bag recordings
 dataset/
+D435if-dataset
+ObjectDetection_V2.4/
+ObjectDetection_V2.5/
+archive/
+*.pdf
 *.bag
 *.zip
 *.tar.gz

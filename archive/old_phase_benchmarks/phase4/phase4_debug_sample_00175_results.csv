@@ -1,2 +1,0 @@
-sample_id,vis,achieved_vis,distance_m,valid,fitness,inlier_rmse,e_t,e_R,e_R_sym,add_s_mm,opt_pass,strict_pass,relaxed_pass,coarse_pass,adds_pass,num_inliers,time_ms
-sample_00175,0.75,0.799,0.572,True,0.0858,0.0011,2.0,0.12,0.12,2.07,True,True,True,True,True,84,225.1

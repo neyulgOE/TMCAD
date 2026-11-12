@@ -1,275 +1,341 @@
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+PyTorch Dataset cho TMCAD Single-CAD Hierarchy:
+- Tận dụng trực tiếp đặc trưng tam giác (_triangles.npz, _patches.npz, _regions.npz).
+- Lấy mẫu ưu tiên độ cong & cạnh sắc tam giác (Curvature-Biased Sampling) cho chi tiết máy.
+- Tự động tiêm nhiễu thực tế Sim-to-Real & Che khuất một phần (15%-35% Partial Occlusion)
+  để mô hình hoạt động bền bỉ khi vật thể bị che khuất hoặc mất depth trên camera thực.
+"""
+
 import json
+import os
+from typing import Dict, List, Optional, Tuple
+
+import cv2
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-def fps_sampling_np(pts, num_samples):
-    """
-    Farthest Point Sampling on numpy array (M, 3) -> (num_samples,) indices.
-    Uses GPU if available for high speed on large CAD meshes.
-    """
-    M = len(pts)
-    if M <= num_samples:
-        return np.arange(M, dtype=np.int64)
-
-    if torch.cuda.is_available():
-        pts_t = torch.from_numpy(pts).cuda().float()
-        sampled = torch.zeros(num_samples, dtype=torch.long, device='cuda')
-        dist = torch.full((M,), 1e10, device='cuda')
-        sampled[0] = 0
-        cur = pts_t[0]
-        for i in range(1, num_samples):
-            d = torch.sum((pts_t - cur) ** 2, dim=1)
-            dist = torch.minimum(dist, d)
-            sampled[i] = torch.argmax(dist)
-            cur = pts_t[sampled[i]]
-        torch.cuda.synchronize()
-        return sampled.cpu().numpy()
-    else:
-        sampled = np.zeros(num_samples, dtype=np.int64)
-        dist = np.full(M, 1e10, dtype=np.float32)
-        sampled[0] = 0
-        cur = pts[0]
-        for i in range(1, num_samples):
-            d = np.sum((pts - cur) ** 2, axis=1)
-            dist = np.minimum(dist, d)
-            sampled[i] = np.argmax(dist)
-            cur = pts[sampled[i]]
-        return sampled
 
 class CADHierarchyDataset(Dataset):
-    """
-    PyTorch Dataset linking:
-    1. Canonical CAD Hierarchy (13D triangle primitives, K-ring local patches, symmetry group G)
-    2. Synthetic RGB-D partial observations (camera point cloud + GT correspondences)
-    """
-    def __init__(self,
-                 dataset_dir: str,
-                 cad_dir: str,
-                 cad_name: str = "TABLE-DEMO",
-                 split: str = "train",
-                 num_cad_samples: int = 512,
-                 num_obs_samples: int = 1024,
-                 patch_k: int = 32,
-                 enable_sim2real_noise: bool = True,
-                 max_occlusion_ratio: float = 0.32):
+    def __init__(
+        self,
+        dataset_root: str,
+        cad_data_dir: str,
+        cad_name: str,
+        split: str = "train",
+        num_obs_points: int = 1024,
+        enable_sim2real_noise: bool = True,
+        max_occlusion_ratio: float = 0.32,
+    ):
         super().__init__()
-        self.dataset_dir = dataset_dir
-        # Auto-resolve dedicated model subfolder if present (e.g. CAD_DATA/TABLE-DEMO)
-        model_subfolder = os.path.join(cad_dir, cad_name)
-        if os.path.isdir(model_subfolder):
-            cad_dir = model_subfolder
-        self.cad_dir = cad_dir
+        self.dataset_root = dataset_root
+        self.cad_data_dir = cad_data_dir
         self.cad_name = cad_name
         self.split = split
-        self.num_cad_samples = num_cad_samples
-        self.num_obs_samples = num_obs_samples
-        self.patch_k = patch_k
-        self.enable_sim2real_noise = enable_sim2real_noise and (split == "train")
+        self.num_obs_points = num_obs_points
+        self.is_train = split == "train"
+        self.enable_sim2real_noise = enable_sim2real_noise and self.is_train
         self.max_occlusion_ratio = float(np.clip(max_occlusion_ratio, 0.0, 0.45))
 
-        # 1. Load Canonical CAD Hierarchy files
-        tri_path = os.path.join(cad_dir, f"{cad_name}_triangles.npz")
-        patch_path = os.path.join(cad_dir, f"{cad_name}_patches.npz")
-        sym_path = os.path.join(cad_dir, f"{cad_name}_symmetry.json")
+        # 1. Nạp dữ liệu phân tầng Tam giác CAD (Phase 1 Canonical Representation)
+        self._load_canonical_cad_hierarchy()
+
+        # 2. Nạp danh sách các mẫu từ train.txt / val.txt
+        split_file = os.path.join(dataset_root, cad_name, f"{split}.txt")
+        self.sample_dirs: List[str] = []
+        if os.path.exists(split_file):
+            with open(split_file, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f.readlines() if line.strip()]
+            for rel_path in lines:
+                cand = os.path.join(dataset_root, cad_name, rel_path)
+                if not os.path.exists(cand):
+                    cand = os.path.join(dataset_root, rel_path)
+                if os.path.exists(cand):
+                    self.sample_dirs.append(cand)
+        else:
+            # Quét trực tiếp thư mục con nếu không có file split
+            sub_dir = os.path.join(dataset_root, cad_name, split)
+            if os.path.exists(sub_dir):
+                for name in sorted(os.listdir(sub_dir)):
+                    full_p = os.path.join(sub_dir, name)
+                    if os.path.isdir(full_p):
+                        self.sample_dirs.append(full_p)
+
+    def _load_canonical_cad_hierarchy(self) -> None:
+        tri_path = os.path.join(self.cad_data_dir, f"{self.cad_name}_triangles.npz")
+        patch_path = os.path.join(self.cad_data_dir, f"{self.cad_name}_patches.npz")
+        sym_path = os.path.join(self.cad_data_dir, f"{self.cad_name}_symmetry.json")
+        adj_path = os.path.join(self.cad_data_dir, f"{self.cad_name}_adjacency.npz")
 
         if not os.path.exists(tri_path) or not os.path.exists(patch_path):
-            raise FileNotFoundError(f"Missing canonical hierarchy files for {cad_name} in {cad_dir}")
+            raise FileNotFoundError(
+                f"Thiếu tệp phân tầng CAD cho {self.cad_name} tại {self.cad_data_dir}. "
+                f"Hãy chạy Build CAD Hierarchy (Phase 1) trước."
+            )
 
-        tri_data = np.load(tri_path)
-        self.all_tri_features = tri_data['features'].astype(np.float32) # (M, 13)
-        self.all_centroids = self.all_tri_features[:, :3]               # (M, 3)
+        tri_npz = np.load(tri_path)
+        patch_npz = np.load(patch_path)
 
-        patch_data = np.load(patch_path)
-        self.all_patch_indices = patch_data['patch_indices'].astype(np.int64) # (M, 32)
-        self.all_patch_hops = patch_data['patch_hops'].astype(np.int64)       # (M, 32)
-
-        # 2. Load Symmetry Group G
-        self.symmetry_transforms = [np.eye(4, dtype=np.float32)]
-        self.symmetry_type = "None"
-        if os.path.exists(sym_path):
-            with open(sym_path, 'r') as f:
-                sym_info = json.load(f)
-            self.symmetry_type = sym_info.get("symmetry_type", "None")
-            raw_xforms = sym_info.get("symmetry_transforms", [])
-            if raw_xforms:
-                self.symmetry_transforms = [np.array(x, dtype=np.float32).reshape(4, 4) for x in raw_xforms]
-
-        # 3. Select CAD Key Primitives via FPS and cache
-        cache_key_path = os.path.join(cad_dir, f"{cad_name}_key_triangles_{num_cad_samples}.npy")
-        cache_partner_path = os.path.join(cad_dir, f"{cad_name}_symmetry_partner_indices.npy")
-        if os.path.exists(cache_key_path):
-            self.cad_key_indices = np.load(cache_key_path)
+        # Tier 1: Đặc trưng tam giác 13 chiều [c(3), n(3), area(1), lengths(3), angles(3)]
+        if "features" in tri_npz:
+            self.tri_features = tri_npz["features"].astype(np.float32)
         else:
-            print(f"Sampling {num_cad_samples} key CAD primitives via FPS...")
-            self.cad_key_indices = fps_sampling_np(self.all_centroids, num_cad_samples)
-            np.save(cache_key_path, self.cad_key_indices)
+            centers = tri_npz["centers"].astype(np.float32)
+            normals = tri_npz["normals"].astype(np.float32)
+            areas = tri_npz["areas"].astype(np.float32).reshape(-1, 1)
+            edge_lengths = tri_npz.get("edge_lengths", np.zeros((len(centers), 3), dtype=np.float32))
+            angles = tri_npz.get("angles", np.zeros((len(centers), 3), dtype=np.float32))
+            self.tri_features = np.concatenate([centers, normals, areas, edge_lengths, angles], axis=1)
 
-        self.symmetry_partners = None
-        if os.path.exists(cache_partner_path):
-            self.symmetry_partners = np.load(cache_partner_path)
+        self.tri_centers = self.tri_features[:, 0:3]
+        self.tri_normals = self.tri_features[:, 3:6]
+        self.tri_areas = self.tri_features[:, 6]
 
-        # 4. Precompute CAD Key Patch Tensors
-        # key_centroids: (N_cad, 3)
-        self.cad_key_centroids = self.all_centroids[self.cad_key_indices].astype(np.float32)
-        # key_patches: (N_cad, K)
-        key_patches = self.all_patch_indices[self.cad_key_indices, :self.patch_k]
-        # patch_features: (N_cad, K, 13)
-        self.cad_patch_features = self.all_tri_features[key_patches]
-        # rel_centroids: (N_cad, K, 3)
-        self.cad_patch_rel_pos = self.cad_patch_features[:, :, :3] - self.cad_key_centroids[:, None, :]
-        # patch_hops: (N_cad, K)
-        self.cad_patch_hops = self.all_patch_hops[self.cad_key_indices, :self.patch_k]
+        # Đường kính chuẩn hóa thực của CAD từ tâm các tam giác
+        c_min = self.tri_centers.min(axis=0)
+        c_max = self.tri_centers.max(axis=0)
+        self.cad_diag = float(max(np.linalg.norm(c_max - c_min), 1e-4))
 
-        # 5. Load observation sample list from split file
-        split_file = os.path.join(dataset_dir, f"{split}.txt")
-        if not os.path.exists(split_file):
-            raise FileNotFoundError(f"Split file not found: {split_file}")
+        # Tính điểm độ cong / gờ sắc của từng tam giác từ đồ thị kề _adjacency.npz
+        self.tri_sharpness = np.ones(len(self.tri_centers), dtype=np.float32)
+        if os.path.exists(adj_path):
+            adj_npz = np.load(adj_path)
+            if "edges" in adj_npz and "edge_features" in adj_npz:
+                edges = adj_npz["edges"]
+                ef = adj_npz["edge_features"]
+                # Góc nhị diện lớn ->(1 - cos(theta)) lớn -> ưu tiên lấy mẫu cao hơn
+                dihedral_weight = np.abs(ef[:, 0]) if ef.shape[1] > 0 else np.ones(len(edges))
+                np.add.at(self.tri_sharpness, edges[:, 0], dihedral_weight)
+                np.add.at(self.tri_sharpness, edges[:, 1], dihedral_weight)
 
-        with open(split_file, 'r') as f:
-            self.sample_rel_paths = [line.strip() for line in f if line.strip()]
+        # Tier 3: LocalPatchBundle (M, K=32, 13)
+        if "patch_features" in patch_npz:
+            self.patch_features = patch_npz["patch_features"].astype(np.float32)
+        elif "patch_triangle_indices" in patch_npz:
+            p_idx = patch_npz["patch_triangle_indices"].astype(np.int64)
+            self.patch_features = self.tri_features[p_idx]
+        else:
+            raise KeyError("Tệp _patches.npz không chứa 'patch_features' hoặc 'patch_triangle_indices'.")
 
-        print(f"CADHierarchyDataset [{split}]: {len(self.sample_rel_paths)} samples, "
-              f"CAD key primitives: {self.num_cad_samples}, Patch K: {self.patch_k}, "
-              f"Symmetry: {self.symmetry_type} ({len(self.symmetry_transforms)} xforms)")
+        self.patch_centers = (
+            patch_npz["patch_centers"].astype(np.float32)
+            if "patch_centers" in patch_npz
+            else self.patch_features[:, 0, 0:3]
+        )
+        self.patch_normals = (
+            patch_npz["patch_normals"].astype(np.float32)
+            if "patch_normals" in patch_npz
+            else self.patch_features[:, 0, 3:6]
+        )
 
-    def _apply_sim2real_occlusion_and_noise(self, obs_cam: np.ndarray, obs_cad: np.ndarray, R_gt: np.ndarray):
+        # Nhóm đối xứng (Phase 0)
+        self.symmetry_matrices = [np.eye(3, dtype=np.float32)]
+        if os.path.exists(sym_path):
+            with open(sym_path, "r", encoding="utf-8") as f:
+                sym_data = json.load(f)
+            if "rotation_matrices" in sym_data and len(sym_data["rotation_matrices"]) > 0:
+                self.symmetry_matrices = [
+                    np.asarray(m, dtype=np.float32).reshape(3, 3) for m in sym_data["rotation_matrices"]
+                ]
+
+        self.symmetry_matrices_tensor = torch.from_numpy(np.stack(self.symmetry_matrices, axis=0))
+
+    def __len__(self) -> int:
+        return len(self.sample_dirs)
+
+    def _apply_sim2real_occlusion_and_noise(
+        self,
+        pts_cam: np.ndarray,
+        cad_pts: np.ndarray,
+        patch_ids: np.ndarray,
+        R_gt: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Sim-to-Real Domain Randomization & Structured Partial Occlusion:
-        1. Grazing-Angle & Specular Dropout: Mất depth ở góc xiên > 68 độ so với tia nhìn
-        2. Structured Partial Occlusion: Khoét 15%-32% mảng che khuất cục bộ
-        3. RealSense noise: sigma_z = 0.0015 * Z^2 + step quantization 1.0mm
-        4. Clutter points: Tiêm 3%-6% nhiễu ngoại lai
+        Mô phỏng nhiễu thực tế Sim-to-Real & Che khuất cục bộ (15% - 35%):
+        1. Grazing-angle dropout dựa trên pháp tuyến của tam giác CAD.
+        2. Khoét mảng che khuất cục bộ (Partial Patch Occlusion) nhưng đảm bảo giữ lại >= 68% điểm.
+        3. Nhiễu độ sâu phụ thuộc bình phương khoảng cách (Axial + Lateral Sensor Noise) & Lượng tử hóa.
+        4. Điểm nhiễu rìa (Outlier/Clutter points) có nhãn inlier_mask = 0.
         """
-        N = len(obs_cam)
+        N = len(pts_cam)
+        inlier_mask = np.ones(N, dtype=np.float32)
         if N < 64:
-            return obs_cam, obs_cad, np.ones(N, dtype=np.float32)
+            return pts_cam, cad_pts, patch_ids, inlier_mask
 
         keep_mask = np.ones(N, dtype=bool)
 
-        # 1. Grazing-angle dropout
-        view_dirs = obs_cam / (np.linalg.norm(obs_cam, axis=1, keepdims=True) + 1e-8)
-        # Vector pháp tuyến xấp xỉ từ hướng tâm CAD
-        cad_nrms = obs_cad / (np.linalg.norm(obs_cad, axis=1, keepdims=True) + 1e-8)
-        cam_nrms = (R_gt @ cad_nrms.T).T
-        cos_inc = np.abs(np.sum(cam_nrms * view_dirs, axis=1))
-        grazing_prob = np.where(cos_inc < 0.37, 0.55, 0.0)
+        # 1. Mất depth ở góc nghiêng lớn (Grazing-angle / Specular Dropout) từ pháp tuyến tam giác
+        valid_patch = np.clip(patch_ids, 0, len(self.patch_normals) - 1)
+        normals_cad = self.patch_normals[valid_patch]
+        normals_cam = (R_gt @ normals_cad.T).T
+        view_dirs = pts_cam / (np.linalg.norm(pts_cam, axis=1, keepdims=True) + 1e-8)
+        cos_incidence = np.abs(np.sum(normals_cam * view_dirs, axis=1))
+
+        # Các mặt tam giác nghiêng > 68 độ so với tia nhìn (cos < 0.37) có xác suất rớt depth
+        grazing_prob = np.where(cos_incidence < 0.37, 0.55, 0.0)
         grazing_drop = np.random.rand(N) < grazing_prob
         if np.sum(~grazing_drop) >= int(0.75 * N):
             keep_mask &= ~grazing_drop
 
-        # 2. Structured Patch Occlusion (15% - 32%)
+        # 2. Che khuất cục bộ 1 phần (Structured Partial Occlusion: 15% - 32% diện tích)
         if np.random.rand() < 0.80:
             occ_ratio = np.random.uniform(0.12, self.max_occlusion_ratio)
             anchor_idx = np.random.randint(0, N)
-            anchor_pt = obs_cam[anchor_idx]
-            dists = np.linalg.norm(obs_cam - anchor_pt, axis=1)
+            anchor_pt = pts_cam[anchor_idx]
+            dists = np.linalg.norm(pts_cam - anchor_pt, axis=1)
             occ_thresh = np.quantile(dists, occ_ratio)
             occ_drop = dists <= occ_thresh
             if np.sum(keep_mask & (~occ_drop)) >= int(0.65 * N):
                 keep_mask &= ~occ_drop
 
-        obs_cam = obs_cam[keep_mask]
-        obs_cad = obs_cad[keep_mask]
-        inlier_mask = np.ones(len(obs_cam), dtype=np.float32)
+        pts_cam = pts_cam[keep_mask]
+        cad_pts = cad_pts[keep_mask]
+        patch_ids = patch_ids[keep_mask]
+        inlier_mask = np.ones(len(pts_cam), dtype=np.float32)
 
-        # 3. Axial noise sigma_z = 0.0015 * Z^2 + quantization
-        z_vals = np.clip(obs_cam[:, 2:3], 0.3, 3.5)
+        # 3. Cộng nhiễu cảm biến chiều sâu RealSense (Axial Z^2 noise + Step quantization)
+        z_vals = np.clip(pts_cam[:, 2:3], 0.3, 3.5)
         sigma_z = 0.0015 * (z_vals ** 2)
         sigma_xy = 0.0007 * z_vals
-        noise_xyz = np.concatenate([
-            np.random.normal(0.0, sigma_xy, size=(len(obs_cam), 2)),
-            np.random.normal(0.0, sigma_z, size=(len(obs_cam), 1))
-        ], axis=1).astype(np.float32)
-        obs_cam = obs_cam + noise_xyz
-        obs_cam[:, 2] = np.round(obs_cam[:, 2] * 1000.0) / 1000.0
+        noise_xyz = np.concatenate(
+            [
+                np.random.normal(0.0, sigma_xy, size=(len(pts_cam), 2)),
+                np.random.normal(0.0, sigma_z, size=(len(pts_cam), 1)),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        pts_cam = pts_cam + noise_xyz
+        # Lượng tử hóa bước nhảy 1.0 mm
+        pts_cam[:, 2] = np.round(pts_cam[:, 2] * 1000.0) / 1000.0
 
-        return obs_cam, obs_cad, inlier_mask
+        # 4. Tiêm 3% - 6% điểm nhiễu ngoại lai (Clutter / Outlier) ở vùng biên với inlier_mask = 0
+        if np.random.rand() < 0.50 and len(pts_cam) > 32:
+            num_outliers = max(4, int(0.04 * len(pts_cam)))
+            rand_idx = np.random.choice(len(pts_cam), size=num_outliers, replace=True)
+            outlier_pts = pts_cam[rand_idx] + np.random.uniform(
+                -0.08 * self.cad_diag, 0.08 * self.cad_diag, size=(num_outliers, 3)
+            ).astype(np.float32)
+            pts_cam = np.vstack([pts_cam, outlier_pts])
+            cad_pts = np.vstack([cad_pts, cad_pts[rand_idx]])
+            patch_ids = np.concatenate([patch_ids, patch_ids[rand_idx]])
+            inlier_mask = np.concatenate([inlier_mask, np.zeros(num_outliers, dtype=np.float32)])
 
-    def _curvature_biased_sample(self, obs_cam: np.ndarray, obs_cad: np.ndarray, inlier_mask: np.ndarray):
-        """Lấy mẫu ưu tiên vùng có độ cong lớn / cạnh sắc tam giác (50%) + đều (50%)."""
-        N = len(obs_cam)
+        return pts_cam, cad_pts, patch_ids, inlier_mask
+
+    def _curvature_biased_sample(
+        self,
+        pts_cam: np.ndarray,
+        cad_pts: np.ndarray,
+        patch_ids: np.ndarray,
+        inlier_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Lấy mẫu 1.024 điểm ưu tiên các vùng có độ cong cao / cạnh sắc tam giác (50%)
+        kết hợp lấy mẫu đều trên bề mặt (50%) để giữ trọn chi tiết cơ khí.
+        """
+        N = len(pts_cam)
         if N == 0:
-            zeros = np.zeros((self.num_obs_samples, 3), dtype=np.float32)
-            return zeros, zeros, np.zeros(self.num_obs_samples, dtype=np.float32)
+            zeros_pts = np.zeros((self.num_obs_points, 3), dtype=np.float32)
+            zeros_id = np.zeros(self.num_obs_points, dtype=np.int64)
+            zeros_mask = np.zeros(self.num_obs_points, dtype=np.float32)
+            return zeros_pts, zeros_pts, zeros_id, zeros_mask
 
-        # Trọng số độ cong dựa trên khoảng cách tới tâm cụm
-        dists_to_keys = np.linalg.norm(obs_cad[:, None, :] - self.cad_key_centroids[None, :, :], axis=-1)
-        min_d = np.min(dists_to_keys, axis=-1)
-        weights = 1.0 + 3.0 * (min_d / (np.max(min_d) + 1e-6))
+        # Tính trọng số độ sắc của từng điểm dựa trên patch/triangle tương ứng
+        valid_pid = np.clip(patch_ids, 0, len(self.patch_centers) - 1)
+        # Ước lượng độ biến thiên pháp tuyến trong từng LocalPatchBundle (K=32 tam giác)
+        patch_tri_normals = self.patch_features[valid_pid, :, 3:6]  # (N, 32, 3)
+        normal_var = np.var(patch_tri_normals, axis=1).sum(axis=1)  # (N,)
+        weights = 1.0 + 5.0 * normal_var
         weights /= np.sum(weights)
 
-        half_k = self.num_obs_samples // 2
-        rem_k = self.num_obs_samples - half_k
-        replace_flag = N < self.num_obs_samples
+        half_k = self.num_obs_points // 2
+        rem_k = self.num_obs_points - half_k
+
+        replace_flag = N < self.num_obs_points
         idx_sharp = np.random.choice(N, size=half_k, replace=replace_flag, p=weights)
         idx_unif = np.random.choice(N, size=rem_k, replace=replace_flag)
         chosen = np.concatenate([idx_sharp, idx_unif], axis=0)
         np.random.shuffle(chosen)
 
-        return obs_cam[chosen], obs_cad[chosen], inlier_mask[chosen]
-
-    def __len__(self):
-        return len(self.sample_rel_paths)
-
-    def __getitem__(self, idx):
-        rel_path = self.sample_rel_paths[idx]
-        sample_dir = os.path.join(self.dataset_dir, rel_path)
-
-        csv_path = os.path.join(sample_dir, "correspondences.csv")
-        pose_path = os.path.join(sample_dir, "pose.json")
-
-        # 1. Load GT Pose
-        with open(pose_path, 'r') as f:
-            pose_meta = json.load(f)
-        gt_pose = np.array(pose_meta["cameraFromObject"], dtype=np.float32).reshape(4, 4)
-        R_gt = gt_pose[:3, :3]
-
-        # 2. Load correspondences: cam_xyz and cad_xyz
-        df = pd.read_csv(csv_path, usecols=['cam_x', 'cam_y', 'cam_z', 'cad_x', 'cad_y', 'cad_z'])
-        obs_cam = df[['cam_x', 'cam_y', 'cam_z']].values.astype(np.float32)
-        obs_cad = df[['cad_x', 'cad_y', 'cad_z']].values.astype(np.float32)
-
-        inlier_mask = np.ones(len(obs_cam), dtype=np.float32)
-        if self.enable_sim2real_noise:
-            obs_cam, obs_cad, inlier_mask = self._apply_sim2real_occlusion_and_noise(obs_cam, obs_cad, R_gt)
-
-        sampled_obs_cam, sampled_obs_cad, sampled_inlier_mask = self._curvature_biased_sample(
-            obs_cam, obs_cad, inlier_mask
+        return (
+            pts_cam[chosen],
+            cad_pts[chosen],
+            patch_ids[chosen],
+            inlier_mask[chosen],
         )
 
-        # 3. Compute Positive Matching Targets for all Symmetry Transforms
-        diff = sampled_obs_cad[:, None, :] - self.cad_key_centroids[None, :, :]
-        dist_sq = np.sum(diff ** 2, axis=-1)
-        best_cad_idx = np.argmin(dist_sq, axis=-1) # (N_obs,)
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        sample_dir = self.sample_dirs[idx]
+        pose_path = os.path.join(sample_dir, "pose.json")
+        corr_path = os.path.join(sample_dir, "correspondences.csv")
 
-        num_sym = len(self.symmetry_transforms)
-        positive_targets = np.zeros((self.num_obs_samples, num_sym), dtype=np.int64)
-        positive_targets[:, 0] = best_cad_idx
+        with open(pose_path, "r", encoding="utf-8") as f:
+            pose_meta = json.load(f)
 
-        if num_sym > 1:
-            if self.symmetry_partners is not None and len(self.symmetry_partners) == self.num_cad_samples:
-                positive_targets[:, 1] = self.symmetry_partners[best_cad_idx]
+        T_gt = np.asarray(pose_meta.get("cameraFromObject", np.eye(4)), dtype=np.float32).reshape(4, 4)
+        R_gt = T_gt[:3, :3]
+        t_gt = T_gt[:3, 3]
+
+        if os.path.exists(corr_path):
+            df = pd.read_csv(corr_path)
+            pts_cam = df[["obs_x", "obs_y", "obs_z"]].values.astype(np.float32)
+            if "cad_x" in df.columns:
+                cad_pts = df[["cad_x", "cad_y", "cad_z"]].values.astype(np.float32)
             else:
-                for k_idx in range(1, num_sym):
-                    S = self.symmetry_transforms[k_idx]
-                    R_s = S[:3, :3]
-                    t_s = S[:3, 3]
-                    p_sym = sampled_obs_cad @ R_s.T + t_s
-                    diff_sym = p_sym[:, None, :] - self.cad_key_centroids[None, :, :]
-                    positive_targets[:, k_idx] = np.argmin(np.sum(diff_sym ** 2, axis=-1), axis=-1)
+                cad_pts = ((pts_cam - t_gt) @ R_gt).astype(np.float32)
+
+            if "patch_id" in df.columns:
+                patch_ids = df["patch_id"].values.astype(np.int64)
+            else:
+                # Ánh xạ từng điểm CAD về tâm LocalPatchBundle gần nhất
+                dists = np.linalg.norm(
+                    cad_pts[:, None, :] - self.patch_centers[None, :, :], axis=-1
+                )
+                patch_ids = np.argmin(dists, axis=1).astype(np.int64)
+        else:
+            # Dự phòng giải chiếu trực tiếp từ depth.png nếu không có correspondences.csv
+            depth_path = os.path.join(sample_dir, "depth.png")
+            depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32) * 0.001
+            intr = pose_meta.get("intrinsics", {"fx": 608.0, "fy": 608.0, "cx": 320.0, "cy": 240.0})
+            ys, xs = np.where((depth > 0.2) & (depth < 3.0))
+            zs = depth[ys, xs]
+            x3d = (xs - intr["cx"]) * zs / intr["fx"]
+            y3d = (ys - intr["cy"]) * zs / intr["fy"]
+            pts_cam = np.stack([x3d, y3d, zs], axis=1).astype(np.float32)
+            cad_pts = ((pts_cam - t_gt) @ R_gt).astype(np.float32)
+            dists = np.linalg.norm(cad_pts[:, None, :] - self.patch_centers[None, :, :], axis=-1)
+            patch_ids = np.argmin(dists, axis=1).astype(np.int64)
+
+        inlier_mask = np.ones(len(pts_cam), dtype=np.float32)
+
+        # Áp dụng nhiễu thực tế Sim-to-Real & Che khuất một phần khi huấn luyện
+        if self.enable_sim2real_noise:
+            pts_cam, cad_pts, patch_ids, inlier_mask = self._apply_sim2real_occlusion_and_noise(
+                pts_cam, cad_pts, patch_ids, R_gt
+            )
+
+        # Lấy mẫu ưu tiên độ cong về 1024 điểm
+        pts_cam, cad_pts, patch_ids, inlier_mask = self._curvature_biased_sample(
+            pts_cam, cad_pts, patch_ids, inlier_mask
+        )
+
+        # Chuẩn hóa đám mây điểm quan sát về tâm và chia cho đường kính thực của CAD
+        centroid = np.mean(pts_cam, axis=0, keepdims=True)
+        pts_cam_norm = (pts_cam - centroid) / self.cad_diag
 
         return {
-            "obs_cam_pts": torch.from_numpy(sampled_obs_cam),             # (N_obs, 3)
-            "obs_cad_pts": torch.from_numpy(sampled_obs_cad),             # (N_obs, 3)
-            "inlier_mask": torch.from_numpy(sampled_inlier_mask),         # (N_obs,)
-            "positive_targets": torch.from_numpy(positive_targets),       # (N_obs, |G|)
-            "gt_pose": torch.from_numpy(gt_pose),                         # (4, 4)
-            # CAD representation (shared across batch or indexed)
-            "cad_key_centroids": torch.from_numpy(self.cad_key_centroids),       # (N_cad, 3)
-            "cad_patch_features": torch.from_numpy(self.cad_patch_features),     # (N_cad, K, 13)
-            "cad_patch_rel_pos": torch.from_numpy(self.cad_patch_rel_pos),       # (N_cad, K, 3)
-            "cad_patch_hops": torch.from_numpy(self.cad_patch_hops)              # (N_cad, K)
+            "obs_points_raw": torch.from_numpy(pts_cam),
+            "obs_points_norm": torch.from_numpy(pts_cam_norm),
+            "gt_cad_points": torch.from_numpy(cad_pts),
+            "gt_patch_ids": torch.from_numpy(patch_ids),
+            "inlier_mask": torch.from_numpy(inlier_mask),
+            "patch_features": torch.from_numpy(self.patch_features),
+            "patch_centers": torch.from_numpy(self.patch_centers),
+            "patch_normals": torch.from_numpy(self.patch_normals),
+            "symmetry_matrices": self.symmetry_matrices_tensor,
+            "R_gt": torch.from_numpy(R_gt),
+            "t_gt": torch.from_numpy(t_gt),
         }

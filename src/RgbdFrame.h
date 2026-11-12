@@ -27,3 +27,4 @@ struct RgbdFrame
                depth_scale > 0.0;
     }
 };
+
