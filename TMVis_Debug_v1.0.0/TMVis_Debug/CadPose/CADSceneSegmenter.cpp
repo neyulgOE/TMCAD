@@ -1,259 +1,303 @@
 #include "CADSceneSegmenter.h"
-
-#include <algorithm>
+#include <fstream>
+#include <sstream>
 #include <cmath>
-#include <random>
+#include <algorithm>
 #include <unordered_map>
-#include <unordered_set>
-#include <iostream>
+#include <queue>
+#include <random>
+#include <regex>
 
-void CADSceneSegmenter::configure(double half_w, double half_l, double total_height,
-                                  double min_depth, double max_depth)
-{
-    _half_w = half_w;
-    _half_l = half_l;
-    _total_h = total_height;
-    _min_depth_m = min_depth;
-    _max_depth_m = max_depth;
+namespace tmcad {
+
+namespace {
+
+struct VoxelKey {
+    int x, y, z;
+    bool operator==(const VoxelKey& o) const noexcept {
+        return x == o.x && y == o.y && z == o.z;
+    }
+};
+
+struct VoxelKeyHash {
+    std::size_t operator()(const VoxelKey& k) const noexcept {
+        std::size_t h1 = std::hash<int>{}(k.x);
+        std::size_t h2 = std::hash<int>{}(k.y);
+        std::size_t h3 = std::hash<int>{}(k.z);
+        return h1 ^ (h2 * 0x9e3779b9 + (h1 << 6) + (h1 >> 2)) ^ (h3 * 0xc2b2ae35);
+    }
+};
+
+static bool extractJsonNumber(const std::string& content, const std::string& key, double& out_val) {
+    std::regex re("\"" + key + "\"\\s*:\\s*([-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?)");
+    std::smatch match;
+    if (std::regex_search(content, match, re) && match.size() >= 2) {
+        out_val = std::stod(match[1].str());
+        return true;
+    }
+    return false;
 }
 
-std::vector<cv::Vec3f> CADSceneSegmenter::extractDepthPoints(const RgbdFrame& frame,
-                                                             int step,
-                                                             const cv::Rect2f* rgb_roi) const
-{
-    std::vector<cv::Vec3f> points;
-    const int w = static_cast<int>(frame.width);
-    const int h = static_cast<int>(frame.height);
-    const double fx = frame.intrinsics.fx;
-    const double fy = frame.intrinsics.fy;
-    const double cx = frame.intrinsics.ppx;
-    const double cy = frame.intrinsics.ppy;
-    const double scale = frame.depth_scale;
-
-    int x0 = 0, x1 = w, y0 = 0, y1 = h;
-    int cur_step = step;
-
-    if (rgb_roi && rgb_roi->width > 10.0f && rgb_roi->height > 10.0f)
-    {
-        // Align RGB ROI to Depth with 12% safety margin
-        // Bounding depth extraction strictly inside the RGB box eliminates 90% background noise/flying pixels!
-        int pad_x = static_cast<int>(rgb_roi->width * 0.12f);
-        int pad_y = static_cast<int>(rgb_roi->height * 0.12f);
-        x0 = std::max(0, static_cast<int>(rgb_roi->x) - pad_x);
-        y0 = std::max(0, static_cast<int>(rgb_roi->y) - pad_y);
-        x1 = std::min(w, static_cast<int>(rgb_roi->x + rgb_roi->width) + pad_x);
-        y1 = std::min(h, static_cast<int>(rgb_roi->y + rgb_roi->height) + pad_y);
-        cur_step = std::max(1, step / 2); // Sample denser inside ROI
+static bool extractJsonString(const std::string& content, const std::string& key, std::string& out_str) {
+    std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]+)\"");
+    std::smatch match;
+    if (std::regex_search(content, match, re) && match.size() >= 2) {
+        out_str = match[1].str();
+        return true;
     }
-
-    points.reserve((w / cur_step) * (h / cur_step));
-
-    for (int y = y0; y < y1; y += cur_step)
-    {
-        const uint16_t* depth_row = frame.depth_z16.ptr<uint16_t>(y);
-        for (int x = x0; x < x1; x += cur_step)
-        {
-            uint16_t d_raw = depth_row[x];
-            if (d_raw == 0) continue;
-
-            float z = static_cast<float>(d_raw * scale);
-            if (z < static_cast<float>(_min_depth_m) || z > static_cast<float>(_max_depth_m)) continue;
-
-            float px = static_cast<float>((x - cx) * z / fx);
-            float py = static_cast<float>((y - cy) * z / fy);
-
-            // Workspace bounding: filter extreme lateral points
-            if (std::abs(px) > 2.0f || py < -1.4f || py > 1.4f) continue;
-
-            points.emplace_back(px, py, z);
-        }
-    }
-
-    return points;
+    return false;
 }
 
-bool CADSceneSegmenter::fitFloorPlane(const std::vector<cv::Vec3f>& points,
-                                      cv::Vec4d& out_plane,
-                                      double& out_height,
-                                      double& out_tilt_deg) const
-{
-    const int N = static_cast<int>(points.size());
-    if (N < 200) return false;
+} // anonymous namespace
 
-    // Optical frame convention: Y is down towards the floor.
-    // Floor normal points up along -Y. Expected normal = [0, -1, 0].
-    const cv::Vec3d expected_floor_normal(0.0, -1.0, 0.0);
-
-    // Seed pool: Sample from all valid scene depth points
-    std::vector<int> seed_indices;
-    seed_indices.reserve(N);
-    for (int i = 0; i < N; ++i)
-    {
-        if (points[i][2] >= 0.40f && points[i][2] <= 3.20f) seed_indices.push_back(i);
-    }
-    if (seed_indices.size() < 100) return false;
-
-    std::mt19937 rng(1337);
-    std::uniform_int_distribution<int> dist(0, static_cast<int>(seed_indices.size()) - 1);
-
-    int best_inliers = 0;
-    cv::Vec3d best_normal(0.0, -1.0, 0.0);
-    std::vector<uint8_t> best_mask(N, 0);
-
-    for (int iter = 0; iter < _ransac_iterations; ++iter)
-    {
-        int i0 = seed_indices[dist(rng)];
-        int i1 = seed_indices[dist(rng)];
-        int i2 = seed_indices[dist(rng)];
-        if (i0 == i1 || i1 == i2 || i0 == i2) continue;
-
-        cv::Vec3d p0(points[i0]);
-        cv::Vec3d p1(points[i1]);
-        cv::Vec3d p2(points[i2]);
-
-        cv::Vec3d v1 = p1 - p0;
-        cv::Vec3d v2 = p2 - p0;
-        cv::Vec3d normal = v1.cross(v2);
-
-        double n_len = cv::norm(normal);
-        if (n_len < 1e-6) continue;
-        normal *= (1.0 / n_len);
-
-        // Orient normal UP (-Y in camera optical frame)
-        if (normal.dot(expected_floor_normal) < 0.0) normal = -normal;
-
-        // Check alignment with vertical: dot product with [0, -1, 0] must be >= 0.70 (tilt up to 45 deg)
-        // Exactly matches real_sensor_pipeline.py constraint
-        if (normal.dot(expected_floor_normal) < 0.70) continue;
-
-        double d = -normal.dot(p0);
-        double cam_h = std::abs(d);
-        if (cam_h < _min_cam_height_m || cam_h > _max_cam_height_m) continue;
-
-        int current_inliers = 0;
-        int n_above = 0;
-        int n_below = 0;
-        std::vector<uint8_t> current_mask(N, 0);
-
-        for (int i = 0; i < N; ++i)
-        {
-            cv::Vec3d pt(points[i]);
-            double h = normal.dot(pt) + d;
-            if (std::abs(h) < _ransac_distance_thresh_m)
-            {
-                ++current_inliers;
-                current_mask[i] = 1;
-            }
-            else if (h > _ransac_distance_thresh_m)
-            {
-                ++n_above;
-            }
-            else
-            {
-                ++n_below;
-            }
-        }
-
-        // A true floor must have objects standing ABOVE it, not below it!
-        // If n_below > n_above * 0.25, this candidate is a tabletop/ceiling, NOT the floor.
-        if (n_above < 100 || n_below > n_above * 0.25) continue;
-
-        if (current_inliers > best_inliers)
-        {
-            best_inliers = current_inliers;
-            best_normal = normal;
-            best_mask = std::move(current_mask);
-
-            if (best_inliers > static_cast<int>(0.60 * N))
-            {
-                break; // Early exit on strong consensus
-            }
-        }
-    }
-
-    if (best_inliers < static_cast<int>(_min_floor_inlier_ratio * N) || best_inliers < 100)
-    {
+bool CADSceneSegmenter::loadProfileConfig(const std::string& profile_json_path) {
+    std::ifstream ifs(profile_json_path);
+    if (!ifs.is_open()) {
         return false;
     }
+    std::stringstream ss;
+    ss << ifs.rdbuf();
+    std::string content = ss.str();
 
-    // Refinement via SVD on all inlier points
-    cv::Vec3d centroid{0.0, 0.0, 0.0};
-    for (int i = 0; i < N; ++i)
-    {
-        if (best_mask[i]) centroid += cv::Vec3d(points[i]);
+    double lx = 0.0, ly = 0.0, lz = 0.0, diag = 0.0;
+    if (extractJsonNumber(content, "extent_x_m", lx) &&
+        extractJsonNumber(content, "extent_y_m", ly) &&
+        extractJsonNumber(content, "extent_z_m", lz)) {
+        _expected_width_m  = static_cast<float>(std::min(lx, ly));
+        _expected_length_m = static_cast<float>(std::max(lx, ly));
+        _expected_height_m = static_cast<float>(lz);
     }
-    centroid *= (1.0 / best_inliers);
-
-    cv::Matx33d cov = cv::Matx33d::zeros();
-    for (int i = 0; i < N; ++i)
-    {
-        if (best_mask[i])
-        {
-            cv::Vec3d diff = cv::Vec3d(points[i]) - centroid;
-            cov += diff * diff.t();
-        }
+    if (extractJsonNumber(content, "real_bounding_diag_m", diag) && diag > 0.01) {
+        _bounding_diag_m = static_cast<float>(diag);
+    } else {
+        _bounding_diag_m = std::sqrt(_expected_length_m * _expected_length_m +
+                                     _expected_width_m * _expected_width_m +
+                                     _expected_height_m * _expected_height_m);
     }
 
-    cv::Matx33d U, Vt;
-    cv::Vec3d W;
-    cv::SVD::compute(cov, W, U, Vt);
+    std::string placement_mode;
+    if (extractJsonString(content, "placement_mode", placement_mode)) {
+        _floor_standing_mode = (placement_mode == "FLOOR_STANDING");
+    }
 
-    // Normal corresponds to smallest eigenvalue (row 2 of Vt)
-    cv::Vec3d refined_normal(Vt(2, 0), Vt(2, 1), Vt(2, 2));
-    double n_norm = cv::norm(refined_normal);
-    if (n_norm > 1e-6) refined_normal *= (1.0 / n_norm);
-    if (refined_normal.dot(expected_floor_normal) < 0.0) refined_normal = -refined_normal;
-
-    double refined_d = -refined_normal.dot(centroid);
-    out_plane = cv::Vec4d(refined_normal[0], refined_normal[1], refined_normal[2], refined_d);
-    out_height = std::abs(refined_d);
-
-    double dot_up = std::clamp(refined_normal.dot(expected_floor_normal), -1.0, 1.0);
-    out_tilt_deg = std::acos(dot_up) * 180.0 / CV_PI;
-
+    // Automatically adapt depth range for small tabletop/handheld objects vs floor-standing frames
+    if (!_floor_standing_mode && _bounding_diag_m < 0.45f) {
+        _min_depth_m = 0.25f;
+        _max_depth_m = 1.85f;
+        _left_margin_ratio = 0.02f;
+        _right_margin_ratio = 0.02f;
+    } else {
+        _min_depth_m = 0.45f;
+        _max_depth_m = 2.10f; // Reject background clutter > 2.10m visible through hollow table frame
+        _left_margin_ratio = 0.08f; // Reject left-edge vertical aluminum post
+        _right_margin_ratio = 0.04f;
+    }
     return true;
 }
 
-std::vector<std::vector<cv::Vec3f>> CADSceneSegmenter::clusterCentralTable(const std::vector<cv::Vec3f>& candidates,
-                                                                            cv::Rect2f& out_roi,
-                                                                            const CameraIntrinsics& intr,
-                                                                            int img_w, int img_h,
-                                                                            const cv::Vec4d& floor_plane,
-                                                                            bool floor_detected) const
-{
-    if (candidates.size() < 40)
-    {
-        out_roi = cv::Rect2f(0, 0, 0, 0);
-        return {};
+void CADSceneSegmenter::setDepthRange(float min_depth_m, float max_depth_m) {
+    _min_depth_m = min_depth_m;
+    _max_depth_m = max_depth_m;
+}
+
+void CADSceneSegmenter::setBorderMarginRatio(float left_margin, float right_margin) {
+    _left_margin_ratio = std::clamp(left_margin, 0.0f, 0.35f);
+    _right_margin_ratio = std::clamp(right_margin, 0.0f, 0.35f);
+}
+
+void CADSceneSegmenter::setExpectedObjectDimensions(float length_m, float width_m, float height_m, bool floor_standing) {
+    _expected_length_m = length_m;
+    _expected_width_m = width_m;
+    _expected_height_m = height_m;
+    _bounding_diag_m = std::sqrt(length_m * length_m + width_m * width_m + height_m * height_m);
+    _floor_standing_mode = floor_standing;
+}
+
+void CADSceneSegmenter::setMultiInstanceMode(bool enable, int max_instances) {
+    _enable_multi_instance = enable;
+    _max_instances = std::max(1, max_instances);
+}
+
+void CADSceneSegmenter::extractDepthPoints(const cv::Mat& depth_z16,
+                                           const CameraIntrinsics& intr,
+                                           const cv::Rect& roi_hint,
+                                           std::vector<cv::Vec3f>& out_pts) const {
+    out_pts.clear();
+    if (depth_z16.empty() || depth_z16.type() != CV_16UC1) return;
+
+    const int w = depth_z16.cols;
+    const int h = depth_z16.rows;
+
+    // Auto-Intrinsics Fallback if caller passed uninitialized intrinsics
+    const float fx = (intr.fx > 100.0) ? static_cast<float>(intr.fx)
+                                       : ((w == 1024 && h == 576) ? 739.41f : 0.95f * w);
+    const float fy = (intr.fy > 100.0) ? static_cast<float>(intr.fy) : fx;
+    const float cx = (intr.ppx > 10.0) ? static_cast<float>(intr.ppx)
+                                       : ((intr.cx > 10.0) ? static_cast<float>(intr.cx) : (0.5f * w));
+    const float cy = (intr.ppy > 10.0) ? static_cast<float>(intr.ppy)
+                                       : ((intr.cy > 10.0) ? static_cast<float>(intr.cy) : (0.5f * h));
+    const float scale = (intr.depth_scale > 0.0) ? static_cast<float>(intr.depth_scale) : 0.001f;
+
+    int x0 = static_cast<int>( std::round(_left_margin_ratio * w) );
+    int x1 = static_cast<int>( std::round((1.0f - _right_margin_ratio) * w) );
+    int y0 = 0;
+    int y1 = h;
+
+    if (roi_hint.width > 16 && roi_hint.height > 16) {
+        x0 = std::max(0, roi_hint.x);
+        y0 = std::max(0, roi_hint.y);
+        x1 = std::min(w, roi_hint.x + roi_hint.width);
+        y1 = std::min(h, roi_hint.y + roi_hint.height);
     }
 
-    // Fast 3D Voxel Grid Hashing (Cell size = 0.08m, matching DBSCAN eps=0.08m)
-    const float cell_size = 0.08f;
+    const int stride = (w >= 1024) ? 2 : 2;
+    out_pts.reserve(((x1 - x0) / stride) * ((y1 - y0) / stride));
+
+    for (int v = y0; v < y1; v += stride) {
+        const uint16_t* row_ptr = depth_z16.ptr<uint16_t>(v);
+        for (int u = x0; u < x1; u += stride) {
+            uint16_t d_raw = row_ptr[u];
+            if (d_raw == 0) continue;
+            float z = d_raw * scale;
+            if (z < _min_depth_m || z > _max_depth_m) continue;
+
+            float x = (static_cast<float>(u) - cx) * z / fx;
+            float y = (static_cast<float>(v) - cy) * z / fy;
+            out_pts.emplace_back(x, y, z);
+        }
+    }
+}
+
+bool CADSceneSegmenter::fitSupportPlaneRANSAC(const std::vector<cv::Vec3f>& pts,
+                                              cv::Vec4d& out_plane,
+                                              std::vector<cv::Vec3f>& out_above_floor) const {
+    out_above_floor.clear();
+    if (pts.size() < 80) {
+        out_above_floor = pts;
+        return false;
+    }
+
+    // Candidate floor/support points (lower part of image / +Y in camera frame)
+    std::vector<cv::Vec3f> floor_cands;
+    floor_cands.reserve(pts.size() / 2);
+    for (const auto& p : pts) {
+        if (_floor_standing_mode) {
+            if (p[1] > -0.05f) floor_cands.push_back(p);
+        } else {
+            floor_cands.push_back(p);
+        }
+    }
+    if (floor_cands.size() < 50) floor_cands = pts;
+
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<size_t> dist(0, floor_cands.size() - 1);
+
+    const double dist_thresh = _floor_standing_mode ? 0.022 : 0.012;
+    size_t best_inliers = 0;
+    cv::Vec4d best_plane(0.0, -1.0, 0.0, 0.0);
+
+    for (int iter = 0; iter < 140; ++iter) {
+        const cv::Vec3f& p1 = floor_cands[dist(rng)];
+        const cv::Vec3f& p2 = floor_cands[dist(rng)];
+        const cv::Vec3f& p3 = floor_cands[dist(rng)];
+
+        cv::Vec3f v1 = p2 - p1;
+        cv::Vec3f v2 = p3 - p1;
+        cv::Vec3f n = v1.cross(v2);
+        float norm_n = cv::norm(n);
+        if (norm_n < 1e-6f) continue;
+        n /= norm_n;
+
+        // Ensure normal points UPWARD in physical world (negative Y in OpenCV camera frame)
+        if (n[1] > 0.0f) n = -n;
+
+        // For FLOOR_STANDING mode, enforce upright floor tilt constraint
+        if (_floor_standing_mode && n[1] > -0.78f) continue;
+
+        double d = -(n[0] * p1[0] + n[1] * p1[1] + n[2] * p1[2]);
+        size_t count = 0;
+        for (size_t k = 0; k < floor_cands.size(); k += 2) {
+            const auto& q = floor_cands[k];
+            double err = std::abs(n[0] * q[0] + n[1] * q[1] + n[2] * q[2] + d);
+            if (err <= dist_thresh) ++count;
+        }
+
+        if (count > best_inliers) {
+            best_inliers = count;
+            best_plane = cv::Vec4d(n[0], n[1], n[2], d);
+        }
+    }
+
+    if (best_inliers < 35) {
+        out_above_floor = pts;
+        return false;
+    }
+
+    // SVD refinement on floor inliers
+    cv::Vec3d mean(0.0, 0.0, 0.0);
+    std::vector<cv::Vec3f> inliers;
+    inliers.reserve(best_inliers * 2);
+    for (const auto& q : floor_cands) {
+        double err = std::abs(best_plane[0] * q[0] + best_plane[1] * q[1] + best_plane[2] * q[2] + best_plane[3]);
+        if (err <= dist_thresh) {
+            inliers.push_back(q);
+            mean += cv::Vec3d(q[0], q[1], q[2]);
+        }
+    }
+    if (inliers.size() >= 15) {
+        mean *= (1.0 / static_cast<double>(inliers.size()));
+        cv::Matx33d cov = cv::Matx33d::zeros();
+        for (const auto& q : inliers) {
+            cv::Vec3d dq(q[0] - mean[0], q[1] - mean[1], q[2] - mean[2]);
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c)
+                    cov(r, c) += dq[r] * dq[c];
+        }
+        cv::Mat eig_vals, eig_vecs;
+        cv::eigen(cv::Mat(cov), eig_vals, eig_vecs);
+        cv::Vec3d n_svd(eig_vecs.at<double>(2, 0), eig_vecs.at<double>(2, 1), eig_vecs.at<double>(2, 2));
+        if (n_svd[1] > 0.0) n_svd = -n_svd;
+        n_svd *= (1.0 / cv::norm(n_svd));
+        double d_svd = -n_svd.dot(mean);
+        best_plane = cv::Vec4d(n_svd[0], n_svd[1], n_svd[2], d_svd);
+    }
+
+    out_plane = best_plane;
+
+    // Filter points strictly above the support plane within expected height envelope
+    const double min_h = _floor_standing_mode ? 0.020 : 0.008;
+    const double max_h = _floor_standing_mode ? (_expected_height_m + 0.18) : (_bounding_diag_m + 0.15);
+
+    out_above_floor.reserve(pts.size());
+    for (const auto& p : pts) {
+        // Signed height above plane (since normal points upward in world / -Y in cam)
+        double h_above = (best_plane[0] * p[0] + best_plane[1] * p[1] + best_plane[2] * p[2] + best_plane[3]);
+        if (h_above >= min_h && h_above <= max_h) {
+            out_above_floor.push_back(p);
+        }
+    }
+    return true;
+}
+
+void CADSceneSegmenter::clusterAndMergeTarget(const std::vector<cv::Vec3f>& fg_pts,
+                                              std::vector<cv::Vec3f>& out_merged_dense,
+                                              std::vector<SegmentedCluster>& out_multi_clusters) const {
+    out_merged_dense.clear();
+    out_multi_clusters.clear();
+    if (fg_pts.empty()) return;
+
+    // Scale-adaptive voxel grid size: 8cm for table/pallets, 1.2cm for small objects like BBQ Sauce
+    const float cell_size = _floor_standing_mode
+        ? std::clamp(_bounding_diag_m * 0.075f, 0.04f, 0.09f)
+        : std::clamp(_bounding_diag_m * 0.060f, 0.008f, 0.035f);
     const float inv_cell = 1.0f / cell_size;
 
-    struct CellKey
-    {
-        int x, y, z;
-        bool operator==(const CellKey& o) const { return x == o.x && y == o.y && z == o.z; }
-    };
+    std::unordered_map<VoxelKey, std::vector<int>, VoxelKeyHash> grid;
+    grid.reserve(fg_pts.size() / 4 + 16);
 
-    struct KeyHasher
-    {
-        size_t operator()(const CellKey& k) const
-        {
-            return (static_cast<size_t>(k.x * 73856093) ^
-                    static_cast<size_t>(k.y * 19349663) ^
-                    static_cast<size_t>(k.z * 83492791));
-        }
-    };
-
-    std::unordered_map<CellKey, std::vector<int>, KeyHasher> grid;
-    grid.reserve(candidates.size() / 2);
-
-    for (int i = 0; i < static_cast<int>(candidates.size()); ++i)
-    {
-        const auto& p = candidates[i];
-        CellKey key{
+    for (int i = 0; i < static_cast<int>(fg_pts.size()); ++i) {
+        const auto& p = fg_pts[i];
+        VoxelKey key{
             static_cast<int>(std::floor(p[0] * inv_cell)),
             static_cast<int>(std::floor(p[1] * inv_cell)),
             static_cast<int>(std::floor(p[2] * inv_cell))
@@ -261,385 +305,195 @@ std::vector<std::vector<cv::Vec3f>> CADSceneSegmenter::clusterCentralTable(const
         grid[key].push_back(i);
     }
 
-    // Connected components on voxel grid (26-connectivity)
-    std::vector<bool> visited(candidates.size(), false);
-    std::vector<std::vector<int>> clusters;
+    // 26-connectivity BFS clustering in Voxel space
+    std::unordered_map<VoxelKey, bool, VoxelKeyHash> visited;
+    visited.reserve(grid.size());
 
-    for (const auto& pair : grid)
-    {
-        for (int pt_idx : pair.second)
-        {
-            if (visited[pt_idx]) continue;
+    // Lowered minimum cluster threshold from 40 -> 15 points so fragmented table legs survive depth dropout
+    const size_t min_cluster_pts = _floor_standing_mode ? 15 : 20;
+    std::vector<SegmentedCluster> raw_clusters;
 
-            std::vector<int> current_cluster;
-            std::vector<CellKey> queue;
+    for (const auto& kv : grid) {
+        if (visited[kv.first]) continue;
 
-            const auto& pt = candidates[pt_idx];
-            CellKey start_key{
-                static_cast<int>(std::floor(pt[0] * inv_cell)),
-                static_cast<int>(std::floor(pt[1] * inv_cell)),
-                static_cast<int>(std::floor(pt[2] * inv_cell))
-            };
-            queue.push_back(start_key);
+        std::queue<VoxelKey> q;
+        q.push(kv.first);
+        visited[kv.first] = true;
 
-            std::unordered_set<CellKey, KeyHasher> visited_cells;
-            visited_cells.insert(start_key);
+        std::vector<cv::Vec3f> cl_pts;
+        cv::Vec3d sum(0.0, 0.0, 0.0);
+        cv::Vec3f bmin(1e9f, 1e9f, 1e9f), bmax(-1e9f, -1e9f, -1e9f);
 
-            // Seed cluster with all points in the starting cell
-            for (int idx : pair.second)
-            {
-                if (!visited[idx])
-                {
-                    visited[idx] = true;
-                    current_cluster.push_back(idx);
-                }
-            }
+        while (!q.empty()) {
+            VoxelKey cur = q.front();
+            q.pop();
 
-            while (!queue.empty())
-            {
-                CellKey cur = queue.back();
-                queue.pop_back();
-
-                for (int dx = -1; dx <= 1; ++dx)
-                {
-                    for (int dy = -1; dy <= 1; ++dy)
-                    {
-                        for (int dz = -1; dz <= 1; ++dz)
-                        {
-                            if (dx == 0 && dy == 0 && dz == 0) continue;
-                            CellKey nb{cur.x + dx, cur.y + dy, cur.z + dz};
-                            if (visited_cells.find(nb) != visited_cells.end()) continue;
-                            visited_cells.insert(nb);
-
-                            auto it = grid.find(nb);
-                            if (it != grid.end())
-                            {
-                                queue.push_back(nb);
-                                for (int idx : it->second)
-                                {
-                                    if (!visited[idx])
-                                    {
-                                        visited[idx] = true;
-                                        current_cluster.push_back(idx);
-                                    }
-                                }
-                            }
-                        }
+            auto it = grid.find(cur);
+            if (it != grid.end()) {
+                for (int idx : it->second) {
+                    const auto& pt = fg_pts[idx];
+                    cl_pts.push_back(pt);
+                    sum += cv::Vec3d(pt[0], pt[1], pt[2]);
+                    for (int d = 0; d < 3; ++d) {
+                        bmin[d] = std::min(bmin[d], pt[d]);
+                        bmax[d] = std::max(bmax[d], pt[d]);
                     }
                 }
             }
 
-            if (current_cluster.size() >= 20)
-            {
-                clusters.push_back(std::move(current_cluster));
+            for (int dx = -1; dx <= 1; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        if (dx == 0 && dy == 0 && dz == 0) continue;
+                        VoxelKey nb{cur.x + dx, cur.y + dy, cur.z + dz};
+                        if (grid.find(nb) != grid.end() && !visited[nb]) {
+                            visited[nb] = true;
+                            q.push(nb);
+                        }
+                    }
+                }
             }
         }
+
+        if (cl_pts.size() < min_cluster_pts) continue;
+
+        cv::Vec3f centroid(
+            static_cast<float>(sum[0] / cl_pts.size()),
+            static_cast<float>(sum[1] / cl_pts.size()),
+            static_cast<float>(sum[2] / cl_pts.size())
+        );
+
+        // Reject extreme off-center or far background clusters
+        if (std::abs(centroid[0]) > 1.15f || centroid[2] > _max_depth_m) continue;
+
+        // Centrality + density score
+        double radial_offset = std::hypot(centroid[0], centroid[1] * 0.5);
+        double score = static_cast<double>(cl_pts.size()) / (centroid[2] + 1.8 * radial_offset + 0.35);
+
+        raw_clusters.push_back(SegmentedCluster{std::move(cl_pts), centroid, bmin, bmax, score});
     }
 
-    if (clusters.empty())
-    {
-        // Fallback: take all candidates if clustering did not separate clusters
-        std::vector<int> all_idx(candidates.size());
-        for (size_t i = 0; i < candidates.size(); ++i) all_idx[i] = static_cast<int>(i);
-        clusters.push_back(all_idx);
+    if (raw_clusters.empty()) {
+        out_merged_dense = fg_pts;
+        return;
     }
 
-    // Rank clusters matching table geometry in valid operational range [0.65m, 3.20m]
-    struct ScoredCluster
-    {
-        int cluster_idx;
-        double score;
-        cv::Vec3d center;
-        double max_h;
-    };
-    std::vector<ScoredCluster> ranked;
+    std::sort(raw_clusters.begin(), raw_clusters.end(),
+              [](const SegmentedCluster& a, const SegmentedCluster& b) { return a.score > b.score; });
 
-    for (size_t c = 0; c < clusters.size(); ++c)
-    {
-        const auto& cl = clusters[c];
-        if (cl.size() < 40) continue;
+    if (_floor_standing_mode) {
+        // Co-box Cluster Merging (Fixes fragmented table legs when front aluminum beam has depth == 0)
+        const SegmentedCluster& seed = raw_clusters[0];
+        const float max_dx = _expected_length_m + 0.12f; // 0.95m for 0.83m table
+        const float max_dz = _expected_width_m + 0.14f;  // 0.58m for 0.44m table
 
-        cv::Vec3d center{0.0, 0.0, 0.0};
-        double max_h = -1e9;
-        double min_h = 1e9;
-
-        for (int idx : cl) {
-            const auto& p = candidates[idx];
-            center += cv::Vec3d(p);
-
-            double h = 0.0;
-            if (floor_detected) {
-                h = floor_plane[0] * p[0] + floor_plane[1] * p[1] + floor_plane[2] * p[2] + floor_plane[3];
+        SegmentedCluster merged = seed;
+        for (size_t i = 1; i < raw_clusters.size(); ++i) {
+            const auto& cand = raw_clusters[i];
+            float dx = std::abs(cand.centroid[0] - seed.centroid[0]);
+            float dz = std::abs(cand.centroid[2] - seed.centroid[2]);
+            if (dx <= max_dx && dz <= max_dz) {
+                merged.points.insert(merged.points.end(), cand.points.begin(), cand.points.end());
+                for (int d = 0; d < 3; ++d) {
+                    merged.bbox_min[d] = std::min(merged.bbox_min[d], cand.bbox_min[d]);
+                    merged.bbox_max[d] = std::max(merged.bbox_max[d], cand.bbox_max[d]);
+                }
+            }
+        }
+        out_merged_dense = merged.points;
+        out_multi_clusters.push_back(std::move(merged));
+    } else {
+        // Multi-Instance Mode (e.g. 2 TANGY BBQ Sauce bottles lying next to each other on sofa)
+        int count = std::min(static_cast<int>(raw_clusters.size()), _max_instances);
+        for (int i = 0; i < count; ++i) {
+            cv::Vec3f ext = raw_clusters[i].bbox_max - raw_clusters[i].bbox_min;
+            float cluster_diag = cv::norm(ext);
+            // If two identical objects touch each other (cluster_diag > 1.35 * bounding_diag),
+            // split cluster along its principal horizontal axis so each instance gets its own pose!
+            if (_enable_multi_instance && cluster_diag > 1.35f * _bounding_diag_m && raw_clusters[i].points.size() >= 60) {
+                float mid_x = raw_clusters[i].centroid[0];
+                SegmentedCluster left_inst, right_inst;
+                for (const auto& pt : raw_clusters[i].points) {
+                    if (pt[0] <= mid_x) left_inst.points.push_back(pt);
+                    else right_inst.points.push_back(pt);
+                }
+                if (left_inst.points.size() >= 20) out_multi_clusters.push_back(std::move(left_inst));
+                if (right_inst.points.size() >= 20) out_multi_clusters.push_back(std::move(right_inst));
             } else {
-                h = -p[1] + 0.35;
+                out_multi_clusters.push_back(raw_clusters[i]);
             }
-            if (h > max_h) max_h = h;
-            if (h < min_h) min_h = h;
         }
-        center *= (1.0 / cl.size());
-
-        // Working operational range [0.65m, 3.20m], lateral |px| <= 1.20m
-        if (center[2] < 0.65 || center[2] > 3.20 || std::abs(center[0]) > 1.20) {
-            continue;
-        }
-
-        // REJECT FLOOR OBJECTS / PALLETS:
-        // Pallet alone is only ~14cm tall. Table must reach at least 25cm above floor!
-        if (floor_detected && max_h < 0.25) {
-            continue;
-        }
-
-        // Scoring: Exactly matches real_sensor_pipeline.py:
-        // d_center = np.linalg.norm(c[:2]) + c[2] * 0.2
-        // score = n_pts / (d_center + 0.5)
-        double d_center = std::sqrt(center[0] * center[0] + center[1] * center[1]) + center[2] * 0.20;
-        double score = static_cast<double>(cl.size()) / (d_center + 0.50);
-
-        ranked.push_back({static_cast<int>(c), score, center, max_h});
+        out_merged_dense = out_multi_clusters.front().points;
     }
-
-    std::sort(ranked.begin(), ranked.end(), [](const ScoredCluster& a, const ScoredCluster& b) {
-        return a.score > b.score;
-    });
-
-    if (ranked.empty())
-    {
-        // When individual clusters are sparse or separated across table profiles (legs/beams),
-        // take all table candidates together as the unified table structure!
-        if (candidates.size() >= 10) {
-            std::vector<std::vector<cv::Vec3f>> result_all;
-            result_all.push_back(candidates);
-            return result_all;
-        }
-        return {};
-    }
-
-    std::vector<std::vector<cv::Vec3f>> result_clusters;
-    int num_to_take = std::min(3, static_cast<int>(ranked.size()));
-    for (int k = 0; k < num_to_take; ++k)
-    {
-        const auto& cl = clusters[ranked[k].cluster_idx];
-        std::vector<cv::Vec3f> pts;
-        pts.reserve(cl.size());
-        for (int idx : cl) pts.push_back(candidates[idx]);
-        result_clusters.push_back(std::move(pts));
-    }
-
-    // 2D ROI from top cluster
-    const auto& best_cl = clusters[ranked[0].cluster_idx];
-    float min_u = static_cast<float>(img_w);
-    float max_u = 0.0f;
-    float min_v = static_cast<float>(img_h);
-    float max_v = 0.0f;
-
-    for (int idx : best_cl)
-    {
-        const auto& p = candidates[idx];
-        float u = static_cast<float>(intr.fx * p[0] / p[2] + intr.ppx);
-        float v = static_cast<float>(intr.fy * p[1] / p[2] + intr.ppy);
-
-        min_u = std::min(min_u, u);
-        max_u = std::max(max_u, u);
-        min_v = std::min(min_v, v);
-        max_v = std::max(max_v, v);
-    }
-
-    min_u = std::clamp(min_u, 0.0f, static_cast<float>(img_w - 1));
-    max_u = std::clamp(max_u, 0.0f, static_cast<float>(img_w - 1));
-    min_v = std::clamp(min_v, 0.0f, static_cast<float>(img_h - 1));
-    max_v = std::clamp(max_v, 0.0f, static_cast<float>(img_h - 1));
-
-    if (max_u > min_u && max_v > min_v)
-    {
-        out_roi = cv::Rect2f(min_u, min_v, max_u - min_u, max_v - min_v);
-    }
-    else
-    {
-        out_roi = cv::Rect2f(0, 0, static_cast<float>(img_w), static_cast<float>(img_h));
-    }
-
-    return result_clusters;
 }
 
-CADSceneSegmenter::SegmentResult CADSceneSegmenter::segment(const RgbdFrame& frame,
-                                                          int target_points,
-                                                          const cv::Rect2f* rgb_roi) const
-{
-    SegmentResult res;
-    if (!frame.valid())
-    {
-        res.status = "invalid_frame";
-        return res;
-    }
-
-    // Step 1: Sub-sample depth points from full depth frame for robust floor plane fitting and table extraction
-    std::vector<cv::Vec3f> raw_pts = extractDepthPoints(frame, 1, nullptr);
-    res.raw_points_count = static_cast<int>(raw_pts.size());
-
-    if (raw_pts.size() < 100)
-    {
-        res.status = "too_few_depth_points";
-        return res;
-    }
-
-    // Step 2: Fit floor plane
-    cv::Vec4d floor_plane;
-    double floor_height = 0.0;
-    double floor_tilt = 0.0;
-    bool floor_found = fitFloorPlane(raw_pts, floor_plane, floor_height, floor_tilt);
-
-    res.floor_detected = floor_found;
-    res.floor_plane = floor_plane;
-    res.floor_height_m = floor_height;
-    res.floor_tilt_deg = floor_tilt;
-
-    // Step 3: Elevation & 2D/3D Frustum ROI filtering
-    std::vector<cv::Vec3f> table_candidates;
-    table_candidates.reserve(raw_pts.size() / 2);
-
-    const bool use_roi_frustum = (rgb_roi && rgb_roi->width > 20.0f && rgb_roi->height > 20.0f);
-    float roi_u0 = 0.0f, roi_u1 = static_cast<float>(frame.width);
-    float roi_v0 = 0.0f, roi_v1 = static_cast<float>(frame.height);
-    float min_z_filter = 0.50f, max_z_filter = 3.20f;
-    double max_elev_above_floor = 1.40;
-
-    if (use_roi_frustum) {
-        // Tight 25px lateral margin to strictly exclude foreground peripheral clutter
-        const float pad_x = 25.0f;
-        const float pad_y = 25.0f;
-        roi_u0 = std::max(0.0f, rgb_roi->x - pad_x);
-        roi_u1 = std::min(static_cast<float>(frame.width), rgb_roi->x + rgb_roi->width + pad_x);
-        roi_v0 = std::max(0.0f, rgb_roi->y - pad_y);
-        roi_v1 = std::min(static_cast<float>(frame.height), rgb_roi->y + rgb_roi->height + pad_y);
-
-        const float est_z = static_cast<float>((frame.intrinsics.fx * 2.0 * _half_l) / rgb_roi->width);
-        if (est_z >= 0.50f && est_z <= 2.50f) {
-            min_z_filter = std::max(0.50f, est_z - 0.15f);
-            max_z_filter = est_z + static_cast<float>(2.0 * _half_w) + 0.30f;
+std::vector<cv::Vec3f> CADSceneSegmenter::samplePointsCurvatureAware(const std::vector<cv::Vec3f>& pts,
+                                                                     size_t target_count) const {
+    if (pts.empty()) return {};
+    if (pts.size() <= target_count) {
+        std::vector<cv::Vec3f> padded = pts;
+        std::mt19937 rng(1337);
+        std::uniform_int_distribution<size_t> dist(0, pts.size() - 1);
+        while (padded.size() < target_count) {
+            padded.push_back(pts[dist(rng)]);
         }
-        max_elev_above_floor = _total_h + 0.12; // 0.625m max height above floor for table
+        return padded;
     }
 
-    if (floor_found)
-    {
-        cv::Vec3d normal(floor_plane[0], floor_plane[1], floor_plane[2]);
-        double d = floor_plane[3];
-
-        for (const auto& p : raw_pts)
-        {
-            if (p[2] < min_z_filter || p[2] > max_z_filter) continue;
-
-            if (use_roi_frustum) {
-                float u = static_cast<float>(frame.intrinsics.fx * p[0] / p[2] + frame.intrinsics.ppx);
-                float v = static_cast<float>(frame.intrinsics.fy * p[1] / p[2] + frame.intrinsics.ppy);
-                if (u < roi_u0 || u > roi_u1 || v < roi_v0 || v > roi_v1) continue;
-            }
-
-            cv::Vec3d pt(p);
-            double h_above_floor = normal.dot(pt) + d; // Signed distance along UP vector
-
-            if (h_above_floor >= 0.025 && h_above_floor <= max_elev_above_floor && std::abs(p[0]) <= 1.50f)
-            {
-                table_candidates.push_back(p);
-            }
-        }
+    // 50% High-gradient / boundary points + 50% Stratified spatial points
+    std::vector<std::pair<float, size_t>> score_idx;
+    score_idx.reserve(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i) {
+        const auto& p = pts[i];
+        const auto& p_prev = pts[(i > 0) ? (i - 1) : i];
+        const auto& p_next = pts[(i + 1 < pts.size()) ? (i + 1) : i];
+        float local_var = cv::norm(p - 0.5f * (p_prev + p_next));
+        score_idx.emplace_back(local_var, i);
     }
-    else
-    {
-        // Fallback: depth band filter if floor was not distinct
-        for (const auto& p : raw_pts)
-        {
-            if (p[2] >= min_z_filter && p[2] <= max_z_filter && std::abs(p[0]) <= 1.50f)
-            {
-                if (use_roi_frustum) {
-                    float u = static_cast<float>(frame.intrinsics.fx * p[0] / p[2] + frame.intrinsics.ppx);
-                    float v = static_cast<float>(frame.intrinsics.fy * p[1] / p[2] + frame.intrinsics.ppy);
-                    if (u < roi_u0 || u > roi_u1 || v < roi_v0 || v > roi_v1) continue;
-                }
-                table_candidates.push_back(p);
-            }
-        }
+    std::sort(score_idx.begin(), score_idx.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::vector<cv::Vec3f> out;
+    out.reserve(target_count);
+    size_t half = target_count / 2;
+    for (size_t i = 0; i < half; ++i) {
+        out.push_back(pts[score_idx[i].second]);
     }
 
-    if (table_candidates.size() < 10)
-    {
-        res.status = "no_table_candidates_above_floor";
-        return res;
+    size_t rem = target_count - half;
+    double step = static_cast<double>(score_idx.size() - half) / static_cast<double>(rem);
+    for (size_t i = 0; i < rem; ++i) {
+        size_t pick = half + std::min(score_idx.size() - half - 1, static_cast<size_t>(i * step));
+        out.push_back(pts[score_idx[pick].second]);
+    }
+    return out;
+}
+
+SegmentationResult CADSceneSegmenter::segment(const cv::Mat& depth_z16,
+                                              const CameraIntrinsics& intr,
+                                              const cv::Rect& roi_hint,
+                                              size_t target_num_points) const {
+    SegmentationResult res;
+    std::vector<cv::Vec3f> raw_pts;
+    extractDepthPoints(depth_z16, intr, roi_hint, raw_pts);
+    if (raw_pts.size() < 20) return res;
+
+    std::vector<cv::Vec3f> fg_pts;
+    res.floor_detected = fitSupportPlaneRANSAC(raw_pts, res.floor_plane, fg_pts);
+    if (fg_pts.size() < 15) {
+        fg_pts = raw_pts;
     }
 
-    // Step 4: When Frustum 2D/3D ROI is active, table points are already isolated from peripheral clutter.
-    // Preserving all table candidates as a unified structure prevents fracturing front/rear frames and legs.
-    if (use_roi_frustum && table_candidates.size() >= 50)
-    {
-        std::vector<cv::Vec3f> sampled;
-        sampled.reserve(target_points);
-        const double stride = static_cast<double>(table_candidates.size()) / static_cast<double>(target_points);
-        for (int i = 0; i < target_points; ++i)
-        {
-            size_t idx = static_cast<size_t>(i * stride);
-            if (idx >= table_candidates.size()) idx = table_candidates.size() - 1;
-            sampled.push_back(table_candidates[idx]);
-        }
-        res.roi_2d = *rgb_roi;
-        res.table_cluster_points_count = static_cast<int>(table_candidates.size());
-        res.table_points = sampled;
-        res.cluster_candidates.push_back(std::move(sampled));
-        res.valid = true;
-        res.status = "ok";
-        return res;
+    clusterAndMergeTarget(fg_pts, res.dense_object_points, res.multi_clusters);
+    if (res.dense_object_points.empty()) return res;
+
+    res.object_points = samplePointsCurvatureAware(res.dense_object_points, target_num_points);
+    for (auto& cl : res.multi_clusters) {
+        cl.points = samplePointsCurvatureAware(cl.points, target_num_points);
     }
-
-    // Fallback: Spatial voxel clustering to isolate table candidate clusters when ROI is not provided
-    int img_w = static_cast<int>(frame.width);
-    int img_h = static_cast<int>(frame.height);
-    std::vector<std::vector<cv::Vec3f>> all_cl_pts = clusterCentralTable(table_candidates,
-                                                                         res.roi_2d,
-                                                                         frame.intrinsics,
-                                                                         img_w, img_h,
-                                                                         floor_plane,
-                                                                         floor_found);
-
-    if (all_cl_pts.empty() || all_cl_pts[0].size() < 10)
-    {
-        res.status = "table_cluster_too_small";
-        return res;
-    }
-
-    res.table_cluster_points_count = static_cast<int>(all_cl_pts[0].size());
-
-    if (rgb_roi && rgb_roi->width > 10.0f && rgb_roi->height > 10.0f)
-    {
-        res.roi_2d = *rgb_roi;
-    }
-
-    // Step 5: Subsample each cluster candidate to target_points (1024)
-    for (const auto& cl_pts : all_cl_pts)
-    {
-        std::vector<cv::Vec3f> sampled;
-        sampled.reserve(target_points);
-
-        if (cl_pts.size() >= static_cast<size_t>(target_points))
-        {
-            double stride = static_cast<double>(cl_pts.size()) / static_cast<double>(target_points);
-            for (int i = 0; i < target_points; ++i)
-            {
-                size_t idx = static_cast<size_t>(i * stride);
-                if (idx >= cl_pts.size()) idx = cl_pts.size() - 1;
-                sampled.push_back(cl_pts[idx]);
-            }
-        }
-        else
-        {
-            for (int i = 0; i < target_points; ++i)
-            {
-                sampled.push_back(cl_pts[i % cl_pts.size()]);
-            }
-        }
-        res.cluster_candidates.push_back(std::move(sampled));
-    }
-
-    res.table_points = res.cluster_candidates[0];
-    res.valid = true;
-    res.status = "ok";
+    res.valid = !res.object_points.empty();
     return res;
 }
+
+} // namespace tmcad
+

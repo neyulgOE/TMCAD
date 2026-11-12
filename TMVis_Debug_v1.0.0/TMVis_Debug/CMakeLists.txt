@@ -42,6 +42,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 target_link_directories(${PROJECT_NAME} PRIVATE
+    "${CMAKE_SOURCE_DIR}/../../libs/onnxruntime"
     "/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
 )
 
@@ -54,14 +55,14 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
-    BUILD_RPATH "/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
-    INSTALL_RPATH "/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
+    BUILD_RPATH "${CMAKE_SOURCE_DIR}/../../libs/onnxruntime;/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
+    INSTALL_RPATH "${CMAKE_SOURCE_DIR}/../../libs/onnxruntime;/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
 )
 
 if (EXISTS "${CMAKE_SOURCE_DIR}/build/test_estimate.cpp")
     set(CAD_SOURCES
         "${CMAKE_SOURCE_DIR}/CadPose/CADSceneSegmenter.cpp"
-        "${CMAKE_SOURCE_DIR}/CadPose/TablePoseEstimator.cpp"
+        "${CMAKE_SOURCE_DIR}/CadPose/UniversalPoseEstimator.cpp"
         "${CMAKE_SOURCE_DIR}/CadPose/CADTemplateDetector.cpp"
     )
     add_executable(test_estimate "${CMAKE_SOURCE_DIR}/build/test_estimate.cpp" ${CAD_SOURCES})
@@ -78,6 +79,7 @@ if (EXISTS "${CMAKE_SOURCE_DIR}/build/test_estimate.cpp")
         ${OpenCV_INCLUDE_DIRS}
     )
     target_link_directories(test_estimate PRIVATE
+        "${CMAKE_SOURCE_DIR}/../../libs/onnxruntime"
         "/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
     )
     target_link_libraries(test_estimate PRIVATE
@@ -86,7 +88,7 @@ if (EXISTS "${CMAKE_SOURCE_DIR}/build/test_estimate.cpp")
         onnxruntime
     )
     set_target_properties(test_estimate PROPERTIES
-        BUILD_RPATH "/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
-        INSTALL_RPATH "/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/../../libs/onnxruntime;/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/../../libs/onnxruntime;/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
     )
 endif()

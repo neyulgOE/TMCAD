@@ -55,13 +55,22 @@ add_executable(CadViewer
     src/MuJoCoSimDialog.cpp
     src/CADSceneSegmenter.h
     src/CADSceneSegmenter.cpp
+    src/UniversalPoseEstimator.h
+    src/UniversalPoseEstimator.cpp
 )
 
 target_include_directories(CadViewer PRIVATE 
     ${Open3D_INCLUDE_DIRS} 
     ${OpenCV_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/mujoco/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/TMVis_Debug_v1.0.0/TMVis_Debug/ort_include
 )
+
+target_link_directories(CadViewer PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime"
+    "/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
+)
+
 target_link_libraries(CadViewer PRIVATE
     Qt5::Widgets
     Open3D::Open3D
@@ -73,6 +82,12 @@ target_link_libraries(CadViewer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++.so.1
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++abi.so.1
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/mujoco/lib/libmujoco.so
+    onnxruntime
+)
+
+set_target_properties(CadViewer PROPERTIES
+    BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime;/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
+    INSTALL_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime;/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
 )
 
 add_executable(run_sweeps src/run_sweeps.cpp src/CADHierarchy.cpp src/CADPreprocessor.cpp src/CADAsset.cpp src/SceneManager.cpp src/SceneObject.cpp src/SyntheticRGBDSource.cpp src/PoseEstimator.cpp)

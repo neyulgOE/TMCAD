@@ -7,8 +7,11 @@ struct CameraIntrinsics
 {
     double fx = 0.0;
     double fy = 0.0;
+    double cx = 0.0;
+    double cy = 0.0;
     double ppx = 0.0;
     double ppy = 0.0;
+    double depth_scale = 0.001;
 
     bool valid() const
     {
