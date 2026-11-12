@@ -30,6 +30,12 @@ struct ObjectPose {
     int cluster_points_count{0};
     double rmse_m{0.0};
 
+    // Diagnostic telemetry fields populated by UniversalPoseEstimator
+    int valid_depth_pts{0};
+    bool floor_locked{false};
+    double floor_pitch_deg{0.0};
+    bool sparse_depth_fallback{false};
+
     cv::Matx33d R = cv::Matx33d::eye();
     cv::Vec3d t{0.0, 0.0, 0.0};
     cv::Vec3d t_glass{0.0, 0.0, 0.0};
@@ -43,6 +49,7 @@ struct ObjectPose {
     cv::Rect2f bbox_2d;
     std::vector<cv::Point2f> corners_2d;
     std::vector<cv::Point2f> face_corners_2d;
+    std::vector<cv::Vec3f> segmented_points;
 };
 
 class UniversalPoseEstimator {
@@ -67,28 +74,31 @@ public:
     // Single-object 6DoF estimation (supports both FLOOR_STANDING frames and FREE_6DOF parts)
     ObjectPose estimate(const cv::Mat& rgb,
                         const cv::Mat& depth_z16,
-                        const CameraIntrinsics& intr);
+                        const CameraIntrinsics& intr,
+                        const cv::Rect& roi_hint = cv::Rect());
 
     // Backward-compatible overload with depth_scale
     ObjectPose estimate(const cv::Mat& rgb,
                         const cv::Mat& depth_z16,
                         double depth_scale,
-                        const CameraIntrinsics& intr)
+                        const CameraIntrinsics& intr,
+                        const cv::Rect& roi_hint = cv::Rect())
     {
         CameraIntrinsics intr_copy = intr;
         if (depth_scale > 0.0) intr_copy.depth_scale = depth_scale;
-        return estimate(rgb, depth_z16, intr_copy);
+        return estimate(rgb, depth_z16, intr_copy, roi_hint);
     }
 
     // One-shot snapshot estimation for TMVis
     ObjectPose estimateSnapshot(const cv::Mat& rgb,
                                 const cv::Mat& depth_z16,
                                 double depth_scale,
-                                const CameraIntrinsics& intr)
+                                const CameraIntrinsics& intr,
+                                const cv::Rect& roi_hint = cv::Rect())
     {
         CameraIntrinsics intr_copy = intr;
         if (depth_scale > 0.0) intr_copy.depth_scale = depth_scale;
-        return estimate(rgb, depth_z16, intr_copy);
+        return estimate(rgb, depth_z16, intr_copy, roi_hint);
     }
 
     // TMVis async refinement polling stub
@@ -106,7 +116,8 @@ public:
     // Multi-instance / Multi-object 6DoF estimation (e.g. multiple bottles, gears, or boxes in 1 scene)
     std::vector<ObjectPose> estimateMultiObjects(const cv::Mat& rgb,
                                                  const cv::Mat& depth_z16,
-                                                 const CameraIntrinsics& intr);
+                                                 const CameraIntrinsics& intr,
+                                                 const cv::Rect& roi_hint = cv::Rect());
 
     // Universal 3D HUD & Wireframe Overlay (renders any CAD's 3D crease/feature wireframe + OBB)
     void drawOverlay(cv::Mat& img,
@@ -127,13 +138,43 @@ public:
     bool isInTargetWorkspace(const cv::Vec3d& t) const;
     bool isCandidateRotationValid(const cv::Matx33d& R_candidate) const;
 
+    void setMultiInstanceMode(bool enable, int max_instances = 4);
+    bool multiInstanceMode() const noexcept { return _multi_instance_enabled; }
+
     const std::string& modelName() const noexcept { return _model_name; }
+    const std::string& loadedOnnxPath() const noexcept { return _loaded_onnx_path; }
     bool isFloorStanding() const noexcept { return _is_floor_standing; }
+    int symmetryCode() const noexcept { return _symmetry_code; }
+    double realBoundingDiagM() const noexcept { return _real_bounding_diag_m; }
+    const cv::Vec3d& cadMin() const noexcept { return _cad_min; }
+    const cv::Vec3d& cadMax() const noexcept { return _cad_max; }
+    const std::vector<FeatureEdge3D>& cadFeatureEdges() const noexcept { return _cad_feature_edges; }
+    const std::vector<cv::Vec3f>& cadSurfacePts() const noexcept { return _mesh_pts; }
+
+    int lastValidDepthPts() const noexcept { return _last_valid_depth_pts; }
+    bool lastFloorLocked() const noexcept { return _last_floor_locked; }
+    double lastFloorPitchDeg() const noexcept { return _last_floor_pitch_deg; }
+    bool lastSparseDepthFallback() const noexcept { return _last_sparse_depth_fallback; }
+    double lastAiLatencyMs() const noexcept { return _last_ai_latency_ms; }
+    double lastSolveLatencyMs() const noexcept { return _last_solve_latency_ms; }
+    double lastTotalLatencyMs() const noexcept { return _last_total_latency_ms; }
+    const std::vector<cv::Vec3f>& lastSegmentedPoints() const noexcept { return _last_segmented_points; }
 
 private:
     bool unpackBlackBoxOnnx();
     bool unpackBlackBoxOnnxMetadata();
     bool runInference(const std::vector<cv::Vec3f>& obs_pts, std::vector<float>& out_obs_desc) const;
+
+    ObjectPose estimateSingleCluster(const std::vector<cv::Vec3f>& sampled_pts,
+                                     const std::vector<cv::Vec3f>& dense_pts,
+                                     const cv::Vec4d& floor_plane,
+                                     bool floor_detected,
+                                     double floor_pitch_deg,
+                                     const cv::Mat& rgb,
+                                     const CameraIntrinsics& intr,
+                                     int img_w,
+                                     int img_h,
+                                     double* out_ai_ms = nullptr) const;
 
     ObjectPose solveRansacKabsch(const std::vector<cv::Vec3f>& obs_pts,
                                  const std::vector<float>& obs_desc,
@@ -147,6 +188,14 @@ private:
     void refinePoseUniversalCrease2D3D(ObjectPose& pose,
                                        const cv::Mat& rgb,
                                        const CameraIntrinsics& intr) const;
+
+    bool rescorePoseUnclipped(ObjectPose& pose,
+                              const std::vector<cv::Vec3f>& full_fg_pts,
+                              const cv::Mat& depth_z16,
+                              const CameraIntrinsics& intr,
+                              int img_w,
+                              int img_h,
+                              bool strict_clutter_gate = false) const;
 
     cv::Rect2f projectCadBoundingBox(const cv::Matx33d& R,
                                      const cv::Vec3d& t,
@@ -170,7 +219,18 @@ private:
     bool _is_floor_standing{false};
     bool _enable_2d_frame_anchor{false};
     bool _meta_unpacked{false};
+    bool _multi_instance_enabled{true};
+    int _max_instances{4};
     int _symmetry_code{0};
+
+    int _last_valid_depth_pts{0};
+    bool _last_floor_locked{false};
+    double _last_floor_pitch_deg{0.0};
+    bool _last_sparse_depth_fallback{false};
+    double _last_ai_latency_ms{0.0};
+    double _last_solve_latency_ms{0.0};
+    double _last_total_latency_ms{0.0};
+    std::vector<cv::Vec3f> _last_segmented_points;
 
     size_t _num_obs_points{1024};
     size_t _num_cad_samples{0};

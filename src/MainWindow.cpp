@@ -42,6 +42,11 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
+#include <QSet>
+#include <QSignalBlocker>
+#include <QPointer>
+#include <QProcessEnvironment>
+#include <functional>
 #include <QTextStream>
 #include <QDateTime>
 #include <QRegularExpression>
@@ -493,7 +498,7 @@ StaticRGBDTestDialog::StaticRGBDTestDialog(QWidget* parent, const QString& activ
     mainLayout->addWidget(presetGroup);
 
     // File selection group
-    auto* fileGroup = new QGroupBox("📁 Đường Dẫn Ảnh (Color & Depth)", this);
+    auto* fileGroup = new QGroupBox("📁 Đường Dẫn Ảnh (Color && Depth)", this);
     fileGroup->setStyleSheet("QGroupBox { font-weight: bold; color: #e0e0e0; border: 1px solid #37474f; border-radius: 6px; margin-top: 8px; padding-top: 12px; }"
                              "QGroupBox::title { subcontrol-origin: margin; left: 8px; }");
     auto* fileForm = new QFormLayout(fileGroup);
@@ -624,8 +629,7 @@ StaticRGBDTestDialog::StaticRGBDTestDialog(QWidget* parent, const QString& activ
 }
 
 void StaticRGBDTestDialog::onLoadHopePreset() {
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(tmcad::StudioUxToolbar::resolveProjectRoot());
 
     QString rgbPath = tmcadDir.absoluteFilePath("data/hope_sample/test_scenes/scene_000001/rgb/000000.png");
     QString depthPath = tmcadDir.absoluteFilePath("data/hope_sample/test_scenes/scene_000001/depth/000000.png");
@@ -653,8 +657,7 @@ void StaticRGBDTestDialog::onLoadHopePreset() {
 }
 
 void StaticRGBDTestDialog::onLoadDumpPreset() {
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(tmcad::StudioUxToolbar::resolveProjectRoot());
 
     QString rgbPath = tmcadDir.absoluteFilePath("dump_rgb.png");
     QString depthPath = tmcadDir.absoluteFilePath("dump_depth.png");
@@ -678,8 +681,7 @@ void StaticRGBDTestDialog::onLoadDumpPreset() {
 }
 
 void StaticRGBDTestDialog::onLoadDatasetPreset() {
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(tmcad::StudioUxToolbar::resolveProjectRoot());
 
     QString rgbPath = tmcadDir.absoluteFilePath("dataset/TABLE-DEMO_audit_v1/sample_00000/color.png");
     QString depthPath = tmcadDir.absoluteFilePath("dataset/TABLE-DEMO_audit_v1/sample_00000/depth.png");
@@ -756,6 +758,13 @@ void StaticRGBDTestDialog::autoDetectCompanion(const QString& colorPath) {
         QString cand = dir.absoluteFilePath(base + "_depth.png");
         if (QFile::exists(cand)) foundDepth = cand;
     }
+    if (foundDepth.isEmpty() && dir.dirName().compare("rgb", Qt::CaseInsensitive) == 0) {
+        QDir parentDir = dir;
+        if (parentDir.cdUp()) {
+            QString cand = parentDir.absoluteFilePath("depth/" + fi.fileName());
+            if (QFile::exists(cand)) foundDepth = cand;
+        }
+    }
     if (foundDepth.isEmpty()) {
         QStringList depthFiles = dir.entryList(QStringList() << "*depth*.png", QDir::Files);
         if (!depthFiles.isEmpty()) {
@@ -783,6 +792,18 @@ void StaticRGBDTestDialog::autoDetectCompanion(const QString& colorPath) {
     }
 
     if (QFile::exists(metaPath)) {
+        auto applyDepthScaleValue = [&](double ds, bool isBopJson) {
+            if (ds <= 0.0) return;
+            if (ds <= 0.05) {
+                scaleSpin_->setValue(1.0 / ds);
+            } else if (isBopJson || ds <= 10.0) {
+                // BOP scene_camera.json stores depth_scale in mm/unit (e.g. 1.0 -> 1mm/unit -> divisor 1000.0)
+                scaleSpin_->setValue(1000.0 / ds);
+            } else {
+                scaleSpin_->setValue(ds);
+            }
+        };
+
         if (metaPath.endsWith(".txt")) {
             QFile f(metaPath);
             if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -797,7 +818,7 @@ void StaticRGBDTestDialog::autoDetectCompanion(const QString& colorPath) {
                     else if (line.startsWith("h=")) heightSpin_->setValue(line.mid(2).toInt());
                     else if (line.startsWith("scale=")) {
                         double sc = line.mid(6).toDouble();
-                        if (sc > 0) scaleSpin_->setValue(1.0 / sc);
+                        applyDepthScaleValue(sc, false);
                     }
                 }
             }
@@ -807,10 +828,12 @@ void StaticRGBDTestDialog::autoDetectCompanion(const QString& colorPath) {
                 QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
                 if (doc.isObject()) {
                     QJsonObject obj = doc.object();
-                    if (obj.contains("0") && obj["0"].isObject()) {
-                        QJsonObject frame0 = obj["0"].toObject();
-                        if (frame0.contains("cam_K")) {
-                            QJsonArray kArr = frame0["cam_K"].toArray();
+                    QString frameKey = QString::number(fi.completeBaseName().toInt());
+                    QString targetKey = obj.contains(frameKey) ? frameKey : QString("0");
+                    if (obj.contains(targetKey) && obj[targetKey].isObject()) {
+                        QJsonObject frameObj = obj[targetKey].toObject();
+                        if (frameObj.contains("cam_K")) {
+                            QJsonArray kArr = frameObj["cam_K"].toArray();
                             if (kArr.size() >= 9) {
                                 double raw_fx = kArr[0].toDouble();
                                 double raw_fy = kArr[4].toDouble();
@@ -831,8 +854,8 @@ void StaticRGBDTestDialog::autoDetectCompanion(const QString& colorPath) {
                                 }
                             }
                         }
-                        if (frame0.contains("depth_scale")) {
-                            scaleSpin_->setValue(frame0["depth_scale"].toDouble());
+                        if (frameObj.contains("depth_scale")) {
+                            applyDepthScaleValue(frameObj["depth_scale"].toDouble(1.0), true);
                         }
                     } else {
                         if (obj.contains("fx")) fxSpin_->setValue(obj["fx"].toDouble());
@@ -841,6 +864,9 @@ void StaticRGBDTestDialog::autoDetectCompanion(const QString& colorPath) {
                         if (obj.contains("cy")) cySpin_->setValue(obj["cy"].toDouble());
                         if (obj.contains("width")) widthSpin_->setValue(obj["width"].toInt());
                         if (obj.contains("height")) heightSpin_->setValue(obj["height"].toInt());
+                        if (obj.contains("depth_scale")) {
+                            applyDepthScaleValue(obj["depth_scale"].toDouble(1000.0), false);
+                        }
                     }
                 }
             }
@@ -884,7 +910,9 @@ double StaticRGBDTestDialog::depthScale() const { return scaleSpin_->value(); }
 // ---------------------------------------------------------------------------
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+    qRegisterMetaType<tmcad::OverlayRenderFlags>("tmcad::OverlayRenderFlags");
     scene_ = new SceneManager(this);
+    universalPoseEstimator_ = std::make_unique<tmcad::UniversalPoseEstimator>();
     setAcceptDrops(true);
     buildUi();
     statusBar()->showMessage("Sẵn sàng. Hỗ trợ kéo thả trực tiếp tệp CAD (.stl, .obj, .ply, .pcd) hoặc .bag vào cửa sổ.");
@@ -957,14 +985,14 @@ void MainWindow::buildUi() {
     showAxesAction->setChecked(true);
     connect(showAxesAction, &QAction::toggled, this, &MainWindow::onShowAxesToggled);
 
-    QAction* toggleCamViewAct = toolbar->addAction("📹 Bật/Tắt Khung Camera");
-    toggleCamViewAct->setCheckable(true);
-    toggleCamViewAct->setChecked(false);
-    connect(toggleCamViewAct, &QAction::toggled, this, [this](bool checked) {
+    toggleCamViewAct_ = toolbar->addAction("📹 Bật/Tắt Khung Camera");
+    toggleCamViewAct_->setCheckable(true);
+    toggleCamViewAct_->setChecked(false);
+    connect(toggleCamViewAct_, &QAction::toggled, this, [this](bool checked) {
         if (!liveCameraStreamWidget_) return;
         if (checked) {
             liveCameraStreamWidget_->show();
-            if (!liveCameraStreamWidget_->isStreaming()) {
+            if (!liveCameraStreamWidget_->isStreaming() && !lastStaticFrame_.valid()) {
                 liveCameraStreamWidget_->startStream("");
             }
         } else {
@@ -1149,9 +1177,9 @@ void MainWindow::buildUi() {
     liveSnapshotPoseBtn_->setStyleSheet(
         "QPushButton { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00b0ff, stop:1 #00e676); color: #000000; font-weight: bold; font-size: 12px; border-radius: 5px; }"
         "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #40c4ff, stop:1 #69f0ae); }");
-    connect(liveSnapshotPoseBtn_, &QPushButton::clicked, this, [this, toggleCamViewAct]() {
-        if (liveCameraStreamWidget_ && liveCameraStreamWidget_->isHidden()) {
-            toggleCamViewAct->setChecked(true);
+    connect(liveSnapshotPoseBtn_, &QPushButton::clicked, this, [this]() {
+        if (liveCameraStreamWidget_ && liveCameraStreamWidget_->isHidden() && toggleCamViewAct_) {
+            toggleCamViewAct_->setChecked(true);
         }
         onEstimatePoseLiveSnapshot();
     });
@@ -1159,9 +1187,9 @@ void MainWindow::buildUi() {
 
     liveContinuousTrackingCheck_ = new QCheckBox("🔄 Theo dõi liên tục Real-time (~10 FPS)", step2Box);
     liveContinuousTrackingCheck_->setStyleSheet("QCheckBox { font-size: 11px; font-weight: bold; color: #00e676; padding: 2px; }");
-    connect(liveContinuousTrackingCheck_, &QCheckBox::toggled, this, [this, toggleCamViewAct](bool checked) {
-        if (checked && liveCameraStreamWidget_ && liveCameraStreamWidget_->isHidden()) {
-            toggleCamViewAct->setChecked(true);
+    connect(liveContinuousTrackingCheck_, &QCheckBox::toggled, this, [this](bool checked) {
+        if (checked && liveCameraStreamWidget_ && liveCameraStreamWidget_->isHidden() && toggleCamViewAct_) {
+            toggleCamViewAct_->setChecked(true);
         }
         onToggleLiveContinuousTracking(checked);
     });
@@ -1290,13 +1318,23 @@ void MainWindow::buildUi() {
     leftLayout->addWidget(step2Box);
     leftLayout->addStretch();
 
-    // ── Right side: vertical splitter (3D Viewport, Camera Stream, Log) ────
-    mainViewSplitter_ = new QSplitter(Qt::Vertical, splitter);
+    // ── Right side: StudioUxToolbar + vertical splitter (3D Viewport, Camera Stream, Log) ────
+    QWidget* rightContainer = new QWidget(splitter);
+    QVBoxLayout* rightLayout = new QVBoxLayout(rightContainer);
+    rightLayout->setContentsMargins(0, 0, 0, 0);
+    rightLayout->setSpacing(0);
+
+    uxToolbar_ = new tmcad::StudioUxToolbar(rightContainer);
+    rightLayout->addWidget(uxToolbar_);
+
+    mainViewSplitter_ = new QSplitter(Qt::Vertical, rightContainer);
 
     viewport_ = new Viewport3D(scene_, mainViewSplitter_);
 
     liveCameraStreamWidget_ = new CameraStreamWidget(mainViewSplitter_, true);
     liveCameraStreamWidget_->hide();
+    liveCameraStreamWidget_->setOverlayRenderFlags(uxToolbar_->renderFlags());
+    lastMultiInstanceFlag_ = uxToolbar_->renderFlags().multi_instance_mode;
 
     logPanel_ = new QPlainTextEdit(mainViewSplitter_);
     logPanel_->setReadOnly(true);
@@ -1315,8 +1353,10 @@ void MainWindow::buildUi() {
     mainViewSplitter_->setStretchFactor(2, 2);
     mainViewSplitter_->setSizes({560, 240, 130});
 
+    rightLayout->addWidget(mainViewSplitter_, 1);
+
     splitter->addWidget(leftPanel);
-    splitter->addWidget(mainViewSplitter_);
+    splitter->addWidget(rightContainer);
     splitter->setStretchFactor(1, 1);
 
     setCentralWidget(splitter);
@@ -1331,19 +1371,109 @@ void MainWindow::buildUi() {
     });
     connect(onnxModelCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         QString path = selectedOnnxPath();
+        if (uxToolbar_ && !path.isEmpty()) {
+            uxToolbar_->setActiveOnnxPath(path);
+        }
         if (!path.isEmpty() && onnxStatusLabel_) {
             QFileInfo fi(path);
             double mb = fi.size() / (1024.0 * 1024.0);
             onnxStatusLabel_->setText(QString("✅ Sẵn sàng: <b>%1</b> (%2 MB) — Không cần .STL")
                                           .arg(fi.fileName()).arg(mb, 0, 'f', 2));
         }
+        if (!path.isEmpty()) {
+            onActiveOnnxModelSwitched(path);
+        }
     });
 
+    if (uxToolbar_) {
+        connect(uxToolbar_, &tmcad::StudioUxToolbar::activeOnnxModelChanged,
+                this, [this](const QString& path) {
+            if (onnxModelCombo_ && !path.isEmpty()) {
+                onnxModelCombo_->blockSignals(true);
+                const QFileInfo reqFi(path);
+                const QString reqCanon = reqFi.canonicalFilePath();
+                const QString reqBase = reqFi.completeBaseName();
+                int matchIdx = -1;
+                for (int i = 0; i < onnxModelCombo_->count(); ++i) {
+                    const QString itemPath = onnxModelCombo_->itemData(i).toString();
+                    const QFileInfo itemFi(itemPath);
+                    if (itemPath == reqFi.absoluteFilePath() ||
+                        (!reqCanon.isEmpty() && itemFi.canonicalFilePath() == reqCanon) ||
+                        (!reqBase.isEmpty() && itemFi.completeBaseName() == reqBase)) {
+                        matchIdx = i;
+                        break;
+                    }
+                }
+                if (matchIdx < 0 && reqFi.exists()) {
+                    onnxModelCombo_->addItem(QString("📦 %1.onnx").arg(reqBase), reqFi.absoluteFilePath());
+                    matchIdx = onnxModelCombo_->count() - 1;
+                }
+                if (matchIdx >= 0) onnxModelCombo_->setCurrentIndex(matchIdx);
+                onnxModelCombo_->blockSignals(false);
+            }
+            if (!path.isEmpty() && onnxStatusLabel_) {
+                QFileInfo fi(path);
+                double mb = fi.size() / (1024.0 * 1024.0);
+                onnxStatusLabel_->setText(QString("✅ Sẵn sàng: <b>%1</b> (%2 MB) — Chạy độc lập không cần .STL")
+                                              .arg(fi.fileName()).arg(mb, 0, 'f', 2));
+            }
+            onActiveOnnxModelSwitched(path);
+        });
+
+        connect(uxToolbar_, &tmcad::StudioUxToolbar::overlayFlagsChanged,
+                this, [this](const tmcad::OverlayRenderFlags& flags) {
+            const bool multiChanged = (flags.multi_instance_mode != lastMultiInstanceFlag_);
+            lastMultiInstanceFlag_ = flags.multi_instance_mode;
+            if (liveCameraStreamWidget_) {
+                liveCameraStreamWidget_->setOverlayRenderFlags(flags);
+            }
+            if (universalPoseEstimator_) {
+                universalPoseEstimator_->setMultiInstanceMode(flags.multi_instance_mode, 4);
+            }
+            if (multiChanged && lastStaticFrame_.valid() && !isInteractiveRoiUpdating_ &&
+                !isBagAutoStepping_ &&
+                !(liveTrackingTimer_ && liveTrackingTimer_->isActive()) &&
+                !(muJoCoSimTimer_ && muJoCoSimTimer_->isActive())) {
+                isInteractiveRoiUpdating_ = true;
+                runPoseEstimationAI(lastStaticFrame_, lastStaticIntrinsics_,
+                                    hasLastStaticGtPose_ ? &lastStaticGtPose_ : nullptr,
+                                    lastStaticRunLabel_, /*interactiveRoiRerun=*/true);
+                isInteractiveRoiUpdating_ = false;
+            }
+        });
+
+        connect(uxToolbar_, &tmcad::StudioUxToolbar::clearRoiRequested, this, [this]() {
+            if (liveCameraStreamWidget_) {
+                liveCameraStreamWidget_->clearInteractiveRoi();
+            }
+        });
+
+        connect(uxToolbar_, &tmcad::StudioUxToolbar::autoBuildPipelineRequested,
+                this, &MainWindow::onAutoBuildPipelineRequested);
+    }
+
+    if (liveCameraStreamWidget_) {
+        connect(liveCameraStreamWidget_, &CameraStreamWidget::roiSelectionChanged,
+                this, &MainWindow::onInteractiveRoiChanged);
+    }
+
     refreshOnnxModelList();
+    if (!selectedOnnxPath().isEmpty()) {
+        onActiveOnnxModelSwitched(selectedOnnxPath());
+    }
     syncPropertiesUi();
 }
 
 MainWindow::~MainWindow() {
+    autoBuildCanceled_.store(true);
+    if (autoBuildProcess_) {
+        if (autoBuildProcess_->state() != QProcess::NotRunning) {
+            autoBuildProcess_->kill();
+            autoBuildProcess_->waitForFinished(500);
+        }
+        autoBuildProcess_->deleteLater();
+        autoBuildProcess_ = nullptr;
+    }
     stopAiDaemon();
     if (warmRealSense_) {
         warmRealSense_->close();
@@ -1407,70 +1537,90 @@ void MainWindow::pipelineLog(const QString& line) {
     logPanel_->setTextCursor(cursor);
 }
 
+QString MainWindow::projectRootDir() const {
+    return tmcad::StudioUxToolbar::resolveProjectRoot();
+}
+
 void MainWindow::refreshOnnxModelList(const QString& selectPath) {
     if (!onnxModelCombo_) return;
-    QString currentSelection = selectPath.isEmpty() ? selectedOnnxPath() : selectPath;
+    QString currentSelection = selectPath;
+    if (currentSelection.isEmpty()) currentSelection = selectedOnnxPath();
+    if (currentSelection.isEmpty() && uxToolbar_) currentSelection = uxToolbar_->activeOnnxPath();
 
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(projectRootDir());
 
-    onnxModelCombo_->blockSignals(true);
-    onnxModelCombo_->clear();
+    {
+        QSignalBlocker blocker(onnxModelCombo_);
+        onnxModelCombo_->clear();
 
-    QSet<QString> addedNames;
-    auto addOnnxFile = [&](const QString& fullPath) {
-        QFileInfo fi(fullPath);
-        if (!fi.exists() || fi.suffix().toLower() != "onnx") return;
-        if (fi.fileName() == "model_obs_npu.onnx") return; // skip duplicate alias
-        QString key = fi.baseName();
-        if (addedNames.contains(key)) return;
-        addedNames.insert(key);
-        onnxModelCombo_->addItem(QString("📦 %1.onnx").arg(key), fi.absoluteFilePath());
-    };
+        QSet<QString> seenCanonical;
+        QSet<QString> addedNames;
+        auto addOnnxFile = [&](const QFileInfo& fi) {
+            if (!fi.exists() || !fi.isFile() || fi.suffix().toLower() != "onnx") return;
+            const QString fname = fi.fileName();
+            if (fname == "model_obs_npu.onnx" || fname == "model_obs_backbone.onnx") return;
+            QString canon = fi.canonicalFilePath();
+            if (canon.isEmpty()) canon = fi.absoluteFilePath();
+            const QString key = fi.completeBaseName();
+            if (seenCanonical.contains(canon) || addedNames.contains(key)) return;
+            seenCanonical.insert(canon);
+            addedNames.insert(key);
+            onnxModelCombo_->addItem(QString("📦 %1.onnx").arg(key), fi.absoluteFilePath());
+        };
 
-    // 1. Scan models/*.onnx
-    QDir modelsDir(tmcadDir.absoluteFilePath("models"));
-    if (modelsDir.exists()) {
-        for (const QFileInfo& fi : modelsDir.entryInfoList(QStringList() << "*.onnx", QDir::Files)) {
-            addOnnxFile(fi.absoluteFilePath());
-        }
-    }
-
-    // 2. Scan deploy_orange_pi_5b/*/*.onnx
-    QDir deployDir(tmcadDir.absoluteFilePath("deploy_orange_pi_5b"));
-    if (deployDir.exists()) {
-        for (const QString& sub : deployDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
-            QDir subDir(deployDir.absoluteFilePath(sub));
-            for (const QFileInfo& fi : subDir.entryInfoList(QStringList() << "*.onnx", QDir::Files)) {
-                addOnnxFile(fi.absoluteFilePath());
+        // 1. Scan models/*.onnx (regular files before symlinks so canonical names win over lowercase aliases)
+        QDir modelsDir(tmcadDir.absoluteFilePath("models"));
+        if (modelsDir.exists()) {
+            const QFileInfoList files = modelsDir.entryInfoList(QStringList() << "*.onnx", QDir::Files, QDir::Name);
+            for (const QFileInfo& fi : files) {
+                if (!fi.isSymLink()) addOnnxFile(fi);
+            }
+            for (const QFileInfo& fi : files) {
+                if (fi.isSymLink()) addOnnxFile(fi);
             }
         }
-    }
 
-    // If user explicitly browsed a file outside standard dirs, ensure it's in the list
-    if (!currentSelection.isEmpty() && QFile::exists(currentSelection)) {
-        addOnnxFile(currentSelection);
-    }
-
-    int targetIdx = 0;
-    if (!currentSelection.isEmpty()) {
-        for (int i = 0; i < onnxModelCombo_->count(); ++i) {
-            if (onnxModelCombo_->itemData(i).toString() == QFileInfo(currentSelection).absoluteFilePath() ||
-                QFileInfo(onnxModelCombo_->itemData(i).toString()).baseName() == QFileInfo(currentSelection).baseName()) {
-                targetIdx = i;
-                break;
+        // 2. Scan deploy_orange_pi_5b/*/*.onnx
+        QDir deployDir(tmcadDir.absoluteFilePath("deploy_orange_pi_5b"));
+        if (deployDir.exists()) {
+            for (const QString& sub : deployDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
+                QDir subDir(deployDir.absoluteFilePath(sub));
+                for (const QFileInfo& fi : subDir.entryInfoList(QStringList() << "*.onnx", QDir::Files, QDir::Name)) {
+                    addOnnxFile(fi);
+                }
             }
         }
-    }
-    if (onnxModelCombo_->count() > 0) {
-        onnxModelCombo_->setCurrentIndex(targetIdx);
-    }
-    onnxModelCombo_->blockSignals(false);
 
+        // If user explicitly browsed a file outside standard dirs, ensure it's in the list
+        if (!currentSelection.isEmpty() && QFile::exists(currentSelection)) {
+            addOnnxFile(QFileInfo(currentSelection));
+        }
+
+        int targetIdx = 0;
+        if (!currentSelection.isEmpty()) {
+            const QFileInfo selFi(currentSelection);
+            const QString selCanon = selFi.canonicalFilePath();
+            const QString selBase = selFi.completeBaseName();
+            for (int i = 0; i < onnxModelCombo_->count(); ++i) {
+                const QString itemPath = onnxModelCombo_->itemData(i).toString();
+                const QFileInfo itemFi(itemPath);
+                if (itemPath == selFi.absoluteFilePath() ||
+                    (!selCanon.isEmpty() && itemFi.canonicalFilePath() == selCanon) ||
+                    (!selBase.isEmpty() && itemFi.completeBaseName() == selBase)) {
+                    targetIdx = i;
+                    break;
+                }
+            }
+        }
+        if (onnxModelCombo_->count() > 0) {
+            onnxModelCombo_->setCurrentIndex(targetIdx);
+        }
+    }
+
+    const QString resolvedPath = selectedOnnxPath();
     if (onnxStatusLabel_) {
-        QString path = selectedOnnxPath();
-        if (!path.isEmpty()) {
-            QFileInfo fi(path);
+        if (!resolvedPath.isEmpty()) {
+            QFileInfo fi(resolvedPath);
             double mb = fi.size() / (1024.0 * 1024.0);
             onnxStatusLabel_->setText(QString("✅ Sẵn sàng: <b>%1</b> (%2 MB) — Chạy độc lập không cần .STL")
                                           .arg(fi.fileName()).arg(mb, 0, 'f', 2));
@@ -1478,6 +1628,161 @@ void MainWindow::refreshOnnxModelList(const QString& selectPath) {
             onnxStatusLabel_->setText("⚠️ Chưa có file .onnx. Hãy Train từ CAD hoặc chọn file .onnx.");
         }
     }
+
+    if (uxToolbar_) {
+        uxToolbar_->refreshOnnxModelList(tmcadDir.absoluteFilePath("models"), resolvedPath);
+        if (!resolvedPath.isEmpty()) {
+            uxToolbar_->setActiveOnnxPath(resolvedPath);
+        }
+    }
+}
+
+void MainWindow::onActiveOnnxModelSwitched(const QString& onnxPath) {
+    if (onnxPath.isEmpty() || !QFileInfo::exists(onnxPath)) return;
+    if (!universalPoseEstimator_) {
+        universalPoseEstimator_ = std::make_unique<tmcad::UniversalPoseEstimator>();
+    }
+    stopAiDaemon();
+
+    const bool ok = universalPoseEstimator_->loadModelOnnx(onnxPath.toStdString());
+    const bool multiMode = uxToolbar_ ? uxToolbar_->renderFlags().multi_instance_mode : lastMultiInstanceFlag_;
+    universalPoseEstimator_->setMultiInstanceMode(multiMode, 4);
+
+    if (ok) {
+        pipelineLog(QString("🔄 [HOT-SWAP ONNX] Nạp %1 | Mode: %2 | SurfPts: %3 | Edges: %4 | Diag: %5 m")
+                        .arg(QFileInfo(onnxPath).fileName())
+                        .arg(universalPoseEstimator_->isFloorStanding() ? "FLOOR_STANDING" : "FREE_6DOF")
+                        .arg(universalPoseEstimator_->cadSurfacePts().size())
+                        .arg(universalPoseEstimator_->cadFeatureEdges().size())
+                        .arg(universalPoseEstimator_->realBoundingDiagM(), 0, 'f', 3));
+        if (uxToolbar_) {
+            uxToolbar_->resetDiagnostics();
+        }
+        // Nếu MuJoCo 3D Interactive đang chạy, tự động chuyển đổi luôn vật thể CAD khớp với ONNX mới
+        if (activeMuJoCoSim_ && activeMuJoCoSim_->isInteractiveWindowOpen()) {
+            QFileInfo onnxFi(onnxPath);
+            if (onnxFi.isSymLink()) {
+                QFileInfo targetFi(onnxFi.symLinkTarget());
+                if (targetFi.exists()) onnxFi = targetFi;
+            }
+            QString baseName = onnxFi.completeBaseName();
+            if (baseName == "model_obs_npu" || baseName == "model_obs_backbone") {
+                baseName = onnxFi.dir().dirName();
+            }
+            QDir projDir(projectRootDir());
+            QStringList cands = {
+                projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".obj"),
+                projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".stl"),
+                projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".STL"),
+                projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + "_mesh.ply"),
+                projDir.absoluteFilePath("CAD_DATA/" + baseName + ".obj"),
+                projDir.absoluteFilePath("CAD_DATA/" + baseName + ".stl"),
+                projDir.absoluteFilePath("CAD_DATA/" + baseName + "_mesh.ply"),
+                projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".obj"),
+                projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".stl"),
+                projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".ply")
+            };
+            QDir cadRoot(projDir.absoluteFilePath("CAD_DATA"));
+            if (cadRoot.exists() && !baseName.isEmpty()) {
+                for (const QString& sub : cadRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
+                    if (sub.contains(baseName, Qt::CaseInsensitive) && sub != baseName) {
+                        cands << cadRoot.absoluteFilePath(sub + "/" + sub + ".obj")
+                              << cadRoot.absoluteFilePath(sub + "/" + sub + ".stl")
+                              << cadRoot.absoluteFilePath(sub + "/" + sub + "_mesh.ply");
+                    }
+                }
+            }
+            for (const QString& cand : cands) {
+                if (QFile::exists(cand)) {
+                    QFileInfo cfi(cand);
+                    QString baseNoExt = cfi.dir().absoluteFilePath(cfi.completeBaseName());
+                    QString texPath;
+                    if (QFile::exists(baseNoExt + ".png")) texPath = baseNoExt + ".png";
+                    else if (QFile::exists(baseNoExt + ".jpg")) texPath = baseNoExt + ".jpg";
+                    double s = cand.endsWith("_mesh.ply", Qt::CaseInsensitive) ? 1.0 : 0.001;
+                    activeMuJoCoSim_->loadTargetMesh(cand.toStdString(), texPath.toStdString(), Eigen::Vector3d(s, s, s));
+                    pipelineLog(QString("🎮 [MUJOCO SYNC] Tự động chuyển vật thể 3D → %1").arg(cfi.fileName()));
+                    break;
+                }
+            }
+        }
+        if (currentMode_ == WorkspaceMode::LiveCameraStudio && liveTargetCadLabel_) {
+            QListWidgetItem* item = objectList_ ? objectList_->currentItem() : nullptr;
+            bool hasMeshSelected = false;
+            if (item) {
+                SceneObject* obj = scene_->getObject(item->data(Qt::UserRole).toInt());
+                hasMeshSelected = (obj && obj->type() == SceneObjectType::Mesh);
+            }
+            if (!hasMeshSelected) {
+                liveTargetCadLabel_->setText(QString("<b>Black-Box ONNX:</b> <font color='#40c4ff'>%1</font>")
+                                                 .arg(QFileInfo(onnxPath).fileName()));
+            }
+        }
+    } else {
+        pipelineLog(QString("  [WARN] Không thể nạp Black-Box ONNX: %1").arg(onnxPath));
+    }
+}
+
+void MainWindow::cacheStaticFrameForRoi(const RGBDFrame& frame,
+                                        const CameraIntrinsics& intrinsics,
+                                        const QString& runLabel,
+                                        const Eigen::Matrix4d* groundTruthCameraFromObject) {
+    RGBDFrame copyFrame;
+    copyFrame.depthScale = frame.depthScale;
+    copyFrame.depthTruncMeters = frame.depthTruncMeters;
+    copyFrame.timestampUs = frame.timestampUs;
+    if (frame.color && !frame.color->IsEmpty()) {
+        auto c = std::make_shared<open3d::geometry::Image>();
+        c->Prepare(frame.color->width_, frame.color->height_,
+                   frame.color->num_of_channels_, frame.color->bytes_per_channel_);
+        c->data_ = frame.color->data_;
+        copyFrame.color = std::move(c);
+    }
+    if (frame.depth && !frame.depth->IsEmpty()) {
+        auto d = std::make_shared<open3d::geometry::Image>();
+        d->Prepare(frame.depth->width_, frame.depth->height_,
+                   frame.depth->num_of_channels_, frame.depth->bytes_per_channel_);
+        d->data_ = frame.depth->data_;
+        copyFrame.depth = std::move(d);
+    }
+    lastStaticFrame_ = std::move(copyFrame);
+    lastStaticIntrinsics_ = intrinsics;
+    lastStaticRunLabel_ = runLabel;
+    if (groundTruthCameraFromObject) {
+        lastStaticGtPose_ = *groundTruthCameraFromObject;
+        hasLastStaticGtPose_ = true;
+    } else {
+        lastStaticGtPose_ = Eigen::Matrix4d::Identity();
+        hasLastStaticGtPose_ = false;
+    }
+}
+
+void MainWindow::onInteractiveRoiChanged(bool active) {
+    if (uxToolbar_) {
+        uxToolbar_->setRoiActive(active);
+    }
+    if (isInteractiveRoiUpdating_) return;
+
+    pipelineLog(active
+        ? "✂️ [2D ROI] Đã khoanh vùng ROI mới — tự động chạy lại nhận diện..."
+        : "✂️ [2D ROI] Đã xóa vùng ROI — khôi phục tìm kiếm toàn khung hình...");
+
+    if (!lastStaticFrame_.valid() || isBagAutoStepping_ ||
+        (liveTrackingTimer_ && liveTrackingTimer_->isActive()) ||
+        (muJoCoSimTimer_ && muJoCoSimTimer_->isActive())) {
+        return;
+    }
+
+    const bool useAI = (!poseMethodCombo_ || poseMethodCombo_->currentIndex() == 0);
+    if (!useAI) return;
+
+    isInteractiveRoiUpdating_ = true;
+    runPoseEstimationAI(lastStaticFrame_,
+                        lastStaticIntrinsics_,
+                        hasLastStaticGtPose_ ? &lastStaticGtPose_ : nullptr,
+                        lastStaticRunLabel_,
+                        /*interactiveRoiRerun=*/true);
+    isInteractiveRoiUpdating_ = false;
 }
 
 QString MainWindow::selectedOnnxPath() const {
@@ -1486,8 +1791,7 @@ QString MainWindow::selectedOnnxPath() const {
 }
 
 void MainWindow::onBrowseOnnxModel() {
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(projectRootDir());
     QString initDir = tmcadDir.absoluteFilePath("models");
     if (!QDir(initDir).exists()) initDir = tmcadDir.absolutePath();
 
@@ -1496,8 +1800,10 @@ void MainWindow::onBrowseOnnxModel() {
     if (path.isEmpty()) return;
 
     refreshOnnxModelList(path);
+    const QString activePath = selectedOnnxPath().isEmpty() ? path : selectedOnnxPath();
+    onActiveOnnxModelSwitched(activePath);
     syncPropertiesUi();
-    pipelineLog(QString("📦 [BLACK-BOX ONNX] Đã chọn model: %1").arg(path));
+    pipelineLog(QString("📦 [BLACK-BOX ONNX] Đã chọn model: %1").arg(activePath));
 }
 
 QString MainWindow::parseDatasetDirFromFile(const QString& path) const {
@@ -1560,10 +1866,9 @@ void MainWindow::onSelectDatasetFile() {
         QMessageBox::warning(this, "Chọn File Dataset", "Vui lòng chọn một mô hình CAD hợp lệ.");
         return;
     }
-    QString cadName = QFileInfo(QString::fromStdString(obj->filePath())).baseName();
+    QString cadName = QFileInfo(QString::fromStdString(obj->filePath())).completeBaseName();
 
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(projectRootDir());
     QString startDir = tmcadDir.absoluteFilePath("dataset");
     if (cadDatasetDirMap_.contains(cadName)) {
         startDir = cadDatasetDirMap_.value(cadName);
@@ -1611,10 +1916,9 @@ void MainWindow::onSelectDatasetDir() {
         QMessageBox::warning(this, "Chọn Thư Mục Dataset", "Vui lòng chọn một mô hình CAD hợp lệ.");
         return;
     }
-    QString cadName = QFileInfo(QString::fromStdString(obj->filePath())).baseName();
+    QString cadName = QFileInfo(QString::fromStdString(obj->filePath())).completeBaseName();
 
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(projectRootDir());
     QString startDir = tmcadDir.absoluteFilePath("dataset");
     if (cadDatasetDirMap_.contains(cadName)) {
         startDir = cadDatasetDirMap_.value(cadName);
@@ -1678,10 +1982,9 @@ void MainWindow::syncPropertiesUi() {
         return;
     }
 
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(projectRootDir());
     QFileInfo cadFi(QString::fromStdString(obj->filePath()));
-    QString cadName = cadFi.baseName();
+    QString cadName = cadFi.completeBaseName();
 
     QString resolvedDataset = resolveDatasetDir(cadName);
     QDir datasetDir(resolvedDataset);
@@ -1689,16 +1992,23 @@ void MainWindow::syncPropertiesUi() {
                       (datasetDir.exists("train.txt") || !datasetDir.entryList(QStringList() << "sample_*", QDir::Dirs).isEmpty());
 
     QString onnxCandidate = tmcadDir.absoluteFilePath("models/" + cadName + ".onnx");
-    bool hasCadOnnx = QFile::exists(onnxCandidate) ||
-                      QFile::exists(tmcadDir.absoluteFilePath("deploy_orange_pi_5b/" + cadName + "/" + cadName + ".onnx"));
+    bool hasCadOnnx = QFile::exists(onnxCandidate);
+    if (!hasCadOnnx) {
+        QString deployCand = tmcadDir.absoluteFilePath("deploy_orange_pi_5b/" + cadName + "/" + cadName + ".onnx");
+        if (QFile::exists(deployCand)) {
+            onnxCandidate = deployCand;
+            hasCadOnnx = true;
+        }
+    }
     if (!hasCadOnnx) {
         // Case-insensitive / fuzzy match for onnx
         QDir modelsDir(tmcadDir.absoluteFilePath("models"));
         if (modelsDir.exists()) {
             for (const QFileInfo& fi : modelsDir.entryInfoList(QStringList() << "*.onnx", QDir::Files)) {
-                if (fi.baseName().compare(cadName, Qt::CaseInsensitive) == 0 ||
-                    fi.baseName().toUpper().contains(cadName.toUpper()) ||
-                    cadName.toUpper().contains(fi.baseName().toUpper())) {
+                const QString fiBase = fi.completeBaseName();
+                if (fiBase.compare(cadName, Qt::CaseInsensitive) == 0 ||
+                    fiBase.toUpper().contains(cadName.toUpper()) ||
+                    cadName.toUpper().contains(fiBase.toUpper())) {
                     onnxCandidate = fi.absoluteFilePath();
                     hasCadOnnx = true;
                     break;
@@ -1709,6 +2019,13 @@ void MainWindow::syncPropertiesUi() {
 
     if (hasCadOnnx) {
         refreshOnnxModelList(onnxCandidate);
+        const QString candCanon = QFileInfo(onnxCandidate).canonicalFilePath();
+        const QString curLoaded = universalPoseEstimator_
+            ? QFileInfo(QString::fromStdString(universalPoseEstimator_->loadedOnnxPath())).canonicalFilePath()
+            : QString();
+        if (!universalPoseEstimator_ || candCanon != curLoaded) {
+            onActiveOnnxModelSwitched(onnxCandidate);
+        }
     }
 
     if (cadStatusLabel_) {
@@ -1753,9 +2070,8 @@ QString MainWindow::prepareCadModelFolder(const QString& sourcePath) {
         return sourcePath;
     }
 
-    QString cadName = fi.baseName();
-    QDir projDir(QCoreApplication::applicationDirPath());
-    if (projDir.dirName() == "build") projDir.cdUp();
+    QString cadName = fi.completeBaseName();
+    QDir projDir(projectRootDir());
 
     QDir cadDataDir(projDir.absoluteFilePath("CAD_DATA"));
     if (!cadDataDir.exists()) {
@@ -1857,7 +2173,7 @@ void MainWindow::onQuickLoadCad(const QString& cadName) {
     if (projDir.dirName() == "build") projDir.cdUp();
 
     // Check in subfolder CAD_DATA/<baseName>/<cadName> first, then fallback to CAD_DATA/<cadName>
-    QString baseName = QFileInfo(cadName).baseName();
+    QString baseName = QFileInfo(cadName).completeBaseName();
     QString cadPath = projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + cadName);
     if (!QFile::exists(cadPath)) {
         cadPath = projDir.absoluteFilePath("CAD_DATA/" + cadName);
@@ -2019,6 +2335,10 @@ void MainWindow::dropEvent(QDropEvent* event) {
                 openBagForStepping(localPath);
             } else if (msgBox.clickedButton() == playBtn) {
                 if (liveCameraStreamWidget_) {
+                    if (toggleCamViewAct_) {
+                        QSignalBlocker blocker(toggleCamViewAct_);
+                        toggleCamViewAct_->setChecked(true);
+                    }
                     liveCameraStreamWidget_->show();
                     liveCameraStreamWidget_->startPlayback(localPath.toStdString());
                     QList<int> currentSizes = mainViewSplitter_->sizes();
@@ -2686,7 +3006,8 @@ bool MainWindow::runPoseEstimation(const RGBDFrame& frame,
 bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
                                      const CameraIntrinsics& intrinsics,
                                      const Eigen::Matrix4d* groundTruthCameraFromObject,
-                                     const QString& runLabel) {
+                                     const QString& runLabel,
+                                     bool interactiveRoiRerun) {
     QListWidgetItem* item = objectList_ ? objectList_->currentItem() : nullptr;
     SceneObject* obj = nullptr;
     if (item) {
@@ -2698,21 +3019,40 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
     }
 
     QString activeOnnx = selectedOnnxPath();
+    if (activeOnnx.isEmpty() && uxToolbar_) {
+        activeOnnx = uxToolbar_->activeOnnxPath();
+    }
+
+    const bool isLiveMode = runLabel.contains("live", Qt::CaseInsensitive) ||
+                            runLabel.contains("MuJoCo", Qt::CaseInsensitive) ||
+                            runLabel.startsWith("bag_step");
+    const bool suppressDialogs = isLiveMode || interactiveRoiRerun ||
+                                 runLabel.contains("roi", Qt::CaseInsensitive);
+
     if (!obj && activeOnnx.isEmpty()) {
-        QMessageBox::warning(this, "Estimate Pose",
-                             "Vui lòng chọn một file Model .ONNX (ở Bước 2) hoặc chọn một file CAD .STL trước.");
+        if (!suppressDialogs) {
+            QMessageBox::warning(this, "Estimate Pose",
+                                 "Vui lòng chọn một file Model .ONNX (ở Bước 2) hoặc chọn một file CAD .STL trước.");
+        }
         return false;
     }
 
-    bool isLiveMode = runLabel.contains("live", Qt::CaseInsensitive) ||
-                      runLabel.contains("MuJoCo", Qt::CaseInsensitive) ||
-                      runLabel.startsWith("bag_step");
+    if (!frame.valid() || !frame.color || frame.color->IsEmpty()) {
+        if (!suppressDialogs) {
+            pipelineLog("  [ERROR] Khung hình RGB-D không hợp lệ hoặc trống.");
+            QMessageBox::warning(this, "Estimate Pose", "Khung hình RGB-D đầu vào không hợp lệ.");
+        }
+        return false;
+    }
 
-    if (!isLiveMode) {
+    if (!isLiveMode && !interactiveRoiRerun) {
+        cacheStaticFrameForRoi(frame, intrinsics, runLabel, groundTruthCameraFromObject);
         pipelineLog(QString("=== [BLACK-BOX ONNX 6DoF] Pose Estimation [%1] ===")
                         .arg(runLabel.isEmpty() ? "single run" : runLabel));
         statusBar()->showMessage("Đang chạy nhận diện 6DoF từ Black-Box ONNX...");
         QApplication::processEvents();
+    } else if (interactiveRoiRerun) {
+        statusBar()->showMessage("Đang ước lượng lại 6DoF trong vùng 2D ROI...");
     }
 
     double scaleToView = 1.0;
@@ -2723,52 +3063,11 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
         }
     }
 
-    // Convert RGBDFrame to Open3D point cloud
-    auto rawScene = ClassicalPoseEstimator::pointCloudFromRGBD(frame, intrinsics);
-    if (!rawScene || rawScene->points_.empty()) {
-        if (!isLiveMode) {
-            pipelineLog("  [ERROR] Empty scene cloud from RGBD frame.");
-            QMessageBox::warning(this, "Estimate Pose", "Failed to generate point cloud from frame.");
-            statusBar()->clearMessage();
-        }
-        return false;
-    }
-
-    if (!isLiveMode) {
-        pipelineLog(QString("  Scene points extracted: %1").arg(rawScene->points_.size()));
-    }
-
-    // Voxel downsampling (5mm grid): chuyển 300.000 điểm thành ~5k-10k điểm sạch trong ~2ms!
-    auto sceneCloud = rawScene->VoxelDownSample(0.005);
-    if (!sceneCloud || sceneCloud->points_.size() < 128) {
-        sceneCloud = rawScene;
-    }
-    if (!isLiveMode) {
-        pipelineLog(QString("  Voxel filtered points (5mm): %1").arg(sceneCloud->points_.size()));
-    }
-
-    // Locate project directory and debug output directory
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
-    
-    QDir debugDir(tmcadDir.absoluteFilePath("debug"));
-    if (!debugDir.exists()) debugDir.mkpath(".");
-
-    QString tempScenePath = debugDir.absoluteFilePath("temp_scene_ai.ply");
-    QString jsonOutputPath = debugDir.absoluteFilePath("pose_output_ai.json");
-    QString overlayCloudPath = debugDir.absoluteFilePath("aligned_scene_overlay.ply");
-
-    // Xóa file kết quả cũ để đảm bảo kết quả mới luôn được kiểm chứng
-    QFile::remove(jsonOutputPath);
-
-    // Lưu đám mây điểm đã lọc (chỉ 5k điểm -> ghi đĩa chỉ mất ~2ms thay vì 150ms)
-    open3d::io::WritePointCloud(tempScenePath.toStdString(), *sceneCloud);
-
-    QString pyScript = tmcadDir.absoluteFilePath("scripts/infer_hierarchy.py");
+    QDir tmcadDir(projectRootDir());
     QString cadPath = obj ? QString::fromStdString(obj->filePath()) : activeOnnx;
     QString cadName = !activeOnnx.isEmpty()
-                          ? QFileInfo(activeOnnx).baseName()
-                          : QFileInfo(cadPath).baseName();
+                          ? QFileInfo(activeOnnx).completeBaseName()
+                          : QFileInfo(cadPath).completeBaseName();
 
     QString onnxPath = activeOnnx;
     if (onnxPath.isEmpty() || !QFile::exists(onnxPath)) {
@@ -2780,17 +3079,522 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
     if (!QFile::exists(onnxPath)) {
         onnxPath = tmcadDir.absoluteFilePath("deploy_orange_pi_5b/" + cadName + "/model_obs_npu.onnx");
     }
-    QString ckptPath = QFile::exists(onnxPath)
-                           ? onnxPath
-                           : tmcadDir.absoluteFilePath("deep_learning/checkpoints/" + cadName + "/best_hierarchy_model.pth");
+
+    auto makeDisplayImages = [&](const RGBDFrame& f, QImage& qColorOut, QImage& qDepthOut, float& centerDistOut) {
+        qColorOut = QImage();
+        qDepthOut = QImage();
+        centerDistOut = 0.0f;
+        if (!f.valid() || !f.color || f.color->IsEmpty()) return;
+
+        const int w = f.color->width_;
+        const int h = f.color->height_;
+        QImage tmpColor(f.color->data_.data(), w, h, w * 3, QImage::Format_RGB888);
+        qColorOut = tmpColor.copy();
+
+        qDepthOut = QImage(w, h, QImage::Format_RGB888);
+        qDepthOut.fill(Qt::black);
+        if (f.depth && !f.depth->IsEmpty()) {
+            const double div = (f.depthScale > 1e-6) ? f.depthScale : 1000.0;
+            cv::Mat depthRaw(f.depth->height_, f.depth->width_, CV_16UC1, f.depth->data_.data());
+            if (depthRaw.cols > 0 && depthRaw.rows > 0) {
+                centerDistOut = static_cast<float>(depthRaw.at<uint16_t>(depthRaw.rows / 2, depthRaw.cols / 2) / div);
+                cv::Mat depth8;
+                depthRaw.convertTo(depth8, CV_8UC1, 255.0 / (3.5 * div));
+                cv::Mat depthColor, depthRgb;
+                cv::applyColorMap(depth8, depthColor, cv::COLORMAP_TURBO);
+                cv::cvtColor(depthColor, depthRgb, cv::COLOR_BGR2RGB);
+                qDepthOut = QImage(depthRgb.data, depthRgb.cols, depthRgb.rows,
+                                   static_cast<int>(depthRgb.step), QImage::Format_RGB888).copy();
+            }
+        }
+    };
+
+    // =========================================================================
+    // PRIMARY PATH: Native C++ Black-Box ONNX Runtime (Zero Python Subprocess)
+    // =========================================================================
+    if (!onnxPath.isEmpty() && QFile::exists(onnxPath)) {
+        lastAiTelemetry_ = LastAiTelemetry();
+        lastAiTelemetry_.fromCppNative = true;
+
+        if (!universalPoseEstimator_) {
+            universalPoseEstimator_ = std::make_unique<tmcad::UniversalPoseEstimator>();
+        }
+
+        const QString reqCanon = QFileInfo(onnxPath).canonicalFilePath();
+        const QString curCanon = QFileInfo(QString::fromStdString(universalPoseEstimator_->loadedOnnxPath())).canonicalFilePath();
+        if (!universalPoseEstimator_->isInitialized() || reqCanon != curCanon) {
+            if (!universalPoseEstimator_->loadModelOnnx(onnxPath.toStdString())) {
+                if (uxToolbar_) uxToolbar_->resetDiagnostics();
+                pipelineLog(QString("  [ERROR] Không thể nạp model Black-Box ONNX: %1").arg(onnxPath));
+                if (!suppressDialogs) {
+                    QMessageBox::warning(this, "AI Pose Error", "Không thể nạp file Black-Box ONNX:\n" + onnxPath);
+                }
+                statusBar()->clearMessage();
+                return false;
+            }
+        }
+
+        const bool multiMode = uxToolbar_ ? uxToolbar_->renderFlags().multi_instance_mode : lastMultiInstanceFlag_;
+        universalPoseEstimator_->setMultiInstanceMode(multiMode, 4);
+
+        const int w = frame.color->width_;
+        const int h = frame.color->height_;
+        cv::Mat rgbMat(h, w, CV_8UC3, const_cast<uint8_t*>(frame.color->data_.data()));
+        cv::Mat bgrMat;
+        cv::cvtColor(rgbMat, bgrMat, cv::COLOR_RGB2BGR);
+
+        cv::Mat depthMat;
+        if (frame.depth && !frame.depth->IsEmpty()) {
+            cv::Mat rawDepth(frame.depth->height_, frame.depth->width_, CV_16UC1,
+                             const_cast<uint8_t*>(frame.depth->data_.data()));
+            if (rawDepth.cols != w || rawDepth.rows != h) {
+                cv::resize(rawDepth, depthMat, cv::Size(w, h), 0.0, 0.0, cv::INTER_NEAREST);
+            } else {
+                depthMat = rawDepth;
+            }
+        }
+
+        CameraIntrinsics estIntr = intrinsics;
+        estIntr.width = w;
+        estIntr.height = h;
+        estIntr.depth_scale = (frame.depthScale > 1e-6) ? (1.0 / frame.depthScale) : 0.001;
+        if (estIntr.ppx <= 1e-6 && estIntr.cx > 1e-6) estIntr.ppx = estIntr.cx;
+        if (estIntr.ppy <= 1e-6 && estIntr.cy > 1e-6) estIntr.ppy = estIntr.cy;
+        if (estIntr.cx <= 1e-6 && estIntr.ppx > 1e-6) estIntr.cx = estIntr.ppx;
+        if (estIntr.cy <= 1e-6 && estIntr.ppy > 1e-6) estIntr.cy = estIntr.ppy;
+
+        cv::Rect roiHint;
+        if (liveCameraStreamWidget_) {
+            roiHint = liveCameraStreamWidget_->currentRoiHintImageSpace(w, h);
+        }
+        if (interactiveRoiRerun && !roiHint.empty()) {
+            pipelineLog(QString("  [2D ROI] Crop [%1, %2, %3x%4] px")
+                            .arg(roiHint.x).arg(roiHint.y).arg(roiHint.width).arg(roiHint.height));
+        }
+
+        const std::vector<tmcad::ObjectPose> poses =
+            universalPoseEstimator_->estimateMultiObjects(bgrMat, depthMat, estIntr, roiHint);
+
+        const int validDepthPts = universalPoseEstimator_->lastValidDepthPts();
+        const bool floorLocked = universalPoseEstimator_->lastFloorLocked();
+        const double floorPitchDeg = universalPoseEstimator_->lastFloorPitchDeg();
+        const bool sparseFallback = universalPoseEstimator_->lastSparseDepthFallback();
+        const double aiLat = universalPoseEstimator_->lastAiLatencyMs();
+        const double icpLat = universalPoseEstimator_->lastSolveLatencyMs();
+        const double totLat = universalPoseEstimator_->lastTotalLatencyMs();
+
+        lastAiTelemetry_.aiMs = aiLat;
+        lastAiTelemetry_.solveMs = icpLat;
+        lastAiTelemetry_.totalMs = totLat;
+        lastAiTelemetry_.validDepthPts = validDepthPts;
+        lastAiTelemetry_.floorLocked = floorLocked;
+        lastAiTelemetry_.floorPitchDeg = floorPitchDeg;
+        lastAiTelemetry_.numInstances = static_cast<int>(poses.size());
+
+        if (uxToolbar_) {
+            const float conf = poses.empty() ? 0.0f : poses.front().confidence;
+            const double diagRmseMm = poses.empty() ? 0.0 : (poses.front().rmse_m * 1000.0);
+            uxToolbar_->updateDiagnostics(validDepthPts,
+                                          floorLocked,
+                                          floorPitchDeg,
+                                          conf,
+                                          diagRmseMm,
+                                          static_cast<int>(poses.size()),
+                                          sparseFallback,
+                                          universalPoseEstimator_->isFloorStanding());
+        }
+
+        if (poses.empty()) {
+            QString errMsg;
+            if (validDepthPts < 20) {
+                errMsg = QString("Dữ liệu độ sâu quá thưa (%1 điểm hợp lệ). Hãy kiểm tra lại dải depth hoặc bỏ chọn ROI.").arg(validDepthPts);
+            } else if (!roiHint.empty()) {
+                errMsg = QString("Không khớp được vật thể trong vùng 2D ROI đã khoanh (%1 điểm depth). Hãy vẽ lại ROI rộng hơn hoặc nhấp phải để reset ROI.").arg(validDepthPts);
+            } else {
+                errMsg = QString("RANSAC/ICP chưa tìm thấy vật thể đạt ngưỡng (%1 điểm depth hợp lệ). Gợi ý: kéo chuột trên khung Camera 2D để khoanh 2D ROI quanh vật thể.").arg(validDepthPts);
+            }
+            if (!isLiveMode) {
+                pipelineLog("  [ERROR] Pose invalid: " + errMsg);
+            }
+            if (livePoseResultCard_) {
+                livePoseResultCard_->setText(QString(
+                    "<div style='font-size:11px; line-height: 1.4; color: #ff80ab;'>"
+                    "<b>⚠️ CHƯA TÌM THẤY VẬT THỂ (%1 depth pts)</b><br>"
+                    "<span style='color:#eceff1;'>%2</span><br>"
+                    "<span style='color:#90a4ae;'>Mẹo: Kéo chuột trái trên ảnh Camera 2D để khoanh vùng 2D ROI quanh vật thể.</span>"
+                    "</div>"
+                ).arg(validDepthPts).arg(errMsg));
+            }
+            if (liveCameraStreamWidget_) {
+                liveCameraStreamWidget_->clearOverlayDetection();
+                if (!isLiveMode) {
+                    QImage qColor, qDepth;
+                    float centerDist = 0.0f;
+                    makeDisplayImages(frame, qColor, qDepth, centerDist);
+                    if (toggleCamViewAct_) {
+                        QSignalBlocker b(toggleCamViewAct_);
+                        toggleCamViewAct_->setChecked(true);
+                    }
+                    liveCameraStreamWidget_->show();
+                    QList<int> currentSizes = mainViewSplitter_->sizes();
+                    if (currentSizes.size() >= 3 && currentSizes[1] < 100) {
+                        mainViewSplitter_->setSizes({400, 280, 120});
+                    }
+                    liveCameraStreamWidget_->displayStaticRGBDFrame(qColor, qDepth, centerDist);
+                }
+            }
+            if (!suppressDialogs) {
+                QMessageBox::warning(this, "AI Pose Error", "Pose estimation failed:\n" + errMsg);
+            }
+            statusBar()->clearMessage();
+            return false;
+        }
+
+        const tmcad::ObjectPose& primary = poses.front();
+        Eigen::Matrix3d R;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                R(r, c) = primary.R(r, c);
+            }
+        }
+        Eigen::Vector3d t(primary.t[0], primary.t[1], primary.t[2]);
+        Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+        T.block<3, 3>(0, 0) = R;
+        T.block<3, 1>(0, 3) = t;
+
+        const double roll = primary.roll_deg;
+        const double pitch = primary.pitch_deg;
+        const double yaw = primary.yaw_deg;
+        const double fitness = static_cast<double>(primary.confidence);
+        const double rmseMm = primary.rmse_m * 1000.0;
+        const int inliers = primary.inliers_count;
+
+        Eigen::Matrix4d T_wc = T.inverse();
+        Eigen::Vector3d cam_pos = T_wc.block<3, 1>(0, 3);
+        Eigen::Vector3d fwd = T_wc.block<3, 1>(0, 2);
+        Eigen::Vector3d right_v = T_wc.block<3, 1>(0, 0);
+        Eigen::Vector3d up_v = -T_wc.block<3, 1>(0, 1);
+        const double physPitch = std::asin(std::clamp(fwd.z(), -1.0, 1.0)) * 180.0 / M_PI;
+        const double physRoll = std::atan2(right_v.z(), up_v.z()) * 180.0 / M_PI;
+        const double physAzimuth = std::atan2(-cam_pos.y(), -cam_pos.x()) * 180.0 / M_PI;
+        const double physHeight = cam_pos.z();
+        const double physDist = cam_pos.head<2>().norm();
+
+        lastAiTelemetry_.valid = true;
+        lastAiTelemetry_.tx = t.x();
+        lastAiTelemetry_.ty = t.y();
+        lastAiTelemetry_.tz = t.z();
+        lastAiTelemetry_.roll = roll;
+        lastAiTelemetry_.pitch = pitch;
+        lastAiTelemetry_.yaw = yaw;
+        lastAiTelemetry_.fitness = fitness;
+        lastAiTelemetry_.rmseMm = rmseMm;
+        lastAiTelemetry_.inliers = inliers;
+        lastAiTelemetry_.clusterPts = primary.cluster_points_count;
+
+        if (!isLiveMode) {
+            pipelineLog(QString("  [AI SUCCESS] Native C++ ONNX latency: %1 ms (AI: %2 ms, Solve/ICP: %3 ms) | Instances: %4 | Depth: %5 pts")
+                            .arg(totLat, 0, 'f', 2).arg(aiLat, 0, 'f', 2).arg(icpLat, 0, 'f', 2)
+                            .arg(poses.size()).arg(validDepthPts));
+            pipelineLog(QString("  [1] Camera World Navigation (Robot Base / Mặt đất):"));
+            pipelineLog(QString("      • Height: %1 m | Distance: %2 m").arg(physHeight, 0, 'f', 3).arg(physDist, 0, 'f', 3));
+            pipelineLog(QString("      • Pitch (tilt): %1 deg | Roll (bank): %2 deg | Azimuth (Yaw): %3 deg")
+                            .arg(physPitch, 0, 'f', 2).arg(physRoll, 0, 'f', 2).arg(physAzimuth, 0, 'f', 2));
+            pipelineLog(QString("  [2] OpenCV Sensor Optical Frame (T_cam_obj, +Z forward, +Y down):"));
+            pipelineLog(QString("      • Translation (m): X=%1  Y=%2  Z=%3")
+                            .arg(t.x(), 0, 'f', 4).arg(t.y(), 0, 'f', 4).arg(t.z(), 0, 'f', 4));
+            pipelineLog(QString("      • Sensor Euler (deg): Roll=%1  Pitch=%2  Yaw=%3")
+                            .arg(roll, 0, 'f', 2).arg(pitch, 0, 'f', 2).arg(yaw, 0, 'f', 2));
+            pipelineLog(QString("  Fitness: %1%  Inlier RMSE: %2 mm  Inliers: %3")
+                            .arg(fitness * 100.0, 0, 'f', 1).arg(rmseMm, 0, 'f', 2).arg(inliers));
+            for (size_t pi = 1; pi < poses.size(); ++pi) {
+                const auto& inst = poses[pi];
+                pipelineLog(QString("  [Instance #%1] T=(%2, %3, %4)m | Fit=%5% | RMSE=%6 mm")
+                                .arg(pi + 1)
+                                .arg(inst.t[0], 0, 'f', 3).arg(inst.t[1], 0, 'f', 3).arg(inst.t[2], 0, 'f', 3)
+                                .arg(inst.confidence * 100.0f, 0, 'f', 1)
+                                .arg(inst.rmse_m * 1000.0, 0, 'f', 2));
+            }
+        }
+
+        double e_t = -1.0;
+        double e_R_deg = -1.0;
+        if (groundTruthCameraFromObject) {
+            Eigen::Vector3d tGt = groundTruthCameraFromObject->block<3, 1>(0, 3);
+            Eigen::Matrix3d RGt = groundTruthCameraFromObject->block<3, 3>(0, 0);
+            e_t = (t - tGt).norm();
+            double cosArg = (R * RGt.transpose()).trace() - 1.0;
+            cosArg = std::clamp(cosArg / 2.0, -1.0, 1.0);
+            e_R_deg = std::acos(cosArg) * 180.0 / M_PI;
+            if (!isLiveMode) {
+                pipelineLog(QString("  Errors vs Ground Truth: e_t = %1 mm, e_R = %2 deg")
+                                .arg(e_t * 1000.0, 0, 'f', 2).arg(e_R_deg, 0, 'f', 2));
+            }
+        }
+
+        // Update 3D Viewport on One-Shot runs
+        if (!isLiveMode) {
+            // 0. If no .STL loaded, populate embedded ONNX CAD surface point cloud
+            if (!obj) {
+                const auto& surfPts = universalPoseEstimator_->cadSurfacePts();
+                if (!surfPts.empty()) {
+                    auto cadSurfCloud = std::make_shared<open3d::geometry::PointCloud>();
+                    cadSurfCloud->points_.reserve(surfPts.size());
+                    cadSurfCloud->colors_.reserve(surfPts.size());
+                    for (const auto& sp : surfPts) {
+                        cadSurfCloud->points_.emplace_back(sp[0], sp[1], sp[2]);
+                        cadSurfCloud->colors_.emplace_back(0.62, 0.72, 0.85);
+                    }
+                    for (const auto& o : scene_->objects()) {
+                        if (o->name() == "ONNX CAD Surface") {
+                            scene_->removeObject(o->id());
+                            break;
+                        }
+                    }
+                    scene_->addPointCloud("ONNX CAD Surface", cadSurfCloud);
+                }
+            }
+
+            // 1. Estimated Camera FOV
+            {
+                auto fovCloudEst = std::make_shared<open3d::geometry::PointCloud>();
+                const double fw = estIntr.width;
+                const double fh = estIntr.height;
+                const double ffx = estIntr.fx;
+                const double ffy = estIntr.fy;
+                const double fcx = estIntr.cx;
+                const double fcy = estIntr.cy;
+                const double fz = std::max(0.25, t.norm());
+
+                Eigen::Vector3d tl((0 - fcx) * fz / ffx, (0 - fcy) * fz / ffy, fz);
+                Eigen::Vector3d tr((fw - fcx) * fz / ffx, (0 - fcy) * fz / ffy, fz);
+                Eigen::Vector3d bl((0 - fcx) * fz / ffx, (fh - fcy) * fz / ffy, fz);
+                Eigen::Vector3d br((fw - fcx) * fz / ffx, (fh - fcy) * fz / ffy, fz);
+                Eigen::Vector3d origin(0, 0, 0);
+
+                std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> lines = {
+                    {origin, tl}, {origin, tr}, {origin, bl}, {origin, br},
+                    {tl, tr}, {tr, br}, {br, bl}, {bl, tl}
+                };
+
+                Eigen::Matrix4d estPoseInv = T.inverse();
+                for (const auto& line : lines) {
+                    const int num_points = 50;
+                    for (int i = 0; i <= num_points; ++i) {
+                        double frac = double(i) / num_points;
+                        Eigen::Vector3d p = line.first + frac * (line.second - line.first);
+                        Eigen::Vector4d p_homo(p.x(), p.y(), p.z(), 1.0);
+                        p_homo = estPoseInv * p_homo;
+                        p = p_homo.head<3>() / p_homo.w();
+                        p *= scaleToView;
+                        fovCloudEst->points_.push_back(p);
+                        fovCloudEst->colors_.push_back(Eigen::Vector3d(0.0, 1.0, 0.4));
+                    }
+                }
+
+                for (const auto& o : scene_->objects()) {
+                    if (o->name() == "Estimated Camera FOV") {
+                        scene_->removeObject(o->id());
+                        break;
+                    }
+                }
+                scene_->addPointCloud("Estimated Camera FOV", fovCloudEst);
+            }
+
+            // 2. Transform segmented foreground cluster(s) into CAD space
+            {
+                auto alignedCloud = std::make_shared<open3d::geometry::PointCloud>();
+                static const Eigen::Vector3d kInstCols[4] = {
+                    {0.0, 1.0, 0.82},
+                    {1.0, 0.57, 0.0},
+                    {0.88, 0.25, 0.98},
+                    {1.0, 0.93, 0.0}
+                };
+                for (size_t pi = 0; pi < poses.size(); ++pi) {
+                    const auto& pose_i = poses[pi];
+                    const std::vector<cv::Vec3f>& segPts = !pose_i.segmented_points.empty()
+                        ? pose_i.segmented_points
+                        : (pi == 0 ? universalPoseEstimator_->lastSegmentedPoints() : std::vector<cv::Vec3f>{});
+                    if (segPts.empty()) continue;
+
+                    Eigen::Matrix4d T_i = Eigen::Matrix4d::Identity();
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 3; ++c) {
+                            T_i(r, c) = pose_i.R(r, c);
+                        }
+                        T_i(r, 3) = pose_i.t[r];
+                    }
+                    Eigen::Matrix4d invT_i = T_i.inverse();
+                    const Eigen::Vector3d col = kInstCols[pi % 4];
+                    for (const auto& sp : segPts) {
+                        Eigen::Vector4d ph = invT_i * Eigen::Vector4d(sp[0], sp[1], sp[2], 1.0);
+                        alignedCloud->points_.emplace_back((ph.head<3>() / ph.w()) * scaleToView);
+                        alignedCloud->colors_.push_back(col);
+                    }
+                }
+                if (!alignedCloud->points_.empty()) {
+                    for (const auto& o : scene_->objects()) {
+                        if (o->name() == "Aligned Scene Points") {
+                            scene_->removeObject(o->id());
+                            break;
+                        }
+                    }
+                    scene_->addPointCloud("Aligned Scene Points", alignedCloud);
+                    pipelineLog(QString("  [3D Overlay] Added %1 aligned scene points onto CAD model.")
+                                    .arg(alignedCloud->points_.size()));
+                }
+            }
+
+            viewport_->update();
+            syncPropertiesUi();
+        }
+
+        if (livePoseResultCard_) {
+            QString instBadge = (poses.size() > 1)
+                ? QString(" | <b style='color:#40c4ff;'>%1 inst</b>").arg(poses.size())
+                : QString();
+            QString cardHtml = QString(
+                "<div style='font-size:11px; line-height: 1.4; color: #eceff1;'>"
+                "<b style='color:#00e676;'>🎯 Black-Box ONNX (%1 ms)%14</b><br>"
+                "<b>World Nav:</b> H=%2m, D=%3m | Pitch=%4°, Az=%5°<br>"
+                "<b>Sensor T (mm):</b> X=%6, Y=%7, Z=%8<br>"
+                "<b>Sensor Euler:</b> R=%9°, P=%10°, Y=%11°<br>"
+                "<b>Quality:</b> Fit <b style='color:#00e676;'>%12%</b> | RMSE: %13 mm"
+                "</div>")
+                .arg(totLat, 0, 'f', 1)
+                .arg(physHeight, 0, 'f', 2).arg(physDist, 0, 'f', 2)
+                .arg(physPitch, 0, 'f', 1).arg(physAzimuth, 0, 'f', 1)
+                .arg(t.x() * 1000.0, 0, 'f', 1).arg(t.y() * 1000.0, 0, 'f', 1).arg(t.z() * 1000.0, 0, 'f', 1)
+                .arg(roll, 0, 'f', 1).arg(pitch, 0, 'f', 1).arg(yaw, 0, 'f', 1)
+                .arg(fitness * 100.0, 0, 'f', 1).arg(rmseMm, 0, 'f', 2)
+                .arg(instBadge);
+            livePoseResultCard_->setText(cardHtml);
+        }
+
+        if (liveCameraStreamWidget_) {
+            const cv::Vec3d cmin = universalPoseEstimator_->cadMin();
+            const cv::Vec3d cmax = universalPoseEstimator_->cadMax();
+            const double dx_mm = (cmax[0] - cmin[0]) * 1000.0;
+            const double dy_mm = (cmax[1] - cmin[1]) * 1000.0;
+            const double dz_mm = (cmax[2] - cmin[2]) * 1000.0;
+            QString headerBanner = QString("%1 • %2 (%3x%4x%5mm) • %6 inst")
+                .arg(floorLocked ? "FLOOR LOCKED" : (universalPoseEstimator_->isFloorStanding() ? "PCA ALIGNED" : "FREE 6DoF"))
+                .arg(QString::fromStdString(universalPoseEstimator_->modelName()))
+                .arg(dx_mm, 0, 'f', 0).arg(dy_mm, 0, 'f', 0).arg(dz_mm, 0, 'f', 0)
+                .arg(poses.size());
+            QString poseBanner = QString("X:%1m Y:%2m Z:%3m | Yaw:%4° [Fit:%5% | RMSE:%6mm | %7ms]")
+                .arg(t.x(), 0, 'f', 2).arg(t.y(), 0, 'f', 2).arg(t.z(), 0, 'f', 2)
+                .arg(yaw >= 0.0 ? QString("+%1").arg(yaw, 0, 'f', 1) : QString::number(yaw, 'f', 1))
+                .arg(fitness * 100.0, 0, 'f', 0)
+                .arg(rmseMm, 0, 'f', 1)
+                .arg(totLat, 0, 'f', 1);
+
+            if (!runLabel.contains("live", Qt::CaseInsensitive) &&
+                !runLabel.contains("MuJoCo", Qt::CaseInsensitive)) {
+                QImage qColor, qDepth;
+                float centerDist = 0.0f;
+                makeDisplayImages(frame, qColor, qDepth, centerDist);
+                if (toggleCamViewAct_) {
+                    QSignalBlocker b(toggleCamViewAct_);
+                    toggleCamViewAct_->setChecked(true);
+                }
+                liveCameraStreamWidget_->show();
+                if (!isLiveMode) {
+                    QList<int> currentSizes = mainViewSplitter_->sizes();
+                    if (currentSizes.size() >= 3 && currentSizes[1] < 100) {
+                        mainViewSplitter_->setSizes({400, 280, 120});
+                    }
+                }
+                liveCameraStreamWidget_->displayStaticRGBDFrame(qColor, qDepth, centerDist);
+            }
+            liveCameraStreamWidget_->setUniversalPoseOverlays(poses, *universalPoseEstimator_, estIntr, poseBanner, headerBanner);
+        }
+
+        if (!suppressDialogs) {
+            QString summary = QString(
+                "<h3>🎯 Universal Black-Box ONNX 6DoF Pose Thành Công!</h3>"
+                "<p><b>Model:</b> %17 (%18) | <b>Instances:</b> %19<br>"
+                "<b>Thời gian xử lý (C++ ORT):</b> <font color='#00cc66'><b>%1 ms</b></font> "
+                "(AI: %2 ms | Solve/ICP: %3 ms)</p>"
+                "<hr>"
+                "<b>1. Tư thế Camera thực tế trong không gian (World Frame):</b><br>"
+                "&bull; Chiều cao (Height): <b>%4 m</b> | Khoảng cách: <b>%5 m</b><br>"
+                "&bull; Pitch: <b>%6&deg;</b> | Roll: <b>%7&deg;</b> | Azimuth: <b>%8&deg;</b><br><br>"
+                "<b>2. Hệ trục Sensor OpenCV (T_cam_obj):</b><br>"
+                "&bull; Tọa độ t (mm): X=<b>%9</b>, Y=<b>%10</b>, Z=<b>%11</b><br>"
+                "&bull; Euler sensor: Roll=<b>%12&deg;</b>, Pitch=<b>%13&deg;</b>, Yaw=<b>%14&deg;</b><br><br>"
+                "<b>3. Độ tin cậy:</b> Fitness <b>%15%</b> | Surface RMSE: <b>%16 mm</b><br>")
+                .arg(totLat, 0, 'f', 2).arg(aiLat, 0, 'f', 2).arg(icpLat, 0, 'f', 2)
+                .arg(physHeight, 0, 'f', 3).arg(physDist, 0, 'f', 3)
+                .arg(physPitch, 0, 'f', 2).arg(physRoll, 0, 'f', 2).arg(physAzimuth, 0, 'f', 2)
+                .arg(t.x() * 1000.0, 0, 'f', 1).arg(t.y() * 1000.0, 0, 'f', 1).arg(t.z() * 1000.0, 0, 'f', 1)
+                .arg(roll, 0, 'f', 1).arg(pitch, 0, 'f', 1).arg(yaw, 0, 'f', 1)
+                .arg(fitness * 100.0, 0, 'f', 1).arg(rmseMm, 0, 'f', 2)
+                .arg(QString::fromStdString(universalPoseEstimator_->modelName()))
+                .arg(universalPoseEstimator_->isFloorStanding() ? "FLOOR_STANDING" : "FREE_6DOF")
+                .arg(poses.size());
+
+            if (groundTruthCameraFromObject) {
+                summary += QString(
+                    "<hr><b>So sánh Ground Truth:</b> e_t=<b>%1 mm</b> | e_R=<b>%2&deg;</b>")
+                    .arg(e_t * 1000.0, 0, 'f', 2).arg(e_R_deg, 0, 'f', 2);
+            }
+            QMessageBox::information(this, "AI Pose Estimation Result", summary);
+        }
+
+        statusBar()->showMessage(
+            QString("ONNX 6DoF [%1 inst]: t=(%2, %3, %4)m | Fit=%5% | %6 ms")
+                .arg(poses.size())
+                .arg(t.x(), 0, 'f', 3).arg(t.y(), 0, 'f', 3).arg(t.z(), 0, 'f', 3)
+                .arg(fitness * 100.0, 0, 'f', 0).arg(totLat, 0, 'f', 1),
+            10000);
+        return true;
+    }
+
+    // =========================================================================
+    // LEGACY .PTH FALLBACK (only used when no .onnx model exists yet)
+    // =========================================================================
+    QString ckptPath = tmcadDir.absoluteFilePath("deep_learning/checkpoints/" + cadName + "/best_hierarchy_model.pth");
     if (!QFile::exists(ckptPath)) {
         ckptPath = tmcadDir.absoluteFilePath("deep_learning/checkpoints/" + cadName + "/best_model.pth");
     }
+    if (!QFile::exists(ckptPath)) {
+        if (!suppressDialogs) {
+            QMessageBox::warning(this, "AI Pose Error",
+                                 QString("Chưa tìm thấy model .onnx hoặc checkpoint .pth cho '%1'.\nHãy nhấn '1-Click Auto-Build (CAD -> ONNX)'.").arg(cadName));
+        }
+        statusBar()->clearMessage();
+        return false;
+    }
 
+    auto rawScene = ClassicalPoseEstimator::pointCloudFromRGBD(frame, intrinsics);
+    if (!rawScene || rawScene->points_.empty()) {
+        if (!suppressDialogs) {
+            pipelineLog("  [ERROR] Empty scene cloud from RGBD frame.");
+            QMessageBox::warning(this, "Estimate Pose", "Failed to generate point cloud from frame.");
+            statusBar()->clearMessage();
+        }
+        return false;
+    }
+
+    auto sceneCloud = rawScene->VoxelDownSample(0.005);
+    if (!sceneCloud || sceneCloud->points_.size() < 128) {
+        sceneCloud = rawScene;
+    }
+
+    QDir debugDir(tmcadDir.absoluteFilePath("debug"));
+    if (!debugDir.exists()) debugDir.mkpath(".");
+
+    QString tempScenePath = debugDir.absoluteFilePath("temp_scene_ai.ply");
+    QString jsonOutputPath = debugDir.absoluteFilePath("pose_output_ai.json");
+    QString overlayCloudPath = debugDir.absoluteFilePath("aligned_scene_overlay.ply");
+    QFile::remove(jsonOutputPath);
+    open3d::io::WritePointCloud(tempScenePath.toStdString(), *sceneCloud);
+
+    QString pyScript = tmcadDir.absoluteFilePath("scripts/infer_hierarchy.py");
     bool isRealSensor = !runLabel.startsWith("synthetic");
     bool daemonReady = false;
 
-    // Kiểm tra xem Persistent AI Worker đã khởi tạo, khớp model và script chưa bị thay đổi hay chưa
     QDateTime scriptMTime = QFileInfo(pyScript).lastModified();
     if (aiDaemonProcess_ && aiDaemonProcess_->state() == QProcess::Running &&
         currentDaemonCadPath_ == cadPath && currentDaemonCkptPath_ == ckptPath &&
@@ -2799,16 +3603,12 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
     } else {
         stopAiDaemon();
         currentDaemonScriptMTime_ = scriptMTime;
-        pipelineLog(QString("  [ONNX Worker] Khởi tạo worker thường trực cho: %1...").arg(cadName));
-        statusBar()->showMessage("Đang nạp Black-Box ONNX model vào bộ nhớ...");
-        QApplication::processEvents();
-
+        pipelineLog(QString("  [PyTorch Fallback] Khởi tạo worker cho: %1...").arg(cadName));
         aiDaemonProcess_ = std::make_unique<QProcess>();
         aiDaemonProcess_->setWorkingDirectory(tmcadDir.absolutePath());
         QStringList daemonArgs;
         daemonArgs << "-u"
                    << pyScript
-                   << "--onnx" << ckptPath
                    << "--cad" << cadPath
                    << "--checkpoint" << ckptPath
                    << "--daemon";
@@ -2823,7 +3623,6 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
                         daemonReady = true;
                         currentDaemonCadPath_ = cadPath;
                         currentDaemonCkptPath_ = ckptPath;
-                        pipelineLog("  [AI Worker] Model loaded & READY in GPU VRAM (instant mode enabled).");
                         break;
                     }
                 }
@@ -2866,22 +3665,15 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
             }
             elapsedMs += 50;
         }
-
-        if (!finished) {
-            pipelineLog("  [WARN] AI worker response timed out, restarting worker...");
-            stopAiDaemon();
-        }
+        if (!finished) stopAiDaemon();
     }
 
-    // One-shot fallback nếu chế độ daemon chưa tạo được kết quả
     if (!QFile::exists(jsonOutputPath)) {
-        pipelineLog(QString("  Invoking AI inference (one-shot fallback): %1").arg(pyScript));
         QProcess process;
         process.setWorkingDirectory(tmcadDir.absolutePath());
         QStringList args;
         args << pyScript
              << "--input" << tempScenePath
-             << "--onnx" << ckptPath
              << "--cad" << cadPath
              << "--checkpoint" << ckptPath
              << "--output-json" << jsonOutputPath
@@ -2895,39 +3687,29 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
         if (isRealSensor) {
             args << "--real-sensor" << "--fixed-height" << "-1" << "--max-depth" << "3.5";
         }
-
         process.start("python3", args);
         if (!process.waitForFinished(15000)) {
-            pipelineLog("  [ERROR] AI inference timed out after 15s.");
-            QMessageBox::warning(this, "AI Pose Error", "Inference timed out.");
+            if (!suppressDialogs) QMessageBox::warning(this, "AI Pose Error", "Inference timed out.");
             statusBar()->clearMessage();
             return false;
         }
-
         if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
             QString err = process.readAllStandardError();
             pipelineLog(QString("  [ERROR] Inference failed:\n%1").arg(err));
-            QMessageBox::warning(this, "AI Pose Error", "AI Inference failed:\n" + err);
+            if (!suppressDialogs) QMessageBox::warning(this, "AI Pose Error", "AI Inference failed:\n" + err);
             statusBar()->clearMessage();
             return false;
         }
     }
 
-    // Read result JSON
     QFile jsonFile(jsonOutputPath);
-    if (!jsonFile.open(QIODevice::ReadOnly)) {
-        pipelineLog("  [ERROR] Cannot read JSON output.");
-        return false;
-    }
-
-    QByteArray jsonData = jsonFile.readAll();
+    if (!jsonFile.open(QIODevice::ReadOnly)) return false;
+    QJsonDocument doc = QJsonDocument::fromJson(jsonFile.readAll());
     jsonFile.close();
+    if (!doc.isObject()) return false;
 
-    QJsonDocument doc = QJsonDocument::fromJson(jsonData);
-    if (!doc.isObject()) {
-        pipelineLog("  [ERROR] Invalid JSON from AI inference.");
-        return false;
-    }
+    lastAiTelemetry_ = LastAiTelemetry();
+    lastAiTelemetry_.fromCppNative = false;
 
     QJsonObject root = doc.object();
     if (!root["valid"].toBool()) {
@@ -2941,44 +3723,32 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
             livePoseResultCard_->setText(QString(
                 "<div style='font-size:11px; line-height: 1.4; color: #ff80ab;'>"
                 "<b>⚠️ CHƯA TÌM THẤY VẬT THỂ (%1 inliers)</b><br>"
-                "<span style='color:#eceff1;'>%2</span><br>"
-                "<span style='color:#90a4ae;'>Gợi ý: Hướng camera trực tiếp vào bàn ở khoảng cách 0.6m - 1.8m.</span>"
+                "<span style='color:#eceff1;'>%2</span>"
                 "</div>"
             ).arg(inliers).arg(errMsg));
         }
-        if (!isLiveMode) {
-            QMessageBox::warning(this, "AI Pose Error", "Pose estimation failed:\n" + errMsg);
-        }
+        if (!suppressDialogs) QMessageBox::warning(this, "AI Pose Error", "Pose estimation failed:\n" + errMsg);
         return false;
     }
 
-    // Parse Transformation matrix
     QJsonArray matArray = root["transformation_matrix"].toArray();
     Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
     for (int r = 0; r < 4; ++r) {
         QJsonArray rowArr = matArray[r].toArray();
-        for (int c = 0; c < 4; ++c) {
-            T(r, c) = rowArr[c].toDouble();
-        }
+        for (int c = 0; c < 4; ++c) T(r, c) = rowArr[c].toDouble();
     }
-
     Eigen::Matrix3d R = T.block<3, 3>(0, 0);
     Eigen::Vector3d t = T.block<3, 1>(0, 3);
-
     QJsonObject eulerObj = root["euler_deg"].toObject();
     double roll = eulerObj["roll"].toDouble();
     double pitch = eulerObj["pitch"].toDouble();
     double yaw = eulerObj["yaw"].toDouble();
-
     QJsonObject latencyObj = root["latency"].toObject();
     double aiLat = latencyObj["ai_latency_ms"].toDouble();
     double icpLat = latencyObj["icp_latency_ms"].toDouble();
     double totLat = latencyObj["total_latency_ms"].toDouble();
-
     double fitness = root["fitness"].toDouble();
     double rmseMm = root["inlier_rmse_mm"].toDouble();
-
-    // Physical Camera navigation parameters in World/Robot frame
     QJsonObject physObj = root["camera_physical_world"].toObject();
     double physPitch = physObj["pitch_deg"].toDouble();
     double physRoll = physObj["roll_deg"].toDouble();
@@ -2986,299 +3756,55 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
     double physHeight = physObj["height_m"].toDouble();
     double physDist = physObj["distance_m"].toDouble();
 
+    lastAiTelemetry_.valid = true;
+    lastAiTelemetry_.aiMs = aiLat;
+    lastAiTelemetry_.solveMs = icpLat;
+    lastAiTelemetry_.totalMs = totLat;
+    lastAiTelemetry_.tx = t.x();
+    lastAiTelemetry_.ty = t.y();
+    lastAiTelemetry_.tz = t.z();
+    lastAiTelemetry_.roll = roll;
+    lastAiTelemetry_.pitch = pitch;
+    lastAiTelemetry_.yaw = yaw;
+    lastAiTelemetry_.fitness = fitness;
+    lastAiTelemetry_.rmseMm = rmseMm;
+    lastAiTelemetry_.inliers = root["ransac_inliers"].toInt();
+    lastAiTelemetry_.numInstances = 1;
+
     if (!isLiveMode) {
-        pipelineLog(QString("  [AI SUCCESS] Total latency: %1 ms (GeoPoseNet: %2 ms, ICP: %3 ms)")
-                        .arg(totLat, 0, 'f', 2).arg(aiLat, 0, 'f', 2).arg(icpLat, 0, 'f', 2));
-        pipelineLog(QString("  [1] Camera World Navigation (Robot Base / Mặt đất):"));
-        pipelineLog(QString("      • Height: %1 m | Distance: %2 m").arg(physHeight, 0, 'f', 3).arg(physDist, 0, 'f', 3));
-        pipelineLog(QString("      • Pitch (tilt): %1 deg | Roll (bank): %2 deg | Azimuth (Yaw): %3 deg")
-                        .arg(physPitch, 0, 'f', 2).arg(physRoll, 0, 'f', 2).arg(physAzimuth, 0, 'f', 2));
-        pipelineLog(QString("  [2] OpenCV Sensor Optical Frame (T_cam_obj, +Z optical forward, +Y down):"));
-        pipelineLog(QString("      • Translation (m): X=%1  Y=%2  Z=%3")
-                        .arg(t.x(), 0, 'f', 4).arg(t.y(), 0, 'f', 4).arg(t.z(), 0, 'f', 4));
-        pipelineLog(QString("      • Sensor Euler (deg): Roll=%1  Pitch=%2  Yaw=%3 (Roll ~90 deg do quy ước trục Y-down vs CAD Z-up)")
-                        .arg(roll, 0, 'f', 2).arg(pitch, 0, 'f', 2).arg(yaw, 0, 'f', 2));
-        pipelineLog(QString("  Fitness: %1%  Inlier RMSE: %2 mm")
-                        .arg(fitness * 100.0, 0, 'f', 1).arg(rmseMm, 0, 'f', 2));
-    }
-
-    double e_t = -1.0;
-    double e_R_deg = -1.0;
-    if (groundTruthCameraFromObject) {
-        Eigen::Vector3d tGt = groundTruthCameraFromObject->block<3, 1>(0, 3);
-        Eigen::Matrix3d RGt = groundTruthCameraFromObject->block<3, 3>(0, 0);
-        e_t = (t - tGt).norm();
-        double cosArg = (R * RGt.transpose()).trace() - 1.0;
-        cosArg = std::clamp(cosArg / 2.0, -1.0, 1.0);
-        e_R_deg = std::acos(cosArg) * 180.0 / M_PI;
-        if (!isLiveMode) {
-            pipelineLog(QString("  Errors vs Ground Truth: e_t = %1 mm, e_R = %2 deg")
-                            .arg(e_t * 1000.0, 0, 'f', 2).arg(e_R_deg, 0, 'f', 2));
-
-            Eigen::Matrix4d T_wc_gt = groundTruthCameraFromObject->inverse();
-            Eigen::Vector3d cam_pos_gt = T_wc_gt.block<3, 1>(0, 3);
-            Eigen::Vector3d fwd_gt = T_wc_gt.block<3, 1>(0, 2);
-            Eigen::Vector3d right_gt = T_wc_gt.block<3, 1>(0, 0);
-            Eigen::Vector3d up_gt = -T_wc_gt.block<3, 1>(0, 1);
-            double gt_pitch = std::asin(std::clamp(fwd_gt.z(), -1.0, 1.0)) * 180.0 / M_PI;
-            double gt_roll = std::atan2(right_gt.z(), up_gt.z()) * 180.0 / M_PI;
-            double gt_azimuth = std::atan2(-cam_pos_gt.y(), -cam_pos_gt.x()) * 180.0 / M_PI;
-            double gt_height = cam_pos_gt.z();
-            double gt_dist = cam_pos_gt.head<2>().norm();
-            pipelineLog(QString("  Camera Nav vs Ground Truth: e_Height=%1 mm, e_Dist=%2 mm, e_Pitch=%3 deg, e_Roll=%4 deg, e_Azimuth=%5 deg")
-                            .arg(std::abs(physHeight - gt_height) * 1000.0, 0, 'f', 1)
-                            .arg(std::abs(physDist - gt_dist) * 1000.0, 0, 'f', 1)
-                            .arg(std::abs(physPitch - gt_pitch), 0, 'f', 2)
-                            .arg(std::abs(physRoll - gt_roll), 0, 'f', 2)
-                            .arg(std::abs(physAzimuth - gt_azimuth), 0, 'f', 2));
-        }
-    }
-
-    // Chỉ cập nhật Scene 3D khi chạy chế độ One-shot (tránh giật lag và nhấp nháy UI trong chế độ Live)
-    if (!isLiveMode) {
-        // 0. If running pure Black-Box ONNX without an .STL mesh in the scene, display the embedded ONNX CAD surface
-        if (!obj) {
-            QString onnxSurfPath = debugDir.absoluteFilePath("onnx_cad_surface.ply");
-            if (QFile::exists(onnxSurfPath)) {
-                auto cadSurfCloud = open3d::io::CreatePointCloudFromFile(onnxSurfPath.toStdString());
-                if (cadSurfCloud && !cadSurfCloud->points_.empty()) {
-                    for (const auto& o : scene_->objects()) {
-                        if (o->name() == "ONNX CAD Surface") {
-                            scene_->removeObject(o->id());
-                            break;
-                        }
-                    }
-                    scene_->addPointCloud("ONNX CAD Surface", cadSurfCloud);
-                }
-            }
-        }
-
-        // 1. Draw Estimated Camera FOV
-        {
-            auto fovCloudEst = std::make_shared<open3d::geometry::PointCloud>();
-            double w = intrinsics.width;
-            double h = intrinsics.height;
-            double fx = intrinsics.fx;
-            double fy = intrinsics.fy;
-            double cx = intrinsics.cx;
-            double cy = intrinsics.cy;
-            double z = t.norm();
-
-            Eigen::Vector3d tl((0 - cx) * z / fx, (0 - cy) * z / fy, z);
-            Eigen::Vector3d tr((w - cx) * z / fx, (0 - cy) * z / fy, z);
-            Eigen::Vector3d bl((0 - cx) * z / fx, (h - cy) * z / fy, z);
-            Eigen::Vector3d br((w - cx) * z / fx, (h - cy) * z / fy, z);
-            Eigen::Vector3d origin(0, 0, 0);
-
-            std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> lines = {
-                {origin, tl}, {origin, tr}, {origin, bl}, {origin, br},
-                {tl, tr}, {tr, br}, {br, bl}, {bl, tl}
-            };
-
-            Eigen::Matrix4d estPoseInv = T.inverse();
-            for (const auto& line : lines) {
-                int num_points = 50;
-                for (int i = 0; i <= num_points; ++i) {
-                    double frac = double(i) / num_points;
-                    Eigen::Vector3d p = line.first + frac * (line.second - line.first);
-                    Eigen::Vector4d p_homo(p.x(), p.y(), p.z(), 1.0);
-                    p_homo = estPoseInv * p_homo;
-                    p = p_homo.head<3>() / p_homo.w();
-                    p *= scaleToView;
-                    fovCloudEst->points_.push_back(p);
-                    fovCloudEst->colors_.push_back(Eigen::Vector3d(0.0, 1.0, 0.4)); // Bright Green/Emerald
-                }
-            }
-
-            for (const auto& o : scene_->objects()) {
-                if (o->name() == "Estimated Camera FOV") {
-                    scene_->removeObject(o->id());
-                    break;
-                }
-            }
-            scene_->addPointCloud("Estimated Camera FOV", fovCloudEst);
-        }
-
-        // 2. Load and overlay the transformed Scene Points directly on CAD
-        if (QFile::exists(overlayCloudPath)) {
-            auto overlayCloud = open3d::io::CreatePointCloudFromFile(overlayCloudPath.toStdString());
-            if (overlayCloud && !overlayCloud->points_.empty()) {
-                for (const auto& o : scene_->objects()) {
-                    if (o->name() == "Aligned Scene Points") {
-                        scene_->removeObject(o->id());
-                        break;
-                    }
-                }
-                scene_->addPointCloud("Aligned Scene Points", overlayCloud);
-                pipelineLog(QString("  [3D Overlay] Added %1 aligned scene points onto CAD model.")
-                                .arg(overlayCloud->points_.size()));
-            }
-        }
-
         viewport_->update();
         syncPropertiesUi();
     }
-
-    // Summary Message Box
-    QString summary = QString(
-        "<h3>🎯 AI GeoPoseNet 6DoF Pose Estimation Thành Công!</h3>"
-        "<p><b>Thời gian xử lý:</b> <font color='#00cc66'><b>%1 ms</b></font> "
-        "(AI: %2 ms | ICP: %3 ms) &mdash; <i>Nhanh gấp ~70x FPFH cổ điển</i></p>"
-        "<hr>"
-        "<b>1. Tư thế Camera thực tế trong không gian (Robot / World Frame):</b><br>"
-        "&bull; Chiều cao (Height): <b>%4 m</b><br>"
-        "&bull; Khoảng cách tới vật (Distance): <b>%5 m</b><br>"
-        "&bull; Góc ngẩng/cúi (Pitch): <b>%6&deg;</b> <i>(0&deg; = nằm ngang song song sàn)</i><br>"
-        "&bull; Góc nghiêng ngang (Roll): <b>%7&deg;</b> <i>(0&deg; = camera đứng thẳng thăng bằng)</i><br>"
-        "&bull; Góc phương vị (Azimuth / Yaw): <b>%8&deg;</b><br><br>"
-        "<b>2. Hệ trục Sensor quang học OpenCV (T_cam_obj):</b><br>"
-        "&bull; Tọa độ t (mm): X=<b>%9 mm</b>, Y=<b>%10 mm</b>, Z=<b>%11 mm</b><br>"
-        "&bull; Euler sensor (XYZ): Roll=<b>%12&deg;</b>, Pitch=<b>%13&deg;</b>, Yaw=<b>%14&deg;</b><br>"
-        "<i>(Lưu ý: Sensor Roll &approx; 90&deg; là chính xác do hệ quang học OpenCV có trục +Y hướng xuống đất, còn CAD có trục +Z hướng lên trời)</i><br><br>"
-        "<b>3. Độ tin cậy:</b><br>"
-        "&bull; Inlier Fitness: <b>%15%</b> (Inlier RMSE: %16 mm)<br>")
-        .arg(totLat, 0, 'f', 2)
-        .arg(aiLat, 0, 'f', 2)
-        .arg(icpLat, 0, 'f', 2)
-        .arg(physHeight, 0, 'f', 3)
-        .arg(physDist, 0, 'f', 3)
-        .arg(physPitch, 0, 'f', 2)
-        .arg(physRoll, 0, 'f', 2)
-        .arg(physAzimuth, 0, 'f', 2)
-        .arg(t.x() * 1000.0, 0, 'f', 1)
-        .arg(t.y() * 1000.0, 0, 'f', 1)
-        .arg(t.z() * 1000.0, 0, 'f', 1)
-        .arg(roll, 0, 'f', 1)
-        .arg(pitch, 0, 'f', 1)
-        .arg(yaw, 0, 'f', 1)
-        .arg(fitness * 100.0, 0, 'f', 1)
-        .arg(rmseMm, 0, 'f', 2);
-
-    if (groundTruthCameraFromObject) {
-        summary += QString(
-            "<hr><b>So sánh Ground Truth (Synthetic):</b><br>"
-            "&bull; Sai số tịnh tiến không gian 3D e_t: <font color='#3399ff'><b>%1 mm</b></font><br>"
-            "&bull; Sai số góc xoay không gian 3D e_R: <font color='#3399ff'><b>%2&deg;</b></font><br>")
-            .arg(e_t * 1000.0, 0, 'f', 2)
-            .arg(e_R_deg, 0, 'f', 2);
-    }
-
-    if (livePoseResultCard_) {
-        QString cardHtml = QString(
-            "<div style='font-size:11px; line-height: 1.4; color: #eceff1;'>"
-            "<b style='color:#00e676;'>🎯 AI GeoPoseNet DETECTED (%1 ms)</b><br>"
-            "<b>World Nav:</b> H=%2m, D=%3m | Pitch=%4°, Azimuth=%5°<br>"
-            "<b>Sensor T (mm):</b> X=%6, Y=%7, Z=%8<br>"
-            "<b>Sensor Euler:</b> R=%9°, P=%10°, Y=%11°<br>"
-            "<b>Quality:</b> Fitness <b style='color:#00e676;'>%12%</b> | RMSE: %13 mm"
-            "</div>")
-            .arg(totLat, 0, 'f', 1)
-            .arg(physHeight, 0, 'f', 2).arg(physDist, 0, 'f', 2)
-            .arg(physPitch, 0, 'f', 1).arg(physAzimuth, 0, 'f', 1)
-            .arg(t.x() * 1000.0, 0, 'f', 1).arg(t.y() * 1000.0, 0, 'f', 1).arg(t.z() * 1000.0, 0, 'f', 1)
-            .arg(roll, 0, 'f', 1).arg(pitch, 0, 'f', 1).arg(yaw, 0, 'f', 1)
-            .arg(fitness * 100.0, 0, 'f', 1).arg(rmseMm, 0, 'f', 2);
-        livePoseResultCard_->setText(cardHtml);
-    }
-
     if (liveCameraStreamWidget_) {
-        QRectF bbox(0, 0, intrinsics.width, intrinsics.height);
-        if (root.contains("bbox_2d")) {
-            QJsonArray bboxArr = root["bbox_2d"].toArray();
-            if (bboxArr.size() == 4) {
-                bbox = QRectF(bboxArr[0].toDouble(), bboxArr[1].toDouble(),
-                              bboxArr[2].toDouble(), bboxArr[3].toDouble());
-            }
-        }
-        std::vector<QPointF> corners2d;
-        if (root.contains("corners_2d")) {
-            QJsonArray cArr = root["corners_2d"].toArray();
-            for (const auto& val : cArr) {
-                QJsonArray pt = val.toArray();
-                if (pt.size() == 2) {
-                    corners2d.emplace_back(pt[0].toDouble(), pt[1].toDouble());
-                }
-            }
-        }
         QString cadLabel = QString("[OK] CAD MODEL DETECTED (6DoF)");
         QString poseBanner = QString("X:%1m Y:%2m Z:%3m | Yaw:%4° [Fit:%5%]")
-            .arg(t.x(), 0, 'f', 2)
-            .arg(t.y(), 0, 'f', 2)
-            .arg(t.z(), 0, 'f', 2)
+            .arg(t.x(), 0, 'f', 2).arg(t.y(), 0, 'f', 2).arg(t.z(), 0, 'f', 2)
             .arg(yaw >= 0.0 ? QString("+%1").arg(yaw, 0, 'f', 1) : QString::number(yaw, 'f', 1))
             .arg(fitness * 100.0, 0, 'f', 0);
         Eigen::Vector3d cMin = Eigen::Vector3d::Zero(), cMax = Eigen::Vector3d::Zero();
-        if (root.contains("cad_min") && root.contains("cad_max")) {
-            QJsonArray minArr = root["cad_min"].toArray();
-            QJsonArray maxArr = root["cad_max"].toArray();
-            if (minArr.size() == 3 && maxArr.size() == 3) {
-                cMin = Eigen::Vector3d(minArr[0].toDouble(), minArr[1].toDouble(), minArr[2].toDouble());
-                cMax = Eigen::Vector3d(maxArr[0].toDouble(), maxArr[1].toDouble(), maxArr[2].toDouble());
-            }
-        }
-        if ((cMax - cMin).norm() < 0.001 && obj) {
+        if (obj) {
             const CADAsset& cadAsset = scene_->getOrProcessCADAsset(obj->filePath());
             if (cadAsset.valid() && cadAsset.normalizedMesh) {
                 cMin = cadAsset.normalizedMesh->GetMinBound() * cadAsset.realBoundingDiag;
                 cMax = cadAsset.normalizedMesh->GetMaxBound() * cadAsset.realBoundingDiag;
             }
         }
-        CameraIntrinsics activeIntr = intrinsics;
-        if (root.contains("refined_intrinsics")) {
-            QJsonObject refObj = root["refined_intrinsics"].toObject();
-            activeIntr.fx = refObj["fx"].toDouble(activeIntr.fx);
-            activeIntr.fy = refObj["fy"].toDouble(activeIntr.fy);
-            activeIntr.cx = refObj["cx"].toDouble(activeIntr.cx);
-            activeIntr.cy = refObj["cy"].toDouble(activeIntr.cy);
-            double sc = refObj["scale_correction"].toDouble(1.0);
-            if (std::abs(sc - 1.0) > 0.001) {
-                if (!isLiveMode) {
-                    pipelineLog(QString("  [Auto-Calibrator] Đã tinh chỉnh tiêu cự theo kích thước CAD thực tế: fx=%1, fy=%2 (scale=%3)")
-                        .arg(activeIntr.fx, 0, 'f', 2).arg(activeIntr.fy, 0, 'f', 2).arg(sc, 0, 'f', 4));
-                }
-            }
+        QImage qColor, qDepth;
+        float centerDist = 0.0f;
+        makeDisplayImages(frame, qColor, qDepth, centerDist);
+        if (toggleCamViewAct_) {
+            QSignalBlocker b(toggleCamViewAct_);
+            toggleCamViewAct_->setChecked(true);
         }
-        liveCameraStreamWidget_->setPoseOverlay3D(R, t, activeIntr, cadLabel, poseBanner, fitness, cMin, cMax);
-
-        if (frame.valid() && frame.color && !frame.color->IsEmpty()) {
-            liveCameraStreamWidget_->show();
-            int w = frame.color->width_;
-            int h = frame.color->height_;
-            QImage qColor(frame.color->data_.data(), w, h, w * 3, QImage::Format_RGB888);
-
-            QImage qDepth(w, h, QImage::Format_RGB888);
-            float centerDist = 0.0f;
-            if (frame.depth && !frame.depth->IsEmpty()) {
-                cv::Mat depthRaw(frame.depth->height_, frame.depth->width_, CV_16UC1, frame.depth->data_.data());
-                if (depthRaw.cols > 0 && depthRaw.rows > 0) {
-                    centerDist = depthRaw.at<uint16_t>(depthRaw.rows / 2, depthRaw.cols / 2) / 1000.0f;
-                    cv::Mat depth8;
-                    depthRaw.convertTo(depth8, CV_8UC1, 255.0 / 3500.0);
-                    cv::Mat depthColor, depthRgb;
-                    cv::applyColorMap(depth8, depthColor, cv::COLORMAP_TURBO);
-                    cv::cvtColor(depthColor, depthRgb, cv::COLOR_BGR2RGB);
-                    qDepth = QImage(depthRgb.data, depthRgb.cols, depthRgb.rows, static_cast<int>(depthRgb.step), QImage::Format_RGB888).copy();
-                }
-            }
-            liveCameraStreamWidget_->displayStaticRGBDFrame(qColor.copy(), qDepth, centerDist);
-
-            if (!isLiveMode) {
-                QList<int> currentSizes = mainViewSplitter_->sizes();
-                if (currentSizes.size() >= 3 && currentSizes[1] < 100) {
-                    mainViewSplitter_->setSizes({400, 280, 120});
-                }
-            }
-        }
-    }
-
-    if (!isLiveMode) {
-        QMessageBox::information(this, "AI Pose Estimation Result", summary);
+        liveCameraStreamWidget_->show();
+        liveCameraStreamWidget_->displayStaticRGBDFrame(qColor, qDepth, centerDist);
+        liveCameraStreamWidget_->setPoseOverlay3D(R, t, intrinsics, cadLabel, poseBanner, fitness, cMin, cMax);
+        liveCameraStreamWidget_->redrawCurrentFrame();
     }
     statusBar()->showMessage(
         QString("AI Pose Estimated: t=(%1, %2, %3)m, latency=%4ms")
             .arg(t.x(), 0, 'f', 3).arg(t.y(), 0, 'f', 3).arg(t.z(), 0, 'f', 3).arg(totLat, 0, 'f', 1),
         10000);
-
     return true;
 }
 
@@ -3361,6 +3887,10 @@ void MainWindow::loadRealSenseBagFile(const QString& bagPath) {
 
     // Hiển thị ngay lập tức khung hình trích xuất từ .bag lên khung xem camera 2D
     if (liveCameraStreamWidget_ && frame.valid() && frame.color && !frame.color->IsEmpty()) {
+        if (toggleCamViewAct_) {
+            QSignalBlocker b(toggleCamViewAct_);
+            toggleCamViewAct_->setChecked(true);
+        }
         liveCameraStreamWidget_->show();
         int w = frame.color->width_;
         int h = frame.color->height_;
@@ -3368,11 +3898,12 @@ void MainWindow::loadRealSenseBagFile(const QString& bagPath) {
         QImage qDepth(w, h, QImage::Format_RGB888);
         float centerDist = 0.0f;
         if (frame.depth && !frame.depth->IsEmpty()) {
+            const double div = (frame.depthScale > 1e-6) ? frame.depthScale : 1000.0;
             cv::Mat depthRaw(frame.depth->height_, frame.depth->width_, CV_16UC1, frame.depth->data_.data());
             if (depthRaw.cols > 0 && depthRaw.rows > 0) {
-                centerDist = depthRaw.at<uint16_t>(depthRaw.rows / 2, depthRaw.cols / 2) / 1000.0f;
+                centerDist = static_cast<float>(depthRaw.at<uint16_t>(depthRaw.rows / 2, depthRaw.cols / 2) / div);
                 cv::Mat depth8;
-                depthRaw.convertTo(depth8, CV_8UC1, 255.0 / 3500.0);
+                depthRaw.convertTo(depth8, CV_8UC1, 255.0 / (3.5 * div));
                 cv::Mat depthColor, depthRgb;
                 cv::applyColorMap(depth8, depthColor, cv::COLORMAP_TURBO);
                 cv::cvtColor(depthColor, depthRgb, cv::COLOR_BGR2RGB);
@@ -3471,6 +4002,10 @@ void MainWindow::openBagForStepping(const QString& bagPath) {
     if (bagRestartBtn_) bagRestartBtn_->setEnabled(true);
 
     if (liveCameraStreamWidget_) {
+        if (toggleCamViewAct_) {
+            QSignalBlocker b(toggleCamViewAct_);
+            toggleCamViewAct_->setChecked(true);
+        }
         liveCameraStreamWidget_->show();
         QList<int> currentSizes = mainViewSplitter_->sizes();
         if (currentSizes.size() >= 3 && currentSizes[1] < 100) {
@@ -3546,11 +4081,12 @@ void MainWindow::stepNextBagFrame() {
         QImage qDepth(w, h, QImage::Format_RGB888);
         float centerDist = 0.0f;
         if (frame.depth && !frame.depth->IsEmpty()) {
+            const double div = (frame.depthScale > 1e-6) ? frame.depthScale : 1000.0;
             cv::Mat depthRaw(frame.depth->height_, frame.depth->width_, CV_16UC1, frame.depth->data_.data());
             if (depthRaw.cols > 0 && depthRaw.rows > 0) {
-                centerDist = depthRaw.at<uint16_t>(depthRaw.rows / 2, depthRaw.cols / 2) / 1000.0f;
+                centerDist = static_cast<float>(depthRaw.at<uint16_t>(depthRaw.rows / 2, depthRaw.cols / 2) / div);
                 cv::Mat depth8;
-                depthRaw.convertTo(depth8, CV_8UC1, 255.0 / 3500.0);
+                depthRaw.convertTo(depth8, CV_8UC1, 255.0 / (3.5 * div));
                 cv::Mat depthColor, depthRgb;
                 cv::applyColorMap(depth8, depthColor, cv::COLORMAP_TURBO);
                 cv::cvtColor(depthColor, depthRgb, cv::COLOR_BGR2RGB);
@@ -3625,8 +4161,7 @@ void MainWindow::restartBagStepping() {
 }
 
 void MainWindow::updateBagTelemetryUi(int frameIdx, double totalFrameMs, bool success) {
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(projectRootDir());
     QString jsonOutputPath = tmcadDir.absoluteFilePath("debug/pose_output_ai.json");
 
     double aiMs = 0.0, icpMs = 0.0;
@@ -3634,8 +4169,22 @@ void MainWindow::updateBagTelemetryUi(int frameIdx, double totalFrameMs, bool su
     double roll = 0.0, pitch = 0.0, yaw = 0.0;
     double fitness = 0.0, rmseMm = 0.0;
     int inliers = 0;
+    int numInstances = 0;
 
-    if (QFile::exists(jsonOutputPath)) {
+    if (lastAiTelemetry_.fromCppNative) {
+        aiMs = lastAiTelemetry_.aiMs;
+        icpMs = lastAiTelemetry_.solveMs;
+        tx = lastAiTelemetry_.tx;
+        ty = lastAiTelemetry_.ty;
+        tz = lastAiTelemetry_.tz;
+        roll = lastAiTelemetry_.roll;
+        pitch = lastAiTelemetry_.pitch;
+        yaw = lastAiTelemetry_.yaw;
+        fitness = lastAiTelemetry_.fitness;
+        rmseMm = lastAiTelemetry_.rmseMm;
+        inliers = lastAiTelemetry_.inliers;
+        numInstances = lastAiTelemetry_.numInstances;
+    } else if (QFile::exists(jsonOutputPath)) {
         QFile f(jsonOutputPath);
         if (f.open(QIODevice::ReadOnly)) {
             QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
@@ -3660,6 +4209,7 @@ void MainWindow::updateBagTelemetryUi(int frameIdx, double totalFrameMs, bool su
                 fitness = root["fitness"].toDouble();
                 rmseMm = root["inlier_rmse_mm"].toDouble();
                 inliers = root["ransac_inliers"].toInt();
+                numInstances = root["valid"].toBool() ? 1 : 0;
             }
         }
     }
@@ -3683,27 +4233,32 @@ void MainWindow::updateBagTelemetryUi(int frameIdx, double totalFrameMs, bool su
     if (bagTelemetryCard_) {
         QString cardHtml;
         if (success) {
+            QString instTag = (numInstances > 1)
+                ? QString(" • <b style='color:#40c4ff;'>%1 inst</b>").arg(numInstances)
+                : QString();
             cardHtml = QString(
                 "<div style='background:#1b282e; border:1px solid #00b0ff; border-radius:6px; padding:6px; font-family:monospace; font-size:11px;'>"
-                "<b style='color:#00e676;'>🎯 FRAME #%1 / %2</b> &mdash; ⏱️ Chu kỳ: <b style='color:#00e676;'>%3 ms</b> (AI: %4 ms | Solve: %5 ms)<br>"
+                "<b style='color:#00e676;'>🎯 FRAME #%1 / %2</b>%18 &mdash; ⏱️ Chu kỳ: <b style='color:#00e676;'>%3 ms</b> (AI: %4 ms | Solve: %5 ms)<br>"
                 "<span style='color:#80cbc4;'>📊 Thống kê độ trễ:</span> TB: <b>%6 ms</b> | Min: <b>%7 ms</b> | Max: <b>%8 ms</b><br>"
                 "<b>Pose 3D (m):</b> X=<b>%9</b>, Y=<b>%10</b>, Z=<b>%11</b><br>"
                 "<b>Góc Xoay:</b> Roll=<b>%12°</b>, Pitch=<b>%13°</b>, Yaw=<b>%14°</b><br>"
-                "<b>Độ Tin Cậy:</b> Fit <b style='color:#00e676;'>%15%</b> | Inliers: %16/1024 | RMSE: %17 mm"
+                "<b>Độ Tin Cậy:</b> Fit <b style='color:#00e676;'>%15%</b> | Inliers: %16 | RMSE: %17 mm"
                 "</div>"
             ).arg(frameIdx).arg(totalFrames)
              .arg(totalFrameMs, 0, 'f', 1).arg(aiMs, 0, 'f', 1).arg(icpMs, 0, 'f', 1)
              .arg(avgLatency, 0, 'f', 1).arg(minLat, 0, 'f', 1).arg(maxLat, 0, 'f', 1)
              .arg(tx, 0, 'f', 3).arg(ty, 0, 'f', 3).arg(tz, 0, 'f', 3)
              .arg(roll, 0, 'f', 1).arg(pitch, 0, 'f', 1).arg(yaw, 0, 'f', 1)
-             .arg(fitness * 100.0, 0, 'f', 0).arg(inliers).arg(rmseMm, 0, 'f', 2);
+             .arg(fitness * 100.0, 0, 'f', 0).arg(inliers).arg(rmseMm, 0, 'f', 2)
+             .arg(instTag);
         } else {
             cardHtml = QString(
                 "<div style='background:#2a1b20; border:1px solid #ff5252; border-radius:6px; padding:6px; font-family:monospace; font-size:11px;'>"
                 "<b style='color:#ff5252;'>⚠️ FRAME #%1 / %2</b> &mdash; ⏱️ Thời gian: %3 ms (TB: %4 ms)<br>"
-                "<span style='color:#ff80ab;'>Không tìm thấy vật thể (Inliers thấp: %5/1024).</span>"
+                "<span style='color:#ff80ab;'>Không tìm thấy vật thể (Depth: %5 pts).</span>"
                 "</div>"
-            ).arg(frameIdx).arg(totalFrames).arg(totalFrameMs, 0, 'f', 1).arg(avgLatency, 0, 'f', 1).arg(inliers);
+            ).arg(frameIdx).arg(totalFrames).arg(totalFrameMs, 0, 'f', 1).arg(avgLatency, 0, 'f', 1)
+             .arg(lastAiTelemetry_.fromCppNative ? lastAiTelemetry_.validDepthPts : inliers);
         }
         bagTelemetryCard_->setText(cardHtml);
     }
@@ -3813,7 +4368,7 @@ void MainWindow::onDetectOnImage() {
         int id = item->data(Qt::UserRole).toInt();
         SceneObject* obj = scene_->getObject(id);
         if (obj && obj->type() == SceneObjectType::Mesh) {
-            cadName = QFileInfo(QString::fromStdString(obj->filePath())).baseName();
+            cadName = QFileInfo(QString::fromStdString(obj->filePath())).completeBaseName();
             cadDir = QFileInfo(QString::fromStdString(obj->filePath())).absolutePath();
             auto meshObj = dynamic_cast<MeshObject*>(obj);
             if (meshObj) {
@@ -4195,9 +4750,8 @@ void MainWindow::onGenerateSyntheticDataset() {
         return;
     }
 
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
-    QString cadName = QFileInfo(QString::fromStdString(obj->filePath())).baseName();
+    QDir tmcadDir(projectRootDir());
+    QString cadName = QFileInfo(QString::fromStdString(obj->filePath())).completeBaseName();
     QString defaultOutDir = resolveDatasetDir(cadName);
     if (!QDir(defaultOutDir).exists()) {
         defaultOutDir = tmcadDir.absoluteFilePath("dataset/" + cadName);
@@ -4334,11 +4888,10 @@ void MainWindow::onTrainAIModel() {
         return;
     }
 
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(projectRootDir());
 
     QString cadPath = QString::fromStdString(obj->filePath());
-    QString cadName = QFileInfo(cadPath).baseName();
+    QString cadName = QFileInfo(cadPath).completeBaseName();
     QString datasetDir = resolveDatasetDir(cadName);
 
     QDir dDir(datasetDir);
@@ -4464,20 +5017,13 @@ void MainWindow::onTrainAIModel() {
 
     // Auto-build Canonical CAD Hierarchy (_triangles.npz, _patches.npz) if not yet generated for this CAD file
     QString cadFolder = QFileInfo(cadPath).dir().absolutePath();
+    QString globalCadDir = tmcadDir.absoluteFilePath("CAD_DATA/" + cadName);
     if (!QFile::exists(cadFolder + "/" + cadName + "_triangles.npz") ||
-        !QFile::exists(cadFolder + "/" + cadName + "_patches.npz")) {
+        !QFile::exists(cadFolder + "/" + cadName + "_patches.npz") ||
+        !QFile::exists(globalCadDir + "/" + cadName + "_triangles.npz") ||
+        !QFile::exists(globalCadDir + "/" + cadName + "_patches.npz")) {
         pipelineLog(QString("  [AUTO-PREP] Đang tự động trích xuất Canonical CAD Hierarchy cho %1...").arg(cadName));
-        const CADAsset& asset = scene_->getOrProcessCADAsset(obj->filePath());
-        if (asset.valid() && asset.normalizedMesh) {
-            open3d::geometry::TriangleMesh metricMesh = *asset.normalizedMesh;
-            metricMesh.Scale(asset.realBoundingDiag, Eigen::Vector3d::Zero());
-            CADHierarchy hier = CADHierarchy::buildFromMesh(metricMesh, cadName.toStdString());
-            hier.exportToFiles(cadFolder.toStdString(), cadName.toStdString());
-            // Also mirror into CAD_DATA/<cadName> for unified access
-            QString globalCadDir = tmcadDir.absoluteFilePath("CAD_DATA/" + cadName);
-            QDir().mkpath(globalCadDir);
-            hier.exportToFiles(globalCadDir.toStdString(), cadName.toStdString());
-        }
+        buildCadHierarchyForObject(obj, false);
     }
 
     trainProcess_ = new QProcess(this);
@@ -4615,12 +5161,11 @@ void MainWindow::onTrainingFinished(int exitCode, QProcess::ExitStatus exitStatu
         trainProgressDlg_ = nullptr;
     }
 
-    if (exitCode == 0) {
+    if (exitCode == 0 && exitStatus == QProcess::NormalExit) {
         pipelineLog(QString("=== [HUẤN LUYỆN HOÀN TẤT THÀNH CÔNG] Đang tự động đóng gói Black-Box ONNX cho %1... ===")
                         .arg(currentTrainingCadName_));
 
-        QDir tmcadDir(QCoreApplication::applicationDirPath());
-        if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+        QDir tmcadDir(projectRootDir());
 
         QProcess exportProc;
         exportProc.setWorkingDirectory(tmcadDir.absolutePath());
@@ -4633,9 +5178,16 @@ void MainWindow::onTrainingFinished(int exitCode, QProcess::ExitStatus exitStatu
         bool exported = exportProc.waitForFinished(60000) && (exportProc.exitCode() == 0);
 
         QString blackboxOnnxPath = tmcadDir.absoluteFilePath("models/" + currentTrainingCadName_ + ".onnx");
+        if (!QFile::exists(blackboxOnnxPath)) {
+            QString deployCand = tmcadDir.absoluteFilePath("deploy_orange_pi_5b/" + currentTrainingCadName_ + "/" + currentTrainingCadName_ + ".onnx");
+            if (QFile::exists(deployCand)) {
+                blackboxOnnxPath = deployCand;
+            }
+        }
         if (exported && QFile::exists(blackboxOnnxPath)) {
             pipelineLog(QString("  [BLACK-BOX ONNX READY] Đã xuất thành công 1 file duy nhất: %1").arg(blackboxOnnxPath));
             refreshOnnxModelList(blackboxOnnxPath);
+            onActiveOnnxModelSwitched(blackboxOnnxPath);
         } else {
             pipelineLog("  [WARN] Tự động xuất ONNX có cảnh báo: " + QString::fromUtf8(exportProc.readAllStandardError()));
         }
@@ -4673,7 +5225,7 @@ void MainWindow::onClearCADCache() {
     SceneObject* obj = scene_->getObject(id);
     if (!obj || obj->type() != SceneObjectType::Mesh) return;
 
-    QString cadName = QFileInfo(QString::fromStdString(obj->filePath())).baseName();
+    QString cadName = QFileInfo(QString::fromStdString(obj->filePath())).completeBaseName();
     auto reply = QMessageBox::question(
         this, "Xác Nhận Xóa Dữ Liệu Cũ",
         QString("Bạn có chắc chắn muốn xóa sạch Dataset và Checkpoint AI đã học của '%1' không?\n\n"
@@ -4683,8 +5235,7 @@ void MainWindow::onClearCADCache() {
 
     if (reply != QMessageBox::Yes) return;
 
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(projectRootDir());
 
     // 1. Delete dataset folder
     QDir dDir(tmcadDir.absoluteFilePath("dataset/" + cadName));
@@ -4724,35 +5275,31 @@ void MainWindow::onClearCADCache() {
 // Phase 0 & 1 — Canonical CAD Hierarchy & Symmetry Slots
 // ---------------------------------------------------------------------------
 
-void MainWindow::onBuildCADHierarchy() {
-    QListWidgetItem* item = objectList_->currentItem();
-    if (!item) {
-        QMessageBox::warning(this, "Build CAD Hierarchy", "Vui lòng chọn một mô hình CAD Mesh trong danh sách trước.");
-        return;
-    }
-    int id = item->data(Qt::UserRole).toInt();
-    SceneObject* obj = scene_->getObject(id);
+bool MainWindow::buildCadHierarchyForObject(SceneObject* obj, bool showSuccessDialog) {
     if (!obj || obj->type() != SceneObjectType::Mesh) {
-        QMessageBox::warning(this, "Build CAD Hierarchy", "Đối tượng được chọn không phải là CAD Mesh.");
-        return;
+        if (showSuccessDialog) {
+            QMessageBox::warning(this, "Build CAD Hierarchy", "Đối tượng được chọn không phải là CAD Mesh.");
+        }
+        return false;
     }
 
-    auto* meshObj = static_cast<MeshObject*>(obj);
     QString filePath = QString::fromStdString(obj->filePath());
     QFileInfo fi(filePath);
     QString cadDir = fi.dir().absolutePath();
-    QString cadName = fi.baseName();
+    QString cadName = fi.completeBaseName();
 
     pipelineLog(QString("=== [Phase 1: Canonical CAD Hierarchy] Trích xuất cấu trúc hình học cho %1 ===").arg(fi.fileName()));
     statusBar()->showMessage("Đang trích xuất Canonical CAD Hierarchy (13D Triangles, Graph, Patches, Regions)...");
     QApplication::processEvents();
 
     const CADAsset& asset = scene_->getOrProcessCADAsset(obj->filePath());
-    if (!asset.valid()) {
+    if (!asset.valid() || !asset.normalizedMesh) {
         pipelineLog("  [ERROR] Không thể nạp CAD asset.");
-        QMessageBox::critical(this, "Lỗi", "Không thể xử lý CAD asset.");
+        if (showSuccessDialog) {
+            QMessageBox::critical(this, "Lỗi", "Không thể xử lý CAD asset.");
+        }
         statusBar()->clearMessage();
-        return;
+        return false;
     }
 
     open3d::geometry::TriangleMesh metricMesh = *asset.normalizedMesh;
@@ -4761,28 +5308,491 @@ void MainWindow::onBuildCADHierarchy() {
     CADHierarchy hier = CADHierarchy::buildFromMesh(metricMesh, cadName.toStdString());
     hier.exportToFiles(cadDir.toStdString(), cadName.toStdString());
 
+    QDir projDir(projectRootDir());
+    QString globalCadDir = projDir.absoluteFilePath("CAD_DATA/" + cadName);
+    QDir().mkpath(globalCadDir);
+    if (QDir(cadDir).canonicalPath() != QDir(globalCadDir).canonicalPath()) {
+        hier.exportToFiles(globalCadDir.toStdString(), cadName.toStdString());
+    }
+
     pipelineLog(QString("  ✓ Triangle Primitives (13D): %1 tam giác").arg(hier.triangles.size()));
     pipelineLog(QString("  ✓ Topology Adjacency Edges: %1 cạnh kề").arg(hier.adjacency.numEdges));
     pipelineLog(QString("  ✓ Dihedral Region Segmentation: %1 vùng mặt hình học").arg(hier.regions.numRegions));
     pipelineLog(QString("  ✓ Local K-ring Patches: K=%1").arg(hier.patches.patchSizeK));
-    pipelineLog(QString("  ✓ Xuất hoàn tất: %1_mesh.ply, _triangles.npz, _adjacency.npz, _patches.npz, _regions.npz, _symmetry.json").arg(cadName));
+    pipelineLog(QString("  ✓ Xuất hoàn tất vào %1 (và CAD_DATA/%2)")
+                    .arg(cadDir).arg(cadName));
 
     statusBar()->showMessage("Trích xuất Canonical CAD Hierarchy thành công!", 6000);
     syncPropertiesUi();
 
-    QMessageBox::information(this, "Canonical Hierarchy Hoàn Tất",
-                             QString("Đã trích xuất và đồng bộ Canonical CAD Hierarchy (Phase 1):\n\n"
-                                     "• Số tam giác (13D Primitives): %1\n"
-                                     "• Số cạnh liên kết Topology: %2\n"
-                                     "• Kích thước Local Patch: K=%3\n"
-                                     "• Phân đoạn vùng hình học (Dihedral Regions): %4 vùng\n"
-                                     "• Nhóm đối xứng (Phase 0): %5\n\n"
-                                     "Tất cả các file canonical (.ply, .npz, .json) đã được lưu vào cùng thư mục với CAD.")
-                                 .arg(hier.triangles.size())
-                                 .arg(hier.adjacency.numEdges)
-                                 .arg(hier.patches.patchSizeK)
-                                 .arg(hier.regions.numRegions)
-                                 .arg(QString::fromStdString(hier.symmetry.symmetryType)));
+    if (showSuccessDialog) {
+        QMessageBox::information(this, "Canonical Hierarchy Hoàn Tất",
+                                 QString("Đã trích xuất và đồng bộ Canonical CAD Hierarchy (Phase 1):\n\n"
+                                         "• Số tam giác (13D Primitives): %1\n"
+                                         "• Số cạnh liên kết Topology: %2\n"
+                                         "• Kích thước Local Patch: K=%3\n"
+                                         "• Phân đoạn vùng hình học (Dihedral Regions): %4 vùng\n"
+                                         "• Nhóm đối xứng (Phase 0): %5\n\n"
+                                         "Tất cả các file canonical (.ply, .npz, .json) đã được lưu vào cùng thư mục với CAD và CAD_DATA/%6.")
+                                     .arg(hier.triangles.size())
+                                     .arg(hier.adjacency.numEdges)
+                                     .arg(hier.patches.patchSizeK)
+                                     .arg(hier.regions.numRegions)
+                                     .arg(QString::fromStdString(hier.symmetry.symmetryType))
+                                     .arg(cadName));
+    }
+    return true;
+}
+
+void MainWindow::onBuildCADHierarchy() {
+    QListWidgetItem* item = objectList_->currentItem();
+    if (!item) {
+        QMessageBox::warning(this, "Build CAD Hierarchy", "Vui lòng chọn một mô hình CAD Mesh trong danh sách trước.");
+        return;
+    }
+    int id = item->data(Qt::UserRole).toInt();
+    SceneObject* obj = scene_->getObject(id);
+    buildCadHierarchyForObject(obj, true);
+}
+
+void MainWindow::onAutoBuildPipelineRequested() {
+    if ((autoBuildProcess_ && autoBuildProcess_->state() != QProcess::NotRunning) ||
+        (trainProcess_ && trainProcess_->state() != QProcess::NotRunning)) {
+        QMessageBox::warning(this, "1-Click Auto-Build",
+                             "Một tiến trình huấn luyện hoặc Auto-Build khác đang chạy. Vui lòng đợi hoàn tất.");
+        return;
+    }
+
+    auto findActiveMeshObject = [this]() -> SceneObject* {
+        if (!objectList_) return nullptr;
+        if (QListWidgetItem* cur = objectList_->currentItem()) {
+            SceneObject* obj = scene_->getObject(cur->data(Qt::UserRole).toInt());
+            if (obj && obj->type() == SceneObjectType::Mesh) return obj;
+        }
+        for (int i = 0; i < objectList_->count(); ++i) {
+            SceneObject* obj = scene_->getObject(objectList_->item(i)->data(Qt::UserRole).toInt());
+            if (obj && obj->type() == SceneObjectType::Mesh) {
+                objectList_->setCurrentRow(i);
+                return obj;
+            }
+        }
+        return nullptr;
+    };
+
+    SceneObject* meshObj = findActiveMeshObject();
+    if (!meshObj) {
+        onAddFile();
+        meshObj = findActiveMeshObject();
+    }
+
+    if (!meshObj) {
+        QMessageBox::warning(this, "1-Click Auto-Build",
+                             "Vui lòng nạp hoặc chọn một mô hình CAD (.stl / .obj / .ply) trước khi chạy Auto-Build.");
+        return;
+    }
+
+    runOneClickAutoPipeline(QString::fromStdString(meshObj->filePath()));
+}
+
+void MainWindow::runOneClickAutoPipeline(const QString& cadFilePath) {
+    if (cadFilePath.isEmpty() || !QFileInfo::exists(cadFilePath)) {
+        QMessageBox::warning(this, "1-Click Auto-Build",
+                             "Tệp mô hình CAD không tồn tại. Vui lòng chọn lại file .stl / .obj / .ply.");
+        return;
+    }
+    if ((autoBuildProcess_ && autoBuildProcess_->state() != QProcess::NotRunning) ||
+        (trainProcess_ && trainProcess_->state() != QProcess::NotRunning)) {
+        QMessageBox::warning(this, "1-Click Auto-Build",
+                             "Một tiến trình huấn luyện hoặc Auto-Build khác đang chạy.");
+        return;
+    }
+
+    const QFileInfo cadFi(cadFilePath);
+    const QString cadName = cadFi.completeBaseName();
+    const QDir projDir(projectRootDir());
+
+    pipelineLog(QString("=== [1-CLICK AUTO-BUILD PIPELINE] Khởi chạy cho mô hình '%1' ===").arg(cadName));
+
+    SceneObject* targetObj = nullptr;
+    const QString reqCanon = cadFi.canonicalFilePath();
+    for (const auto& o : scene_->objects()) {
+        if (!o || o->type() != SceneObjectType::Mesh) continue;
+        const QFileInfo oFi(QString::fromStdString(o->filePath()));
+        if (o->filePath() == cadFilePath.toStdString() ||
+            (!reqCanon.isEmpty() && oFi.canonicalFilePath() == reqCanon)) {
+            targetObj = o.get();
+            break;
+        }
+    }
+
+    const CADAsset& asset = scene_->getOrProcessCADAsset(targetObj ? targetObj->filePath() : cadFilePath.toStdString());
+    if (!asset.valid() || !asset.normalizedMesh) {
+        pipelineLog("  [ERROR] Không thể nạp CAD asset cho Auto-Build.");
+        QMessageBox::critical(this, "1-Click Auto-Build", "Không thể xử lý tệp CAD đầu vào.");
+        return;
+    }
+
+    autoBuildCanceled_.store(false);
+    if (uxToolbar_) uxToolbar_->setAutoBuildRunning(true);
+
+    if (autoBuildProgressDlg_) {
+        autoBuildProgressDlg_->close();
+        autoBuildProgressDlg_->deleteLater();
+        autoBuildProgressDlg_ = nullptr;
+    }
+    autoBuildProgressDlg_ = new QProgressDialog(
+        QString("Đang trích xuất Canonical CAD Hierarchy cho %1...").arg(cadName),
+        "Hủy (Cancel)", 0, 100, this);
+    autoBuildProgressDlg_->setWindowTitle(QString("1-Click Auto-Build — %1").arg(cadName));
+    autoBuildProgressDlg_->setWindowModality(Qt::NonModal);
+    autoBuildProgressDlg_->setMinimumDuration(0);
+    autoBuildProgressDlg_->setValue(2);
+    autoBuildProgressDlg_->show();
+
+    connect(autoBuildProgressDlg_, &QProgressDialog::canceled, this, [this]() {
+        autoBuildCanceled_.store(true);
+        pipelineLog("  [CẢNH BÁO] Người dùng đã hủy pipeline 1-Click Auto-Build.");
+        if (autoBuildProcess_ && autoBuildProcess_->state() != QProcess::NotRunning) {
+            autoBuildProcess_->kill();
+        }
+        if (uxToolbar_) uxToolbar_->setAutoBuildRunning(false);
+    });
+
+    // Bước 0: Build Canonical CAD Hierarchy (.ply / _triangles.npz / _patches.npz / _symmetry.json)
+    bool hierOk = false;
+    if (targetObj) {
+        hierOk = buildCadHierarchyForObject(targetObj, false);
+    } else {
+        open3d::geometry::TriangleMesh metricMesh = *asset.normalizedMesh;
+        metricMesh.Scale(asset.realBoundingDiag, Eigen::Vector3d::Zero());
+        CADHierarchy hier = CADHierarchy::buildFromMesh(metricMesh, cadName.toStdString());
+        const QString globalCadDir = projDir.absoluteFilePath("CAD_DATA/" + cadName);
+        QDir().mkpath(globalCadDir);
+        hier.exportToFiles(cadFi.dir().absolutePath().toStdString(), cadName.toStdString());
+        if (QDir(cadFi.dir().absolutePath()).canonicalPath() != QDir(globalCadDir).canonicalPath()) {
+            hier.exportToFiles(globalCadDir.toStdString(), cadName.toStdString());
+        }
+        hierOk = true;
+    }
+
+    auto abortBeforeProcess = [this](const QString& warnMsg) {
+        if (autoBuildProgressDlg_) {
+            autoBuildProgressDlg_->close();
+            autoBuildProgressDlg_->deleteLater();
+            autoBuildProgressDlg_ = nullptr;
+        }
+        if (uxToolbar_) uxToolbar_->setAutoBuildRunning(false);
+        if (!warnMsg.isEmpty()) {
+            QMessageBox::warning(this, "1-Click Auto-Build", warnMsg);
+        }
+    };
+
+    if (!hierOk || autoBuildCanceled_.load()) {
+        abortBeforeProcess(autoBuildCanceled_.load() ? QString() : QString("Không thể trích xuất Canonical CAD Hierarchy."));
+        return;
+    }
+
+    // Bước 0.5: Tự động sinh Dataset Ray-Cast nếu chưa có dữ liệu huấn luyện
+    QString datasetDir = resolveDatasetDir(cadName);
+    QDir dDir(datasetDir);
+    bool hasDataset = !datasetDir.isEmpty() && dDir.exists() &&
+                      (dDir.exists("train.txt") || !dDir.entryList(QStringList() << "sample_*", QDir::Dirs).isEmpty());
+
+    if (!hasDataset) {
+        datasetDir = projDir.absoluteFilePath("dataset/" + cadName);
+        QDir().mkpath(datasetDir);
+        const int autoSamples = 240;
+
+        DatasetGenConfig cfg;
+        cfg.outputDir = datasetDir.toStdString();
+        cfg.numSamples = autoSamples;
+        cfg.visibleFractionLevels = {1.0, 0.75, 0.5, 0.25};
+        cfg.intrinsics.width = lastSyntheticParams_.width;
+        cfg.intrinsics.height = lastSyntheticParams_.height;
+        cfg.intrinsics.fx = lastSyntheticParams_.fx;
+        cfg.intrinsics.fy = lastSyntheticParams_.fy;
+        cfg.intrinsics.cx = lastSyntheticParams_.cx;
+        cfg.intrinsics.cy = lastSyntheticParams_.cy;
+        cfg.useRealisticNoiseModel = lastSyntheticParams_.useRealisticNoiseModel;
+        cfg.baselineMeters = lastSyntheticParams_.baselineMeters;
+        cfg.subpixelDisparityErrorPx = lastSyntheticParams_.subpixelDisparityErrorPx;
+        cfg.maxIncidenceAngleDeg = lastSyntheticParams_.maxIncidenceAngleDeg;
+        cfg.minRangeMeters = lastSyntheticParams_.minRangeMeters;
+        cfg.maxRangeMeters = lastSyntheticParams_.maxRangeMeters;
+        cfg.addBackgroundPlane = lastSyntheticParams_.addBackgroundPlane;
+        cfg.backgroundPlaneDistanceMeters = lastSyntheticParams_.backgroundPlaneDistanceMeters;
+        cfg.backgroundPlaneSizeMeters = lastSyntheticParams_.backgroundPlaneSizeMeters;
+        if (asset.realBoundingDiag < 0.45) {
+            cfg.amrMode = false;
+            cfg.minDistanceMeters = std::max(0.20, asset.realBoundingDiag * 2.2);
+            cfg.maxDistanceMeters = std::max(0.35, asset.realBoundingDiag * 4.5);
+        } else {
+            cfg.amrMode = true;
+            cfg.minDistanceMeters = std::max(0.05, lastSyntheticParams_.distanceMeters * 0.5);
+            cfg.maxDistanceMeters = lastSyntheticParams_.distanceMeters * 1.5;
+        }
+        cfg.full360Rotation = true;
+        cfg.captureCorrespondences = true;
+
+        pipelineLog(QString("  [AUTO-DATASET] Chưa có dataset -> Đang sinh tự động %1 mẫu ray-cast vào %2...")
+                        .arg(autoSamples).arg(datasetDir));
+        if (autoBuildProgressDlg_) {
+            autoBuildProgressDlg_->setLabelText(QString("Bước 0/3: Sinh tự động %1 mẫu dữ liệu ray-cast...").arg(autoSamples));
+            autoBuildProgressDlg_->setValue(5);
+        }
+
+        const int written = SyntheticDatasetGenerator::generate(asset, cfg,
+            [this](int current, int total) -> bool {
+                if (autoBuildProgressDlg_) {
+                    const int pct = 5 + (current * 12) / std::max(1, total);
+                    autoBuildProgressDlg_->setValue(pct);
+                    autoBuildProgressDlg_->setLabelText(
+                        QString("Bước 0/3: Đang sinh mẫu ray-cast %1/%2...").arg(current).arg(total));
+                }
+                QApplication::processEvents();
+                return !autoBuildCanceled_.load();
+            });
+
+        if (autoBuildCanceled_.load()) {
+            abortBeforeProcess(QString());
+            return;
+        }
+        if (written <= 0) {
+            abortBeforeProcess("Không thể sinh bộ dữ liệu huấn luyện ray-cast cho mô hình CAD.");
+            return;
+        }
+        cadDatasetDirMap_[cadName] = datasetDir;
+        cadDatasetFileMap_[cadName] = QDir(datasetDir).absoluteFilePath("train.txt");
+        pipelineLog(QString("  [AUTO-DATASET] Đã sinh xong %1/%2 mẫu.").arg(written).arg(autoSamples));
+    } else {
+        pipelineLog(QString("  [AUTO-DATASET] Tái sử dụng dataset sẵn có: %1").arg(datasetDir));
+    }
+
+    if (autoBuildProcess_) {
+        if (autoBuildProcess_->state() != QProcess::NotRunning) {
+            autoBuildProcess_->kill();
+            autoBuildProcess_->waitForFinished(500);
+        }
+        autoBuildProcess_->deleteLater();
+        autoBuildProcess_ = nullptr;
+    }
+
+    autoBuildProcess_ = new QProcess(this);
+    autoBuildProcess_->setWorkingDirectory(projDir.absolutePath());
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert("PYTHONUNBUFFERED", "1");
+    autoBuildProcess_->setProcessEnvironment(env);
+
+    struct AutoBuildState {
+        int stage = 1; // 1: build_cad_profile, 2: train_hierarchy, 3: export_hierarchy_onnx
+        QString cadName;
+        QString datasetDir;
+        double diagM = 0.5;
+        QStringList stderrTail;
+        std::function<void()> startStage;
+    };
+    auto state = std::make_shared<AutoBuildState>();
+    state->cadName = cadName;
+    state->datasetDir = datasetDir;
+    state->diagM = asset.realBoundingDiag;
+
+    QPointer<MainWindow> self(this);
+    state->startStage = [self, state, projDir]() {
+        if (!self || !self->autoBuildProcess_ || self->autoBuildCanceled_.load()) return;
+
+        QStringList args;
+        if (state->stage == 1) {
+            self->pipelineLog(QString("  [STAGE 1/3] Xây dựng hồ sơ hình học (_profile.json + _crease_edges.npy) cho %1...").arg(state->cadName));
+            if (self->autoBuildProgressDlg_) {
+                self->autoBuildProgressDlg_->setValue(20);
+                self->autoBuildProgressDlg_->setLabelText(
+                    QString("Bước 1/3: Tạo hồ sơ hình học (_profile.json) cho %1...").arg(state->cadName));
+            }
+            args << projDir.absoluteFilePath("scripts/build_cad_profile.py")
+                 << "--cad-dir" << "CAD_DATA"
+                 << "--cad-name" << state->cadName;
+        } else if (state->stage == 2) {
+            self->pipelineLog(QString("  [STAGE 2/3] Huấn luyện mạng CAD-Aware Hierarchy (20 epochs) cho %1...").arg(state->cadName));
+            if (self->autoBuildProgressDlg_) {
+                self->autoBuildProgressDlg_->setValue(28);
+                self->autoBuildProgressDlg_->setLabelText(
+                    QString("Bước 2/3: Đang huấn luyện AI 6DoF cho %1...").arg(state->cadName));
+            }
+            args << projDir.absoluteFilePath("deep_learning/train_hierarchy.py")
+                 << "--cad-name" << state->cadName
+                 << "--dataset-dir" << state->datasetDir
+                 << "--cad-dir" << projDir.absoluteFilePath("CAD_DATA/" + state->cadName)
+                 << "--epochs" << "20"
+                 << "--batch-size" << "8"
+                 << "--lr" << "0.001"
+                 << "--reset-data";
+            if (state->diagM < 0.45) {
+                args << "--num-cad-samples" << "128";
+            }
+        } else {
+            self->pipelineLog(QString("  [STAGE 3/3] Đóng gói Black-Box ONNX tự chủ cho %1...").arg(state->cadName));
+            if (self->autoBuildProgressDlg_) {
+                self->autoBuildProgressDlg_->setValue(88);
+                self->autoBuildProgressDlg_->setLabelText(
+                    QString("Bước 3/3: Đang đóng gói models/%1.onnx...").arg(state->cadName));
+            }
+            args << projDir.absoluteFilePath("scripts/export_hierarchy_onnx.py")
+                 << "--cad-name" << state->cadName
+                 << "--dataset-dir" << state->datasetDir
+                 << "--checkpoint" << projDir.absoluteFilePath("deep_learning/checkpoints/" + state->cadName + "/best_hierarchy_model.pth");
+        }
+
+        self->statusBar()->showMessage(QString("Auto-Build %1 — Giai đoạn %2/3...").arg(state->cadName).arg(state->stage));
+        self->autoBuildProcess_->start("python3", args);
+    };
+
+    connect(autoBuildProcess_, &QProcess::readyReadStandardOutput, this, [self, state]() {
+        if (!self || !self->autoBuildProcess_) return;
+        const QString text = QString::fromUtf8(self->autoBuildProcess_->readAllStandardOutput());
+        const QStringList lines = text.split('\n', Qt::SkipEmptyParts);
+        for (const QString& rawLine : lines) {
+            const QString line = rawLine.trimmed();
+            if (line.isEmpty()) continue;
+            if (line.startsWith("PROGRESS:")) {
+                int epoch = 0, totalEpochs = 20;
+                double loss = 0.0, recall1 = 0.0;
+                for (const QString& pair : line.mid(9).split(',')) {
+                    const QStringList kv = pair.split('=');
+                    if (kv.size() == 2) {
+                        if (kv[0] == "epoch") epoch = kv[1].toInt();
+                        else if (kv[0] == "total_epochs") totalEpochs = std::max(1, kv[1].toInt());
+                        else if (kv[0] == "loss") loss = kv[1].toDouble();
+                        else if (kv[0] == "recall1") recall1 = kv[1].toDouble();
+                    }
+                }
+                if (self->autoBuildProgressDlg_) {
+                    const int pct = 28 + (epoch * 57) / totalEpochs;
+                    self->autoBuildProgressDlg_->setValue(std::clamp(pct, 28, 86));
+                    self->autoBuildProgressDlg_->setLabelText(
+                        QString("Bước 2/3: Epoch %1/%2 | Loss: %3 | Val Recall@1: %4%")
+                            .arg(epoch).arg(totalEpochs).arg(loss, 0, 'f', 3).arg(recall1, 0, 'f', 1));
+                }
+                self->pipelineLog(QString("  [Epoch %1/%2] Loss: %3 | Val R@1: %4%")
+                                      .arg(epoch).arg(totalEpochs).arg(loss, 0, 'f', 4).arg(recall1, 0, 'f', 2));
+            } else {
+                self->pipelineLog("  [AUTO-BUILD] " + line);
+            }
+        }
+    });
+
+    connect(autoBuildProcess_, &QProcess::readyReadStandardError, this, [self, state]() {
+        if (!self || !self->autoBuildProcess_) return;
+        const QString err = QString::fromUtf8(self->autoBuildProcess_->readAllStandardError()).trimmed();
+        if (err.isEmpty()) return;
+        for (const QString& l : err.split('\n', Qt::SkipEmptyParts)) {
+            state->stderrTail.append(l);
+            if (state->stderrTail.size() > 8) state->stderrTail.removeFirst();
+        }
+        self->pipelineLog("  [AUTO-BUILD ERR] " + err);
+    });
+
+    connect(autoBuildProcess_, &QProcess::errorOccurred, this, [self, state](QProcess::ProcessError err) {
+        if (!self) return;
+        if (err == QProcess::FailedToStart) {
+            if (self->autoBuildProgressDlg_) {
+                self->autoBuildProgressDlg_->close();
+                self->autoBuildProgressDlg_->deleteLater();
+                self->autoBuildProgressDlg_ = nullptr;
+            }
+            if (self->uxToolbar_) self->uxToolbar_->setAutoBuildRunning(false);
+            if (self->autoBuildProcess_) {
+                self->autoBuildProcess_->deleteLater();
+                self->autoBuildProcess_ = nullptr;
+            }
+            self->statusBar()->clearMessage();
+            self->pipelineLog("  [ERROR] Không thể khởi chạy python3 cho Auto-Build.");
+            QMessageBox::critical(self, "1-Click Auto-Build Lỗi",
+                                  "Không thể khởi chạy tiến trình python3 trong giai đoạn " + QString::number(state->stage) + "/3.");
+        }
+    });
+
+    connect(autoBuildProcess_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+        [self, state, projDir](int exitCode, QProcess::ExitStatus exitStatus) {
+            if (!self) return;
+
+            if (self->autoBuildCanceled_.load()) {
+                if (self->autoBuildProgressDlg_) {
+                    self->autoBuildProgressDlg_->close();
+                    self->autoBuildProgressDlg_->deleteLater();
+                    self->autoBuildProgressDlg_ = nullptr;
+                }
+                if (self->uxToolbar_) self->uxToolbar_->setAutoBuildRunning(false);
+                if (self->autoBuildProcess_) {
+                    self->autoBuildProcess_->deleteLater();
+                    self->autoBuildProcess_ = nullptr;
+                }
+                self->statusBar()->showMessage("Đã hủy 1-Click Auto-Build.", 4000);
+                return;
+            }
+
+            if (exitStatus != QProcess::NormalExit || exitCode != 0) {
+                if (self->autoBuildProgressDlg_) {
+                    self->autoBuildProgressDlg_->close();
+                    self->autoBuildProgressDlg_->deleteLater();
+                    self->autoBuildProgressDlg_ = nullptr;
+                }
+                if (self->uxToolbar_) self->uxToolbar_->setAutoBuildRunning(false);
+                if (self->autoBuildProcess_) {
+                    self->autoBuildProcess_->deleteLater();
+                    self->autoBuildProcess_ = nullptr;
+                }
+                self->statusBar()->clearMessage();
+                const QString tail = state->stderrTail.join("\n");
+                self->pipelineLog(QString("  [ERROR] 1-Click Auto-Build thất bại ở Bước %1/3 (mã lỗi %2).").arg(state->stage).arg(exitCode));
+                QMessageBox::warning(self, "1-Click Auto-Build Thất Bại",
+                                     QString("Pipeline dừng ở Bước %1/3 (Mã lỗi %2).\n\n%3")
+                                         .arg(state->stage).arg(exitCode)
+                                         .arg(tail.isEmpty() ? QString("Xem chi tiết trong Pipeline Log.") : tail));
+                return;
+            }
+
+            if (state->stage < 3) {
+                state->stage += 1;
+                state->startStage();
+                return;
+            }
+
+            // Stage 3 hoàn tất: Nạp nóng Black-Box .ONNX vừa xuất
+            if (self->autoBuildProgressDlg_) {
+                self->autoBuildProgressDlg_->setValue(100);
+                self->autoBuildProgressDlg_->close();
+                self->autoBuildProgressDlg_->deleteLater();
+                self->autoBuildProgressDlg_ = nullptr;
+            }
+            if (self->uxToolbar_) self->uxToolbar_->setAutoBuildRunning(false);
+            if (self->autoBuildProcess_) {
+                self->autoBuildProcess_->deleteLater();
+                self->autoBuildProcess_ = nullptr;
+            }
+
+            QString finalOnnx = projDir.absoluteFilePath("models/" + state->cadName + ".onnx");
+            if (!QFile::exists(finalOnnx)) {
+                finalOnnx = projDir.absoluteFilePath("deploy_orange_pi_5b/" + state->cadName + "/" + state->cadName + ".onnx");
+            }
+
+            if (QFile::exists(finalOnnx)) {
+                self->refreshOnnxModelList(finalOnnx);
+                self->onActiveOnnxModelSwitched(finalOnnx);
+                self->syncPropertiesUi();
+                self->pipelineLog(QString("🎉 [1-CLICK AUTO-BUILD READY] Đã đóng gói & nạp nóng thành công: %1").arg(finalOnnx));
+                self->statusBar()->showMessage(QString("Black-Box ONNX '%1' đã sẵn sàng nhận diện 6DoF!").arg(QFileInfo(finalOnnx).fileName()), 8000);
+                QMessageBox::information(self, "1-Click Auto-Build Thành Công",
+                                         QString("Đã hoàn tất toàn bộ quy trình CAD -> Profile -> Train -> Black-Box ONNX!\n\n"
+                                                 "• Model sẵn sàng: %1\n"
+                                                 "• Đã tự động nạp nóng vào Runtime C++ để chạy nhận diện 6DoF ngay lập tức.")
+                                             .arg(finalOnnx));
+            } else {
+                self->pipelineLog("  [WARN] Stage 3 hoàn tất nhưng chưa tìm thấy tệp .onnx đầu ra.");
+                self->statusBar()->showMessage("Auto-Build hoàn tất nhưng không thấy tệp .onnx đầu ra.", 6000);
+            }
+        });
+
+    state->startStage();
 }
 
 void MainWindow::onSymmetryConfig() {
@@ -4800,7 +5810,8 @@ void MainWindow::onSymmetryConfig() {
 
     const CADAsset& asset = scene_->getOrProcessCADAsset(obj->filePath());
     QFileInfo fi(QString::fromStdString(obj->filePath()));
-    QString symPath = fi.path() + "/" + fi.baseName() + "_symmetry.json";
+    const QString cadName = fi.completeBaseName();
+    QString symPath = fi.path() + "/" + cadName + "_symmetry.json";
 
     QDialog dlg(this);
     dlg.setWindowTitle("Cấu Hình Đối Xứng CAD (Phase 0 Symmetry)");
@@ -4840,7 +5851,7 @@ void MainWindow::onSymmetryConfig() {
 
     int idx = combo->currentIndex();
     SymmetryDefinition newSym;
-    newSym.cadName = fi.baseName().toStdString();
+    newSym.cadName = cadName.toStdString();
     newSym.symmetryTransforms.clear();
     newSym.symmetryTransforms.push_back(Eigen::Matrix4d::Identity());
 
@@ -4886,6 +5897,13 @@ void MainWindow::onSymmetryConfig() {
     }
 
     newSym.saveToJson(symPath.toStdString());
+    {
+        QString globalSymDir = QDir(projectRootDir()).absoluteFilePath("CAD_DATA/" + cadName);
+        if (QDir(globalSymDir).exists() &&
+            QDir(fi.path()).canonicalPath() != QDir(globalSymDir).canonicalPath()) {
+            newSym.saveToJson((globalSymDir + "/" + cadName + "_symmetry.json").toStdString());
+        }
+    }
     const_cast<CADAsset&>(asset).hierarchy.symmetry = newSym;
 
     pipelineLog(QString("  [Symmetry Config] Cập nhật đối xứng cho %1: %2 (%3 phép biến đổi đối xứng)")
@@ -4936,7 +5954,7 @@ void MainWindow::onToggleColorRegions() {
         QFileInfo fi(QString::fromStdString(obj->filePath()));
         open3d::geometry::TriangleMesh metricMesh = *asset.normalizedMesh;
         metricMesh.Scale(asset.realBoundingDiag, Eigen::Vector3d::Zero());
-        const_cast<CADAsset&>(asset).hierarchy = CADHierarchy::buildFromMesh(metricMesh, fi.baseName().toStdString());
+        const_cast<CADAsset&>(asset).hierarchy = CADHierarchy::buildFromMesh(metricMesh, fi.completeBaseName().toStdString());
     }
 
     const auto& updatedRegionIds = asset.hierarchy.regions.triangleRegionIds;
@@ -5284,6 +6302,10 @@ void MainWindow::switchWorkspaceMode(WorkspaceMode mode) {
             liveCameraStreamWidget_->hide();
             liveCameraStreamWidget_->stopStream();
         }
+        if (toggleCamViewAct_) {
+            QSignalBlocker blocker(toggleCamViewAct_);
+            toggleCamViewAct_->setChecked(false);
+        }
 
         statusBar()->showMessage("Chế độ: Studio Mô Phỏng CAD & Huấn Luyện AI (Simulation Studio)", 4000);
         pipelineLog("=== [WORKSPACE] Chuyển sang: Studio Mô Phỏng CAD (Simulation Studio) ===");
@@ -5303,20 +6325,38 @@ void MainWindow::switchWorkspaceMode(WorkspaceMode mode) {
         if (liveCameraControlPanel_) liveCameraControlPanel_->show();
 
         if (liveCameraStreamWidget_) {
+            if (toggleCamViewAct_) {
+                QSignalBlocker blocker(toggleCamViewAct_);
+                toggleCamViewAct_->setChecked(true);
+            }
             liveCameraStreamWidget_->show();
+            if (mainViewSplitter_) {
+                QList<int> sizes = mainViewSplitter_->sizes();
+                if (sizes.size() >= 3 && sizes[1] < 160) {
+                    mainViewSplitter_->setSizes({400, 280, 120});
+                }
+            }
             liveCameraStreamWidget_->startStream("");
         }
 
-        // Cập nhật nhãn target CAD
-        QListWidgetItem* item = objectList_->currentItem();
-        if (item && liveTargetCadLabel_) {
-            int id = item->data(Qt::UserRole).toInt();
-            SceneObject* obj = scene_->getObject(id);
+        // Cập nhật nhãn target CAD / Black-Box ONNX
+        if (liveTargetCadLabel_) {
+            QListWidgetItem* item = objectList_ ? objectList_->currentItem() : nullptr;
+            SceneObject* obj = nullptr;
+            if (item) {
+                obj = scene_->getObject(item->data(Qt::UserRole).toInt());
+            }
             if (obj && obj->type() == SceneObjectType::Mesh) {
                 QString cname = QFileInfo(QString::fromStdString(obj->filePath())).fileName();
                 liveTargetCadLabel_->setText(QString("<b>Mô hình mục tiêu:</b> <font color='#00e676'>%1</font>").arg(cname));
             } else {
-                liveTargetCadLabel_->setText("<b>Mô hình mục tiêu:</b> <font color='#ffb74d'>Chưa chọn mô hình CAD</font>");
+                const QString activeOnnx = selectedOnnxPath();
+                if (!activeOnnx.isEmpty()) {
+                    liveTargetCadLabel_->setText(QString("<b>Black-Box ONNX:</b> <font color='#40c4ff'>%1</font>")
+                                                     .arg(QFileInfo(activeOnnx).fileName()));
+                } else {
+                    liveTargetCadLabel_->setText("<b>Mô hình mục tiêu:</b> <font color='#ffb74d'>Chưa chọn mô hình CAD / .onnx</font>");
+                }
             }
         }
 
@@ -5413,8 +6453,7 @@ void MainWindow::onLiveTrackingTimerTick() {
 }
 
 void MainWindow::onExportOrangePiRKNN() {
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(projectRootDir());
 
     // 1. Determine target CAD Name
     QString cadName;
@@ -5423,7 +6462,7 @@ void MainWindow::onExportOrangePiRKNN() {
         int id = item->data(Qt::UserRole).toInt();
         SceneObject* obj = scene_->getObject(id);
         if (obj && obj->type() == SceneObjectType::Mesh) {
-            cadName = QFileInfo(QString::fromStdString(obj->filePath())).baseName();
+            cadName = QFileInfo(QString::fromStdString(obj->filePath())).completeBaseName();
         }
     }
 
@@ -5652,8 +6691,7 @@ void MainWindow::onExportOrangePiRKNN() {
 }
 
 void MainWindow::onSimulateRKNN() {
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+    QDir tmcadDir(projectRootDir());
 
     // Determine current CAD object
     QString cadName = "TABLE-DEMO";
@@ -5662,7 +6700,7 @@ void MainWindow::onSimulateRKNN() {
         int id = item->data(Qt::UserRole).toInt();
         SceneObject* obj = scene_->getObject(id);
         if (obj && obj->type() == SceneObjectType::Mesh) {
-            cadName = QFileInfo(QString::fromStdString(obj->filePath())).baseName();
+            cadName = QFileInfo(QString::fromStdString(obj->filePath())).completeBaseName();
         }
     }
 
@@ -5899,6 +6937,7 @@ void MainWindow::onStartMuJoCoSimulation() {
         if (!activeMuJoCoSim_->open()) {
             QString err = QString::fromStdString(activeMuJoCoSim_->lastErrorMessage());
             if (err.isEmpty()) err = "Không thể khởi tạo OpenGL context hoặc đọc file mô hình CAD!";
+            activeMuJoCoSim_.reset();
             QMessageBox::critical(this, "MuJoCo Simulation",
                 QString("Không thể khởi động bộ mô phỏng MuJoCo D435if:\n%1").arg(err));
             return;
@@ -5920,7 +6959,17 @@ void MainWindow::onStartMuJoCoSimulation() {
     activeMuJoCoSim_->openInteractiveWindow(halfW, fullH, rightX, rightY);
 
     if (liveCameraStreamWidget_) {
+        if (toggleCamViewAct_) {
+            QSignalBlocker blocker(toggleCamViewAct_);
+            toggleCamViewAct_->setChecked(true);
+        }
         liveCameraStreamWidget_->show();
+        if (mainViewSplitter_) {
+            QList<int> sizes = mainViewSplitter_->sizes();
+            if (sizes.size() >= 3 && sizes[1] < 160) {
+                mainViewSplitter_->setSizes({400, 280, 120});
+            }
+        }
     }
 
     // 3. Khởi tạo vòng lặp mô phỏng thời gian thực 30 FPS

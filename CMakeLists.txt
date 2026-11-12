@@ -13,6 +13,46 @@ set(Open3D_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/cmake/Open3D")
 find_package(Open3D REQUIRED)
 find_package(realsense2 REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
+set(ORT_PYTHON_CAPI_DIR "")
+if(Python3_EXECUTABLE)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import onnxruntime, os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi'))"
+        OUTPUT_VARIABLE ORT_PYTHON_CAPI_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
+
+set(ORT_LINK_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime")
+if(ORT_PYTHON_CAPI_DIR AND EXISTS "${ORT_PYTHON_CAPI_DIR}")
+    list(APPEND ORT_LINK_DIRS "${ORT_PYTHON_CAPI_DIR}")
+endif()
+list(JOIN ORT_LINK_DIRS ";" ORT_RPATH)
+
+# Single-Source-of-Truth pose core shared by CadViewer and TMVis_Debug (no Open3D dependency)
+add_library(tmcad_pose_core STATIC
+    src/CADSceneSegmenter.h
+    src/CADSceneSegmenter.cpp
+    src/CADTemplateDetector.h
+    src/CADTemplateDetector.cpp
+    src/UniversalPoseEstimator.h
+    src/UniversalPoseEstimator.cpp
+    src/TablePoseEstimator.h
+    src/CameraIntrinsics.h
+    src/RgbdFrame.h
+)
+target_include_directories(tmcad_pose_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${OpenCV_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime/include
+)
+target_link_directories(tmcad_pose_core PUBLIC ${ORT_LINK_DIRS})
+target_link_libraries(tmcad_pose_core PUBLIC
+    ${OpenCV_LIBS}
+    onnxruntime
+)
 
 add_executable(CadViewer
     src/main.cpp
@@ -40,8 +80,6 @@ add_executable(CadViewer
     src/CameraStreamWidget.cpp
     src/SyntheticRGBDSource.cpp
     src/SyntheticDatasetGenerator.cpp
-    src/CADTemplateDetector.h
-    src/CADTemplateDetector.cpp
     src/ImageDetectionDialog.h
     src/ImageDetectionDialog.cpp
     src/CameraHardwareProfile.h
@@ -53,25 +91,20 @@ add_executable(CadViewer
     src/CameraProfileDialog.cpp
     src/MuJoCoSimDialog.h
     src/MuJoCoSimDialog.cpp
-    src/CADSceneSegmenter.h
-    src/CADSceneSegmenter.cpp
-    src/UniversalPoseEstimator.h
-    src/UniversalPoseEstimator.cpp
+    src/StudioUxControls.h
 )
 
-target_include_directories(CadViewer PRIVATE 
-    ${Open3D_INCLUDE_DIRS} 
+target_include_directories(CadViewer PRIVATE
+    ${Open3D_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/mujoco/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/TMVis_Debug_v1.0.0/TMVis_Debug/ort_include
+    ${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime/include
 )
 
-target_link_directories(CadViewer PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime"
-    "/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
-)
+target_link_directories(CadViewer PRIVATE ${ORT_LINK_DIRS})
 
 target_link_libraries(CadViewer PRIVATE
+    tmcad_pose_core
     Qt5::Widgets
     Open3D::Open3D
     realsense2::realsense2
@@ -82,17 +115,17 @@ target_link_libraries(CadViewer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++.so.1
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++abi.so.1
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/mujoco/lib/libmujoco.so
-    onnxruntime
 )
 
 set_target_properties(CadViewer PROPERTIES
-    BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime;/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
-    INSTALL_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime;/home/huyen1905/.local/lib/python3.10/site-packages/onnxruntime/capi"
+    BUILD_RPATH "${ORT_RPATH}"
+    INSTALL_RPATH "${ORT_RPATH}"
 )
 
 add_executable(run_sweeps src/run_sweeps.cpp src/CADHierarchy.cpp src/CADPreprocessor.cpp src/CADAsset.cpp src/SceneManager.cpp src/SceneObject.cpp src/SyntheticRGBDSource.cpp src/PoseEstimator.cpp)
 target_include_directories(run_sweeps PRIVATE ${Open3D_INCLUDE_DIRS})
-target_link_libraries(run_sweeps PRIVATE Qt5::Widgets  PRIVATE
+target_link_libraries(run_sweeps PRIVATE
+    Qt5::Widgets
     Open3D::Open3D
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++.so.1
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++abi.so.1
@@ -100,25 +133,27 @@ target_link_libraries(run_sweeps PRIVATE Qt5::Widgets  PRIVATE
 
 add_executable(generate_dataset src/generate_dataset.cpp src/CADHierarchy.cpp src/CADPreprocessor.cpp src/CADAsset.cpp src/SceneManager.cpp src/SceneObject.cpp src/SyntheticRGBDSource.cpp src/SyntheticDatasetGenerator.cpp)
 target_include_directories(generate_dataset PRIVATE ${Open3D_INCLUDE_DIRS})
-target_link_libraries(generate_dataset PRIVATE Qt5::Widgets PRIVATE
+target_link_libraries(generate_dataset PRIVATE
+    Qt5::Widgets
     Open3D::Open3D
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++.so.1
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++abi.so.1
 )
 
-add_executable(run_benchmark 
-    src/run_benchmark.cpp 
+add_executable(run_benchmark
+    src/run_benchmark.cpp
     src/CADHierarchy.cpp
-    src/CADPreprocessor.cpp 
-    src/CADAsset.cpp 
-    src/SceneManager.cpp 
-    src/SceneObject.cpp 
-    src/RGBDSource.cpp 
-    src/SyntheticRGBDSource.cpp 
+    src/CADPreprocessor.cpp
+    src/CADAsset.cpp
+    src/SceneManager.cpp
+    src/SceneObject.cpp
+    src/RGBDSource.cpp
+    src/SyntheticRGBDSource.cpp
     src/PoseEstimator.cpp
 )
 target_include_directories(run_benchmark PRIVATE ${Open3D_INCLUDE_DIRS})
-target_link_libraries(run_benchmark PRIVATE Qt5::Widgets PRIVATE
+target_link_libraries(run_benchmark PRIVATE
+    Qt5::Widgets
     Open3D::Open3D
     realsense2::realsense2
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++.so.1
@@ -132,7 +167,8 @@ add_executable(test_phase0_phase1
     src/CADAsset.cpp
 )
 target_include_directories(test_phase0_phase1 PRIVATE ${Open3D_INCLUDE_DIRS})
-target_link_libraries(test_phase0_phase1 PRIVATE Qt5::Widgets PRIVATE
+target_link_libraries(test_phase0_phase1 PRIVATE
+    Qt5::Widgets
     Open3D::Open3D
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++.so.1
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++abi.so.1
@@ -159,10 +195,10 @@ add_executable(test_mujoco_sim_source
     src/CameraProfileParser.h
     src/CameraProfileParser.cpp
 )
-target_include_directories(test_mujoco_sim_source PRIVATE 
+target_include_directories(test_mujoco_sim_source PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${Open3D_INCLUDE_DIRS} 
-    ${OpenCV_INCLUDE_DIRS} 
+    ${Open3D_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/mujoco/include
 )
 target_link_libraries(test_mujoco_sim_source PRIVATE

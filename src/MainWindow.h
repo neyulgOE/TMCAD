@@ -9,6 +9,8 @@
 #include "SceneManager.h"
 #include "Viewport3D.h"
 #include "PoseEstimator.h"
+#include "StudioUxControls.h"
+#include "UniversalPoseEstimator.h"
 
 class QListWidget;
 class QListWidgetItem;
@@ -270,13 +272,16 @@ private slots:
     void onRunOracleCheck();
     void onRunBaselineBenchmark();
 
-    // Workspace mode switching
+    // Workspace mode switching & UX Studio toolbar
     void onSwitchToSimulationMode();
     void onSwitchToCameraMode();
     void onEstimatePoseLiveSnapshot();
     void onToggleLiveContinuousTracking(bool checked);
     void onLiveTrackingTimerTick();
     void onBrowseOnnxModel();
+    void onActiveOnnxModelSwitched(const QString& onnxPath);
+    void onInteractiveRoiChanged(bool active);
+    void onAutoBuildPipelineRequested();
 
 protected:
     void dragEnterEvent(QDragEnterEvent* event) override;
@@ -290,6 +295,13 @@ private:
     QString selectedOnnxPath() const;
     QString parseDatasetDirFromFile(const QString& path) const;
     QString resolveDatasetDir(const QString& cadName, const QString& explicitDir = QString()) const;
+    QString projectRootDir() const;
+    bool buildCadHierarchyForObject(SceneObject* obj, bool showSuccessDialog);
+    void runOneClickAutoPipeline(const QString& cadFilePath);
+    void cacheStaticFrameForRoi(const RGBDFrame& frame,
+                                const CameraIntrinsics& intrinsics,
+                                const QString& runLabel,
+                                const Eigen::Matrix4d* groundTruthCameraFromObject);
 
     // Shared pose-estimation logic called by onEstimatePoseRealSense(),
     // onEstimatePoseFromFile(), and onEstimatePoseSynthetic(). Returns
@@ -312,11 +324,12 @@ private:
                             const Eigen::Matrix4d* groundTruthCameraFromObject = nullptr,
                             const QString& runLabel = QString());
 
-    // Phase 6/7 Deep Learning Pose Estimation (GeoPoseNet + Coarse-to-Fine ICP)
+    // Phase 6/7 Deep Learning Pose Estimation (Black-Box ONNX C++ Runtime + Python fallback)
     bool runPoseEstimationAI(const RGBDFrame& frame,
                               const CameraIntrinsics& intrinsics,
                               const Eigen::Matrix4d* groundTruthCameraFromObject = nullptr,
-                              const QString& runLabel = QString());
+                              const QString& runLabel = QString(),
+                              bool interactiveRoiRerun = false);
 
     // Appends one row to /home/huyen1905/TMCAD/logs/pose_runs.csv,
     // creating the file (and its directory) with a header row on first
@@ -428,6 +441,40 @@ private:
     QString currentDaemonCkptPath_;
     QDateTime currentDaemonScriptMTime_;
     void stopAiDaemon();
+
+    struct LastAiTelemetry {
+        bool valid = false;
+        bool fromCppNative = false;
+        double aiMs = 0.0;
+        double solveMs = 0.0;
+        double totalMs = 0.0;
+        double tx = 0.0, ty = 0.0, tz = 0.0;
+        double roll = 0.0, pitch = 0.0, yaw = 0.0;
+        double fitness = 0.0;
+        double rmseMm = 0.0;
+        int inliers = 0;
+        int clusterPts = 0;
+        int validDepthPts = 0;
+        int numInstances = 0;
+        bool floorLocked = false;
+        double floorPitchDeg = 0.0;
+    };
+
+    std::unique_ptr<tmcad::UniversalPoseEstimator> universalPoseEstimator_;
+    tmcad::StudioUxToolbar* uxToolbar_ = nullptr;
+    QAction* toggleCamViewAct_ = nullptr;
+    QProcess* autoBuildProcess_ = nullptr;
+    QProgressDialog* autoBuildProgressDlg_ = nullptr;
+    std::atomic<bool> autoBuildCanceled_{false};
+    bool lastMultiInstanceFlag_ = true;
+    bool isInteractiveRoiUpdating_ = false;
+
+    RGBDFrame lastStaticFrame_;
+    CameraIntrinsics lastStaticIntrinsics_;
+    QString lastStaticRunLabel_;
+    Eigen::Matrix4d lastStaticGtPose_ = Eigen::Matrix4d::Identity();
+    bool hasLastStaticGtPose_ = false;
+    LastAiTelemetry lastAiTelemetry_;
 
     // ── Workspace Modes (Mô Phỏng vs Camera Thực Tế) ──────────────────────
     enum class WorkspaceMode {

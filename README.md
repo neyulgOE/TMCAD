@@ -47,13 +47,14 @@ Khác với các phương pháp truyền thống (biến CAD thành một đám 
 
 ### 2.2. Biên dịch ứng dụng C++ (`CadViewer`)
 ```bash
-# Clone hoặc mở thư mục dự án
-cd /home/huyen1905/TMCAD
+# Clone và mở thư mục dự án
+git clone https://github.com/neyulgOE/TMCAD.git
+cd TMCAD
 
-# Tạo thư mục build và biên dịch
+# Tạo thư mục build và biên dịch toàn bộ target (bao gồm CadViewer & thư viện dùng chung tmcad_pose_core)
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc) CadViewer
+cmake --build . -j$(nproc)
 ```
 
 Sau khi biên dịch thành công, file thực thi nằm tại: `build/CadViewer`.
@@ -217,23 +218,43 @@ TMCAD/
 │   ├── dataset_hierarchy.py        # PyTorch Dataset nạp dữ liệu phân tầng & nhóm đối xứng
 │   ├── model_hierarchy.py          # CADPatchEncoder, ObservationEncoder (DGCNN), Similarity Matrix
 │   ├── loss_hierarchy.py           # Symmetry-Aware Multi-Positive InfoNCE Loss & Recall metrics
-│   ├── train_hierarchy.py          # Script huấn luyện với tiến trình phát tín hiệu cho GUI
-│   └── checkpoints/                # Thư mục lưu trọng số tốt nhất (best_hierarchy_model.pth)
+│   └── train_hierarchy.py          # Script huấn luyện với tiến trình phát tín hiệu cho GUI
 │
-├── scripts/                        # Scripts bổ trợ suy luận & kiểm chuẩn
-│   ├── infer_hierarchy.py          # Cầu nối suy luận 6DoF Pose: AI + RANSAC Kabsch + Point-to-Plane ICP
-│   └── eval_hierarchy_benchmark.py # Công cụ đo đạc benchmark tự động
+├── models/                         # Các Black-Box ONNX tự chứa (<CAD_NAME>.onnx) chạy trực tiếp
 │
-├── src/                            # Mã nguồn C++ ứng dụng CadViewer
+├── scripts/                        # Pipeline cấu hình CAD, xuất ONNX, suy luận & kiểm chuẩn
+│   ├── build_cad_profile.py        # Tự động trích xuất profile hình học & gờ sắc 3D cho CAD mới
+│   ├── export_hierarchy_onnx.py    # Đóng gói Black-Box ONNX tự chứa (descriptors, meta, bounds, edges)
+│   ├── infer_hierarchy.py          # Suy luận 6DoF đa vật thể / đa cá thể + Auto-Intrinsics
+│   ├── real_sensor_pipeline.py     # Lọc mặt phẳng & nhiễu cảm biến thực
+│   ├── eval_hierarchy_benchmark.py # Đánh giá benchmark tự động
+│   ├── eval_v25_tmvis_parity.py    # Kiểm tra đồng bộ kết quả với TMVis_Debug
+│   ├── convert_to_rknn.py          # Chuyển đổi ONNX sang RKNN cho NPU Orange Pi 5B
+│   ├── simulate_rknn_embedded.py   # Mô phỏng suy luận nhúng RKNN
+│   ├── extract_bag.py              # Trích xuất RGB-D từ file .bag RealSense
+│   ├── split_dataset.py            # Chia tập train/val
+│   └── legacy_debug/               # Lưu trữ các script debug / render thử nghiệm cũ
+│
+├── libs/                           # Thư viện bên thứ ba & ONNX Runtime headers (include/)
+│
+├── src/                            # Nguồn duy nhất (Single Source of Truth) cho CadViewer & lõi tmcad_pose_core
+│   ├── RgbdFrame.h / RGBDTypes.h   # Kiểu CameraIntrinsics & RGB-D chuẩn hóa dùng chung OpenCV/Open3D
+│   ├── CADSceneSegmenter.h/.cpp    # Phân đoạn đa cụm 3D, bóc mặt phẳng nền thích ứng kích thước CAD
+│   ├── CADTemplateDetector.h/.cpp  # Phát hiện khớp mẫu 2D đa góc nhìn (ORB + RANSAC)
+│   ├── UniversalPoseEstimator.*    # Bộ giải 6DoF Universal (FREE_6DOF & FLOOR_STANDING, OBB/Z-buffer)
+│   ├── TablePoseEstimator.h        # Alias tương thích ngược tới UniversalPoseEstimator
 │   ├── CADHierarchy.h/.cpp         # Pipeline trích xuất 4 tầng Canonical CAD Representation
 │   ├── SymmetryDefinition.h/.cpp   # Định nghĩa nhóm đối xứng & công thức sai số ADD-S
-│   ├── SyntheticRGBDSource.h/.cpp  # Động cơ Raycasting ảo sinh ảnh RGB-D
-│   ├── SyntheticDatasetGenerator.* # Bộ sinh dữ liệu hàng loạt tự động
-│   ├── PoseEstimator.h/.cpp        # Classical Pose Solver (FPFH, RANSAC, Kabsch, ICP)
-│   ├── MainWindow.h/.cpp           # Giao diện Qt5 chia 4 Tabs & tích hợp QProcess
+│   ├── MuJoCoD435SimSource.h/.cpp  # Mô phỏng cảm biến RGB-D D435if thời gian thực trên MuJoCo
+│   ├── MuJoCoSimDialog.h/.cpp      # Hộp thoại cấu hình MuJoCo đồng bộ tự động với Active ONNX
+│   ├── StudioUxControls.h          # Thanh công cụ hot-swap .onnx, 1-Click Auto-Build & Traffic-Light pills
+│   ├── CameraStreamWidget.h/.cpp   # Stream RealSense, 2D ROI tương tác & lớp phủ HUD/OBB 3D
+│   ├── MainWindow.h/.cpp           # Giao diện Qt5 chính của CadViewer
 │   └── Viewport3D.h/.cpp           # Khung nhìn OpenGL hiển thị CAD, đám mây điểm, FOV frustum
 │
-├── CMakeLists.txt                  # Cấu hình biên dịch CMake C++17
+├── TMVis_Debug_v1.0.0/TMVis_Debug/ # Ứng dụng C++ kiểm thử độc lập, link trực tiếp lõi tmcad_pose_core từ src/
+│
+├── CMakeLists.txt                  # Cấu hình biên dịch CMake C++17 (CadViewer + tmcad_pose_core)
 ├── ROADMAP.md                      # Lộ trình nghiên cứu chi tiết 10 Phase
 └── README.md                       # Tài liệu hướng dẫn sử dụng này
 ```

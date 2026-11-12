@@ -6,8 +6,11 @@ bin/
 *.so
 *.so.*
 
-# Third-party precompiled heavy libraries (>100MB)
-libs/
+# Third-party precompiled heavy libraries (>100MB), while tracking lightweight ONNX Runtime C++ headers
+libs/*
+!libs/onnxruntime/
+libs/onnxruntime/*
+!libs/onnxruntime/include/
 
 # Datasets and bag recordings
 dataset/

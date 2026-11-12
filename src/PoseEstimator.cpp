@@ -18,7 +18,7 @@ std::shared_ptr<open3d::geometry::PointCloud> ClassicalPoseEstimator::pointCloud
         *frame.color, *frame.depth, frame.depthScale, frame.depthTruncMeters,
         /*convert_rgb_to_intensity=*/false);
 
-    auto cloud = open3d::geometry::PointCloud::CreateFromRGBDImage(*rgbd, intrinsics.toOpen3D());
+    auto cloud = open3d::geometry::PointCloud::CreateFromRGBDImage(*rgbd, toOpen3DIntrinsic(intrinsics));
     if (!cloud || cloud->points_.empty()) {
         std::cerr << "pointCloudFromRGBD: resulting cloud is empty.\n";
         return nullptr;

@@ -1,10 +1,10 @@
 #pragma once
 
-#include "RGBDTypes.h"
+#include "CameraIntrinsics.h"
+#include <cstdint>
 #include <opencv2/core.hpp>
 
-struct RgbdFrame
-{
+struct RgbdFrame {
     cv::Mat depth_z16;
     cv::Mat rgb;
     CameraIntrinsics intrinsics;
@@ -18,8 +18,7 @@ struct RgbdFrame
     double rgb_timestamp_ms = 0.0;
     double depth_timestamp_ms = 0.0;
 
-    bool valid() const
-    {
+    bool valid() const {
         return width > 0 &&
                height > 0 &&
                !depth_z16.empty() &&
@@ -27,4 +26,3 @@ struct RgbdFrame
                depth_scale > 0.0;
     }
 };
-

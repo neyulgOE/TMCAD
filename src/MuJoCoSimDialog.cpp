@@ -18,17 +18,19 @@ MuJoCoSimDialog::MuJoCoSimDialog(const CameraHardwareProfile& profile,
     resize(640, 580);
     setupUi();
 
-    // 1. Ưu tiên tệp CAD đang mở trên màn hình chính TMCAD
-    if (!defaultCadPath_.isEmpty() && QFile::exists(defaultCadPath_)) {
+    // 1. Ưu tiên tự động tìm CAD khớp với Model ONNX đang được chọn ở Bước 2
+    if (!activeOnnxPath_.isEmpty()) {
+        autoDetectCadForOnnx(false);
+    }
+    // 2. Nếu không tìm được từ ONNX, fallback sang CAD đang mở sẵn trong Scene 3D
+    if (cadPathEdit_->text().trimmed().isEmpty() && !defaultCadPath_.isEmpty() && QFile::exists(defaultCadPath_)) {
         cadPathEdit_->setText(defaultCadPath_);
         autoDetectTexture(defaultCadPath_);
     }
-    // 2. Tự động tìm CAD tương ứng với ONNX nếu có
-    else if (!activeOnnxPath_.isEmpty()) {
-        onAutoDetectFromOnnx();
-    } else {
-        // Mặc định nạp obj_000002 nếu tồn tại
-        QString defaultCad = "/home/huyen1905/TMCAD/CAD_DATA/obj_000002/obj_000002.obj";
+    // 3. Fallback mặc định cuối cùng (dò từ project root, không hardcode user home)
+    if (cadPathEdit_->text().trimmed().isEmpty()) {
+        QDir projDir(resolveProjectRoot());
+        QString defaultCad = projDir.absoluteFilePath("CAD_DATA/obj_000002/obj_000002.obj");
         if (QFile::exists(defaultCad)) {
             cadPathEdit_->setText(defaultCad);
             autoDetectTexture(defaultCad);
@@ -38,12 +40,33 @@ MuJoCoSimDialog::MuJoCoSimDialog(const CameraHardwareProfile& profile,
 
 MuJoCoSimDialog::~MuJoCoSimDialog() = default;
 
+QString MuJoCoSimDialog::resolveProjectRoot() const {
+    auto findRootFrom = [](QDir d) -> QString {
+        for (int i = 0; i < 5; ++i) {
+            if (d.exists("CAD_DATA") && (d.exists("models") || d.exists("CMakeLists.txt"))) {
+                return d.absolutePath();
+            }
+            if (!d.cdUp()) break;
+        }
+        return QString();
+    };
+    if (!activeOnnxPath_.isEmpty()) {
+        QString r = findRootFrom(QFileInfo(activeOnnxPath_).absoluteDir());
+        if (!r.isEmpty()) return r;
+    }
+    QString rApp = findRootFrom(QDir(QCoreApplication::applicationDirPath()));
+    if (!rApp.isEmpty()) return rApp;
+    QString rCwd = findRootFrom(QDir::current());
+    if (!rCwd.isEmpty()) return rCwd;
+    return QDir::currentPath();
+}
+
 void MuJoCoSimDialog::setupUi() {
     auto mainLayout = new QVBoxLayout(this);
     mainLayout->setSpacing(12);
 
     // 1. Nhóm chọn file CAD
-    auto cadGroup = new QGroupBox(tr("1. Chọn Tệp CAD Mục Tiêu (Target CAD & Texture)"), this);
+    auto cadGroup = new QGroupBox(tr("1. Chọn Tệp CAD Mục Tiêu (Target CAD && Texture)"), this);
     auto cadLayout = new QGridLayout(cadGroup);
 
     cadLayout->addWidget(new QLabel(tr("Tệp CAD (.obj, .stl, .ply):"), this), 0, 0);
@@ -86,7 +109,7 @@ void MuJoCoSimDialog::setupUi() {
     mainLayout->addWidget(cadGroup);
 
     // 2. Nhóm chọn Profile Camera D435if
-    auto camGroup = new QGroupBox(tr("2. Độ Phân Giải & Hồ Sơ Camera (Camera Profile)"), this);
+    auto camGroup = new QGroupBox(tr("2. Độ Phân Giải && Hồ Sơ Camera (Camera Profile)"), this);
     auto camLayout = new QHBoxLayout(camGroup);
 
     camLayout->addWidget(new QLabel(tr("Chế độ Camera D435if:"), this));
@@ -106,7 +129,7 @@ void MuJoCoSimDialog::setupUi() {
     mainLayout->addWidget(camGroup);
 
     // 3. Nhóm tư thế và che khuất (Occlusion)
-    auto poseGroup = new QGroupBox(tr("3. Tư Thế Vật Thể & Mô Phỏng Che Khuất (Occlusion)"), this);
+    auto poseGroup = new QGroupBox(tr("3. Tư Thế Vật Thể && Mô Phỏng Che Khuất (Occlusion)"), this);
     auto poseLayout = new QGridLayout(poseGroup);
 
     // Khoảng cách camera
@@ -205,8 +228,8 @@ void MuJoCoSimDialog::setupUi() {
 
 void MuJoCoSimDialog::onBrowseCad() {
     QString filter = tr("Tệp CAD (*.obj *.stl *.ply);;Tất cả tệp (*.*)");
-    QString path = QFileDialog::getOpenFileName(this, tr("Chọn tệp CAD"),
-                                                "/home/huyen1905/TMCAD/CAD_DATA", filter);
+    QString initDir = QDir(resolveProjectRoot()).absoluteFilePath("CAD_DATA");
+    QString path = QFileDialog::getOpenFileName(this, tr("Chọn tệp CAD"), initDir, filter);
     if (!path.isEmpty()) {
         cadPathEdit_->setText(path);
         autoDetectTexture(path);
@@ -215,8 +238,8 @@ void MuJoCoSimDialog::onBrowseCad() {
 
 void MuJoCoSimDialog::onBrowseTex() {
     QString filter = tr("Ảnh Texture (*.png *.jpg *.jpeg);;Tất cả tệp (*.*)");
-    QString path = QFileDialog::getOpenFileName(this, tr("Chọn ảnh vân bề mặt"),
-                                                "/home/huyen1905/TMCAD/CAD_DATA", filter);
+    QString initDir = QDir(resolveProjectRoot()).absoluteFilePath("CAD_DATA");
+    QString path = QFileDialog::getOpenFileName(this, tr("Chọn ảnh vân bề mặt"), initDir, filter);
     if (!path.isEmpty()) {
         texPathEdit_->setText(path);
     }
@@ -233,53 +256,111 @@ void MuJoCoSimDialog::autoDetectTexture(const QString& cadPath) {
         cadPathEdit_->setText(baseNoExt + ".obj");
     }
 
+    // Tự động chọn đơn vị Scale nếu là tệp canonical _mesh.ply (mét -> 1.0)
+    if (scaleCombo_) {
+        if (cadPath.endsWith("_mesh.ply", Qt::CaseInsensitive)) {
+            int idx = scaleCombo_->findData(1.0);
+            if (idx >= 0) scaleCombo_->setCurrentIndex(idx);
+        } else {
+            QString unitFile = cadPath + ".unit";
+            if (QFile::exists(unitFile)) {
+                QFile uf(unitFile);
+                if (uf.open(QIODevice::ReadOnly)) {
+                    QString u = QString::fromUtf8(uf.readAll()).trimmed().toLower();
+                    double factor = (u == "m" || u == "meter" || u == "meters") ? 1.0 :
+                                    (u == "cm") ? 0.01 : 0.001;
+                    int idx = scaleCombo_->findData(factor);
+                    if (idx >= 0) scaleCombo_->setCurrentIndex(idx);
+                }
+            }
+        }
+    }
+
     // Thử tìm file .png hoặc .jpg cùng tên
     if (QFile::exists(baseNoExt + ".png")) {
         texPathEdit_->setText(baseNoExt + ".png");
     } else if (QFile::exists(baseNoExt + ".jpg")) {
         texPathEdit_->setText(baseNoExt + ".jpg");
+    } else {
+        texPathEdit_->clear();
     }
 }
 
-void MuJoCoSimDialog::onAutoDetectFromOnnx() {
+bool MuJoCoSimDialog::autoDetectCadForOnnx(bool showWarningIfNotFound) {
     if (activeOnnxPath_.isEmpty()) {
-        QMessageBox::information(this, tr("Chưa chọn Model"),
-                                 tr("Chưa có model ONNX nào được chọn ở Bước 2.\nVui lòng bấm 'Duyệt CAD...' để chọn tệp."));
-        return;
+        if (showWarningIfNotFound) {
+            QMessageBox::information(this, tr("Chưa chọn Model"),
+                                     tr("Chưa có model ONNX nào được chọn ở Bước 2.\nVui lòng bấm 'Duyệt CAD...' để chọn tệp."));
+        }
+        return false;
     }
 
     QFileInfo onnxFi(activeOnnxPath_);
-    QString baseName = onnxFi.baseName(); // vd: "obj_000002"
+    if (onnxFi.isSymLink()) {
+        QFileInfo targetFi(onnxFi.symLinkTarget());
+        if (targetFi.exists()) onnxFi = targetFi;
+    }
+    QString baseName = onnxFi.completeBaseName();
+    if (baseName == "model_obs_npu" || baseName == "model_obs_backbone") {
+        baseName = onnxFi.dir().dirName();
+    }
 
-    QDir projDir(QCoreApplication::applicationDirPath());
-    if (projDir.dirName() == "build") projDir.cdUp();
+    QDir projDir(resolveProjectRoot());
 
     QStringList candidates = {
         projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".obj"),
         projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".stl"),
+        projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".STL"),
         projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".ply"),
+        projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + "_mesh.ply"),
+        projDir.absoluteFilePath("CAD_DATA/" + baseName + ".obj"),
+        projDir.absoluteFilePath("CAD_DATA/" + baseName + ".stl"),
+        projDir.absoluteFilePath("CAD_DATA/" + baseName + ".STL"),
+        projDir.absoluteFilePath("CAD_DATA/" + baseName + "_mesh.ply"),
         projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".obj"),
         projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".stl"),
-        projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".ply"),
-        projDir.absoluteFilePath("CAD_DATA/" + baseName + ".obj"),
-        projDir.absoluteFilePath("CAD_DATA/" + baseName + ".stl")
+        projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".ply")
     };
 
-    bool found = false;
+    // Fallback tìm thư mục con trong CAD_DATA khớp tên model (ví dụ CHINSU.onnx -> Chai_Tuong_Ot_CHINSU_...)
+    QDir cadRoot(projDir.absoluteFilePath("CAD_DATA"));
+    if (cadRoot.exists() && !baseName.isEmpty()) {
+        QStringList subDirs = cadRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+        for (const QString& sub : subDirs) {
+            if (sub.contains(baseName, Qt::CaseInsensitive) && sub != baseName) {
+                candidates << cadRoot.absoluteFilePath(sub + "/" + sub + ".obj")
+                           << cadRoot.absoluteFilePath(sub + "/" + sub + ".stl")
+                           << cadRoot.absoluteFilePath(sub + "/" + sub + ".STL")
+                           << cadRoot.absoluteFilePath(sub + "/" + sub + "_mesh.ply");
+            }
+        }
+    }
+
     for (const QString& cand : candidates) {
         if (QFile::exists(cand)) {
             cadPathEdit_->setText(cand);
             autoDetectTexture(cand);
-            found = true;
-            break;
+            return true;
         }
     }
 
-    if (!found) {
+    QString surfPly = projDir.absoluteFilePath("debug/onnx_cad_surface.ply");
+    if (QFile::exists(surfPly)) {
+        cadPathEdit_->setText(surfPly);
+        texPathEdit_->clear();
+        return true;
+    }
+
+    if (showWarningIfNotFound) {
         QMessageBox::warning(this, tr("Không tìm thấy CAD tự động"),
                              tr("Không tìm thấy tệp CAD tự động cho %1.\nVui lòng bấm 'Duyệt CAD...' để chọn tệp.")
                              .arg(baseName));
     }
+    return false;
+}
+
+void MuJoCoSimDialog::onAutoDetectFromOnnx() {
+    autoDetectCadForOnnx(true);
 }
 
 void MuJoCoSimDialog::onDistanceChanged(int val) {

@@ -16,9 +16,12 @@
 #include <QColor>
 #include <QString>
 #include "RGBDTypes.h"
+#include "StudioUxControls.h"
+#include "UniversalPoseEstimator.h"
 
 class QComboBox;
 class QGroupBox;
+class QEvent;
 
 struct CadOverlaySegment {
     QPointF p0;
@@ -29,7 +32,9 @@ struct CadOverlaySegment {
 
 struct CadOverlayData {
     QRectF bbox;
-    std::vector<CadOverlaySegment> segments;
+    std::vector<CadOverlaySegment> segments;          // 3D Oriented Bounding Box (OBB) & generic segments
+    std::vector<CadOverlaySegment> wireframeSegments; // Embedded CAD crease / feature wireframe segments
+    std::vector<QPointF> segmentedCloudPoints2D;      // Projected segmented cluster points in image coords
     QPolygonF topSurfacePolygon;
     std::vector<QPointF> footPoints;
     QPointF centerAxis;
@@ -73,6 +78,21 @@ public:
                           const Eigen::Vector3d& cadMin = Eigen::Vector3d::Zero(),
                           const Eigen::Vector3d& cadMax = Eigen::Vector3d::Zero());
 
+    // Universal Black-Box ONNX Multi-Instance Overlay (renders OBB + CAD feature wireframe + axes + segmented cloud)
+    void setUniversalPoseOverlays(const std::vector<tmcad::ObjectPose>& poses,
+                                  const tmcad::UniversalPoseEstimator& estimator,
+                                  const CameraIntrinsics& intr,
+                                  const QString& telemetryBanner = QString(),
+                                  const QString& headerBanner = QString());
+
+    void setOverlayRenderFlags(const tmcad::OverlayRenderFlags& flags);
+    tmcad::OverlayRenderFlags overlayRenderFlags() const noexcept { return renderFlags_; }
+
+    bool hasActiveRoi() const noexcept;
+    void clearInteractiveRoi();
+    cv::Rect currentRoiHintImageSpace(int img_w, int img_h) const;
+    void redrawCurrentFrame();
+
     void setCadOverlay(const CadOverlayData& data);
     void setOverlayDetection(const QRectF& bbox,
                              const std::vector<QPointF>& corners3DProj,
@@ -97,10 +117,15 @@ signals:
     void recordingStarted(const QString& bagPath);
     void recordingStopped(const QString& bagPath);
     void snapshotSaved(const QString& snapDir);
+    void roiSelectionChanged(bool active);
 
 public slots:
     void toggleRecord();
     void takeSnapshot();
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 private slots:
     void onFrameReady(const QImage& colorImg, const QImage& depthImg, float centerDist);
@@ -140,7 +165,7 @@ private:
     double lastFps_ = 0.0;
     int64_t lastFpsTime_ = 0;
 
-    // V2.4 overlay tracking state
+    // V2.4 & Universal overlay tracking state
     std::mutex overlayMutex_;
     bool hasOverlay_ = false;
     QRectF overlayBbox_;
@@ -148,5 +173,19 @@ private:
     QString overlayLabel_;
     QString overlayPoseText_;
     CadOverlayData overlayCadData_;
+    std::vector<CadOverlayData> multiOverlayData_;
     int64_t overlayTimestamp_ = 0;
+
+    // Layer toggles & Interactive 2D ROI state
+    tmcad::OverlayRenderFlags renderFlags_;
+    bool hasActiveRoi_ = false;
+    bool isDraggingRoi_ = false;
+    QPointF roiDragStartNorm_;
+    QRectF roiNorm_;
+
+    // Cached last frame (GUI thread only) so toggling layers or dragging ROI redraws static frames cleanly
+    bool hasLastFrame_ = false;
+    QImage lastColorImg_;
+    QImage lastDepthImg_;
+    float lastCenterDist_ = 0.0f;
 };

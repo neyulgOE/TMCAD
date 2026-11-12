@@ -1,12 +1,16 @@
 #include <QApplication>
+#include <QLocale>
 #include <QTimer>
 #include <QPixmap>
 #include <QString>
 #include <QFileInfo>
+#include <clocale>
 #include "MainWindow.h"
 
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
+    std::setlocale(LC_NUMERIC, "C");
+    QLocale::setDefault(QLocale::c());
 
     MainWindow window;
     window.resize(1366, 820);

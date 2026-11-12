@@ -9,6 +9,7 @@ namespace tmcad {
 
 struct SegmentedCluster {
     std::vector<cv::Vec3f> points;
+    std::vector<cv::Vec3f> dense_points;
     cv::Vec3f centroid{0.0f, 0.0f, 0.0f};
     cv::Vec3f bbox_min{0.0f, 0.0f, 0.0f};
     cv::Vec3f bbox_max{0.0f, 0.0f, 0.0f};
@@ -18,10 +19,13 @@ struct SegmentedCluster {
 struct SegmentationResult {
     bool valid{false};
     bool floor_detected{false};
+    size_t raw_points_count{0};
+    double floor_pitch_deg{0.0};
     cv::Vec4d floor_plane{0.0, -1.0, 0.0, 0.0}; // nx, ny, nz, d (nx*X + ny*Y + nz*Z + d = 0)
     std::vector<cv::Vec3f> object_points;       // Sampled 1024 points for primary/merged target
     std::vector<cv::Vec3f> dense_object_points; // Unsampled dense cluster points for ICP
     std::vector<SegmentedCluster> multi_clusters; // Top-K separated clusters for Multi-Instance (e.g. 2 BBQ Sauce bottles)
+    std::vector<cv::Vec3f> foreground_points;   // Unclipped foreground points after support-plane removal
 };
 
 class CADSceneSegmenter {
@@ -51,10 +55,12 @@ private:
                             std::vector<cv::Vec3f>& out_pts) const;
 
     bool fitSupportPlaneRANSAC(const std::vector<cv::Vec3f>& pts,
+                               bool has_roi_hint,
                                cv::Vec4d& out_plane,
                                std::vector<cv::Vec3f>& out_above_floor) const;
 
     void clusterAndMergeTarget(const std::vector<cv::Vec3f>& fg_pts,
+                               bool has_roi_hint,
                                std::vector<cv::Vec3f>& out_merged_dense,
                                std::vector<SegmentedCluster>& out_multi_clusters) const;
 

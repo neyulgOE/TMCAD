@@ -3,8 +3,11 @@
 #include <mujoco/mujoco.h>
 #include <GLFW/glfw3.h>
 #include <EGL/egl.h>
+#include <open3d/Open3D.h>
+#include <filesystem>
 #include <iostream>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <chrono>
 #include <cmath>
@@ -42,8 +45,8 @@ struct MuJoCoD435SimSource::Impl {
     bool opened = false;
 
     // Target Object State (CAD)
-    std::string cadObjPath = "/home/huyen1905/TMCAD/CAD_DATA/obj_000002/obj_000002.obj";
-    std::string cadTexPath = "/home/huyen1905/TMCAD/CAD_DATA/obj_000002/obj_000002.png";
+    std::string cadObjPath;
+    std::string cadTexPath;
     Eigen::Vector3d cadScale = Eigen::Vector3d(0.001, 0.001, 0.001); // mm to m
     Eigen::Vector3d targetSize = Eigen::Vector3d(0.0435, 0.0646, 0.1483); // BBQ bottle bounding box (m)
     Eigen::Vector3d targetMinBound = Eigen::Vector3d(-0.02175, -0.0323, 0.0);
@@ -547,33 +550,51 @@ struct MuJoCoD435SimSource::Impl {
     }
 
     void cleanup() {
+        isInteractive = false;
         if (mujocoInitialized) {
             mjr_freeContext(&con);
             mjv_freeScene(&scn);
             if (d) mj_deleteData(d);
             if (m) mj_deleteModel(m);
+            d = nullptr;
+            m = nullptr;
             mujocoInitialized = false;
         }
         if (glfwWin) {
             glfwDestroyWindow(glfwWin);
             glfwWin = nullptr;
-            glfwTerminate();
+            // Không gọi glfwTerminate() để tránh phá hỏng GLFW/GLX context khi đổi ONNX hoặc mở lại MuJoCo
         }
         if (eglInitialized) {
             if (eglSurf != EGL_NO_SURFACE) eglDestroySurface(eglDpy, eglSurf);
             if (eglCtx != EGL_NO_CONTEXT) eglDestroyContext(eglDpy, eglCtx);
             eglTerminate(eglDpy);
+            eglSurf = EGL_NO_SURFACE;
+            eglCtx = EGL_NO_CONTEXT;
             eglInitialized = false;
         }
         activeBackend = GLBackend::None;
         opened = false;
     }
+
+    static std::string findDefaultCameraProfile() {
+        const std::vector<std::string> candidates = {
+            "configs/camera_profiles/D435if_factory.json",
+            "../configs/camera_profiles/D435if_factory.json"
+        };
+        for (const auto& p : candidates) {
+            if (std::filesystem::exists(p)) return p;
+        }
+        return "";
+    }
 };
 
 MuJoCoD435SimSource::MuJoCoD435SimSource()
     : impl_(std::make_unique<Impl>()) {
-    // Tự động nạp cấu hình mặc định từ file D435if-dataset nếu có
-    loadCameraProfileFromFile("/home/huyen1905/TMCAD/D435if-dataset", 1);
+    const std::string prof = Impl::findDefaultCameraProfile();
+    if (!prof.empty()) {
+        loadCameraProfileFromFile(prof, 1);
+    }
 }
 
 MuJoCoD435SimSource::MuJoCoD435SimSource(const CameraHardwareProfile& profile, int profileId)
@@ -663,10 +684,19 @@ bool MuJoCoD435SimSource::applyHardwareProfile(const CameraHardwareProfile& prof
     impl_->currentWidth = selected->width;
     impl_->currentHeight = selected->height;
 
-    if (impl_->opened) {
-        // Hot-reload
+    if (impl_->opened || impl_->isInteractive) {
+        const bool wasInteractive = impl_->isInteractive;
+        int winX = 100, winY = 100;
+        int winW = impl_->interactiveWinW, winH = impl_->interactiveWinH;
+        if (wasInteractive && impl_->glfwWin) {
+            glfwGetWindowPos(impl_->glfwWin, &winX, &winY);
+            glfwGetWindowSize(impl_->glfwWin, &winW, &winH);
+        }
         close();
-        open();
+        if (!open()) return false;
+        if (wasInteractive) {
+            openInteractiveWindow(winW, winH, winX, winY);
+        }
     }
     return true;
 }
@@ -678,9 +708,19 @@ bool MuJoCoD435SimSource::setCustomResolution(int targetW, int targetH) {
     impl_->currentHeight = targetH;
     impl_->activeProfileId = -1; // Chế độ tùy biến
 
-    if (impl_->opened) {
+    if (impl_->opened || impl_->isInteractive) {
+        const bool wasInteractive = impl_->isInteractive;
+        int winX = 100, winY = 100;
+        int winW = impl_->interactiveWinW, winH = impl_->interactiveWinH;
+        if (wasInteractive && impl_->glfwWin) {
+            glfwGetWindowPos(impl_->glfwWin, &winX, &winY);
+            glfwGetWindowSize(impl_->glfwWin, &winW, &winH);
+        }
         close();
-        open();
+        if (!open()) return false;
+        if (wasInteractive) {
+            openInteractiveWindow(winW, winH, winX, winY);
+        }
     }
     return true;
 }
@@ -820,8 +860,8 @@ std::string MuJoCoD435SimSource::lastErrorMessage() const {
 }
 
 bool MuJoCoD435SimSource::loadTargetMesh(const std::string& objPath,
-                                        const std::string& texturePath,
-                                        const Eigen::Vector3d& scale) {
+                                         const std::string& texturePath,
+                                         const Eigen::Vector3d& scale) {
     impl_->cadObjPath = objPath;
     impl_->cadTexPath = texturePath;
     impl_->cadScale = scale;
@@ -829,85 +869,104 @@ bool MuJoCoD435SimSource::loadTargetMesh(const std::string& objPath,
     std::string ext = objPath.size() > 4 ? objPath.substr(objPath.size() - 4) : "";
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
-    double minX = 1e9, maxX = -1e9;
-    double minY = 1e9, maxY = -1e9;
-    double minZ = 1e9, maxZ = -1e9;
-    bool hasV = false;
-
-    // 1. Nếu là tệp .STL: Đọc dữ liệu tam giác (hỗ trợ cả Binary STL và ASCII STL)
+    bool isBinaryStl = false;
+    bool isAsciiStl = false;
     if (ext == ".stl") {
         std::ifstream bifs(objPath, std::ios::binary);
         if (bifs.is_open()) {
             bifs.seekg(0, std::ios::end);
-            size_t fileSize = bifs.tellg();
+            size_t fileSize = static_cast<size_t>(bifs.tellg());
             bifs.seekg(0, std::ios::beg);
             if (fileSize > 84) {
                 bifs.seekg(80, std::ios::beg);
                 uint32_t numTriangles = 0;
                 bifs.read(reinterpret_cast<char*>(&numTriangles), 4);
-                if (fileSize >= 84 + static_cast<size_t>(numTriangles) * 50) {
-                    for (uint32_t i = 0; i < numTriangles; ++i) {
-                        float data[12];
-                        bifs.read(reinterpret_cast<char*>(data), 48);
-                        uint16_t attr;
-                        bifs.read(reinterpret_cast<char*>(&attr), 2);
-                        for (int v = 1; v <= 3; ++v) {
-                            float vx = data[v * 3 + 0];
-                            float vy = data[v * 3 + 1];
-                            float vz = data[v * 3 + 2];
-                            minX = std::min<double>(minX, vx); maxX = std::max<double>(maxX, vx);
-                            minY = std::min<double>(minY, vy); maxY = std::max<double>(maxY, vy);
-                            minZ = std::min<double>(minZ, vz); maxZ = std::max<double>(maxZ, vz);
-                            hasV = true;
-                        }
-                    }
+                if (fileSize == 84 + static_cast<size_t>(numTriangles) * 50) {
+                    isBinaryStl = true;
+                }
+            }
+            if (!isBinaryStl) isAsciiStl = true;
+        }
+    }
+
+    bool converted = false;
+    auto mesh = open3d::io::CreateMeshFromFile(objPath);
+    if (mesh && !mesh->vertices_.empty()) {
+        Eigen::Vector3d bmin = mesh->GetMinBound();
+        Eigen::Vector3d bmax = mesh->GetMaxBound();
+
+        // Tự động phát hiện CAD đã chuẩn hóa sang mét (ví dụ _mesh.ply hoặc extent [0.015m..4.0m])
+        Eigen::Vector3d effScale = scale;
+        const double rawExtent = (bmax - bmin).norm();
+        if (rawExtent > 0.015 && rawExtent < 4.0 && scale.x() <= 0.0015) {
+            effScale = Eigen::Vector3d(1.0, 1.0, 1.0);
+            impl_->cadScale = effScale;
+        }
+
+        impl_->targetMinBound = bmin.cwiseProduct(effScale);
+        impl_->targetMaxBound = bmax.cwiseProduct(effScale);
+        impl_->targetSize = impl_->targetMaxBound - impl_->targetMinBound;
+
+        const bool tooManyFaces = (mesh->triangles_.size() > 95000);
+        if (ext == ".ply" || isAsciiStl || tooManyFaces || !mesh->HasTriangles()) {
+            if (!mesh->HasTriangles()) {
+                open3d::geometry::PointCloud pcd(mesh->vertices_);
+                auto hull = pcd.ComputeConvexHull();
+                mesh = std::get<0>(hull);
+            }
+            if (mesh && mesh->triangles_.size() > 95000) {
+                mesh = mesh->SimplifyQuadricDecimation(
+                    80000, std::numeric_limits<double>::infinity(), 1.0);
+            }
+            if (mesh && mesh->HasTriangles()) {
+                mesh->ComputeVertexNormals();
+                const std::string safeStl = "/tmp/mujoco_safe_target.stl";
+                if (open3d::io::WriteTriangleMesh(safeStl, *mesh, false, false)) {
+                    impl_->cadObjPath = safeStl;
+                    impl_->cadTexPath.clear();
+                    converted = true;
                 }
             }
         }
     }
 
-    // 2. Nếu không phải binary STL hoặc là .OBJ/.PLY/ASCII: Đọc qua luồng văn bản
-    if (!hasV) {
+    if (!converted && impl_->targetSize.norm() < 1e-6) {
+        double minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9, minZ = 1e9, maxZ = -1e9;
+        bool hasV = false;
         std::ifstream ifs(objPath);
-        if (ifs.is_open()) {
-            std::string line;
-            while (std::getline(ifs, line)) {
-                if (line.size() > 2 && line[0] == 'v' && line[1] == ' ') {
-                    std::stringstream ss(line.substr(2));
-                    double vx, vy, vz;
-                    if (ss >> vx >> vy >> vz) {
-                        minX = std::min(minX, vx); maxX = std::max(maxX, vx);
-                        minY = std::min(minY, vy); maxY = std::max(maxY, vy);
-                        minZ = std::min(minZ, vz); maxZ = std::max(maxZ, vz);
-                        hasV = true;
-                    }
-                } else if (line.find("vertex") != std::string::npos) {
-                    std::stringstream ss(line);
-                    std::string token;
-                    ss >> token;
-                    double vx, vy, vz;
-                    if (ss >> vx >> vy >> vz) {
-                        minX = std::min(minX, vx); maxX = std::max(maxX, vx);
-                        minY = std::min(minY, vy); maxY = std::max(maxY, vy);
-                        minZ = std::min(minZ, vz); maxZ = std::max(maxZ, vz);
-                        hasV = true;
-                    }
+        std::string line;
+        while (ifs.is_open() && std::getline(ifs, line)) {
+            if (line.size() > 2 && line[0] == 'v' && line[1] == ' ') {
+                std::stringstream ss(line.substr(2));
+                double vx, vy, vz;
+                if (ss >> vx >> vy >> vz) {
+                    minX = std::min(minX, vx); maxX = std::max(maxX, vx);
+                    minY = std::min(minY, vy); maxY = std::max(maxY, vy);
+                    minZ = std::min(minZ, vz); maxZ = std::max(maxZ, vz);
+                    hasV = true;
                 }
             }
         }
+        if (hasV) {
+            impl_->targetMinBound = Eigen::Vector3d(minX, minY, minZ).cwiseProduct(impl_->cadScale);
+            impl_->targetMaxBound = Eigen::Vector3d(maxX, maxY, maxZ).cwiseProduct(impl_->cadScale);
+            impl_->targetSize = impl_->targetMaxBound - impl_->targetMinBound;
+        }
     }
 
-    if (hasV) {
-        impl_->targetSize.x() = (maxX - minX) * scale.x();
-        impl_->targetSize.y() = (maxY - minY) * scale.y();
-        impl_->targetSize.z() = (maxZ - minZ) * scale.z();
-        impl_->targetMinBound = Eigen::Vector3d(minX, minY, minZ).cwiseProduct(scale);
-        impl_->targetMaxBound = Eigen::Vector3d(maxX, maxY, maxZ).cwiseProduct(scale);
-    }
-
-    if (impl_->opened) {
+    if (impl_->opened || impl_->isInteractive) {
+        const bool wasInteractive = impl_->isInteractive;
+        int winX = 100, winY = 100;
+        int winW = impl_->interactiveWinW, winH = impl_->interactiveWinH;
+        if (wasInteractive && impl_->glfwWin) {
+            glfwGetWindowPos(impl_->glfwWin, &winX, &winY);
+            glfwGetWindowSize(impl_->glfwWin, &winW, &winH);
+        }
         close();
-        open();
+        if (!open()) return false;
+        if (wasInteractive) {
+            return openInteractiveWindow(winW, winH, winX, winY);
+        }
     }
     return true;
 }

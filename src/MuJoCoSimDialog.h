@@ -57,6 +57,8 @@ private slots:
 private:
     void setupUi();
     void autoDetectTexture(const QString& cadPath);
+    bool autoDetectCadForOnnx(bool showWarningIfNotFound);
+    QString resolveProjectRoot() const;
 
     QLineEdit* cadPathEdit_ = nullptr;
     QLineEdit* texPathEdit_ = nullptr;

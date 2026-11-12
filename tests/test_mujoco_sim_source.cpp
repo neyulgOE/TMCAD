@@ -1,4 +1,5 @@
 #include "../src/MuJoCoD435SimSource.h"
+#include <filesystem>
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
@@ -6,9 +7,12 @@ int main() {
     std::cout << "=== TESTING MUJOCO D435IF SIMULATION SOURCE ===" << std::endl;
 
     MuJoCoD435SimSource sim;
-    bool ok = sim.loadCameraProfileFromFile("/home/huyen1905/TMCAD/D435if-dataset", 1);
+    bool ok = sim.loadCameraProfileFromFile("configs/camera_profiles/D435if_factory.json", 1);
     if (!ok) {
-        std::cerr << "FAILED to load D435if-dataset!" << std::endl;
+        ok = sim.loadCameraProfileFromFile("../configs/camera_profiles/D435if_factory.json", 1);
+    }
+    if (!ok) {
+        std::cerr << "FAILED to load D435if_factory.json!" << std::endl;
         return 1;
     }
 
@@ -26,9 +30,11 @@ int main() {
     // Mặc định tắt lon nấm để nhìn rõ sản phẩm CAD
     sim.setOccluderEnabled(false);
 
-    sim.loadTargetMesh("/home/huyen1905/TMCAD/CAD_DATA/Chai_Tuong_Ot_CHINSU_500g_Nap_Moi_205mm_CleanSurface-v4/Chai_Tuong_Ot_CHINSU_500g_Nap_Moi_205mm_CleanSurface-v4.stl",
-                       "",
-                       Eigen::Vector3d(0.001, 0.001, 0.001));
+    std::string cadPath = "CAD_DATA/Chai_Tuong_Ot_CHINSU_500g_Nap_Moi_205mm_CleanSurface-v4/Chai_Tuong_Ot_CHINSU_500g_Nap_Moi_205mm_CleanSurface-v4.stl";
+    if (!std::filesystem::exists(cadPath)) {
+        cadPath = "../" + cadPath;
+    }
+    sim.loadTargetMesh(cadPath, "", Eigen::Vector3d(0.001, 0.001, 0.001));
 
     std::cout << "Opening simulation stream..." << std::endl;
     if (!sim.open()) {
@@ -53,10 +59,10 @@ int main() {
     cv::Mat rgbMat(h, w, CV_8UC3, frame.color->data_.data());
     cv::Mat bgrMat;
     cv::cvtColor(rgbMat, bgrMat, cv::COLOR_RGB2BGR);
-    cv::imwrite("/home/huyen1905/.gemini/antigravity/brain/ae2ffe12-fe6e-40fc-891f-e790b255a317/mujoco_sim_test_rgb.png", bgrMat);
+    cv::imwrite("/tmp/mujoco_sim_test_rgb.png", bgrMat);
 
     cv::Mat depth16Mat(h, w, CV_16UC1, frame.depth->data_.data());
-    cv::imwrite("/home/huyen1905/.gemini/antigravity/brain/ae2ffe12-fe6e-40fc-891f-e790b255a317/mujoco_sim_test_depth.png", depth16Mat);
+    cv::imwrite("/tmp/mujoco_sim_test_depth.png", depth16Mat);
 
     // Vẽ thêm 3D Bounding Box từ Ground Truth để kiểm tra
     Eigen::Matrix3d gtR;
@@ -90,8 +96,8 @@ int main() {
     cv::putText(overlayMat, "MuJoCo D435if GT Box", cv::Point(pts2d[0].x, pts2d[0].y - 10),
                 cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
 
-    cv::imwrite("/home/huyen1905/.gemini/antigravity/brain/ae2ffe12-fe6e-40fc-891f-e790b255a317/mujoco_sim_test_overlay.png", overlayMat);
-    std::cout << "SUCCESS: Saved test images to artifacts directory!" << std::endl;
+    cv::imwrite("/tmp/mujoco_sim_test_overlay.png", overlayMat);
+    std::cout << "SUCCESS: Saved test images to /tmp/mujoco_sim_test_*.png!" << std::endl;
 
     sim.close();
     return 0;

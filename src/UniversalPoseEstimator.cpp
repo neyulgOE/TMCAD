@@ -22,6 +22,511 @@ bool fileExists(const std::string& p) {
 std::string extractStem(const std::string& p) {
     return std::filesystem::path(p).stem().string();
 }
+
+void computeVisibleCadSubset(const cv::Matx33d& R,
+                             const cv::Vec3d& t,
+                             const std::vector<cv::Vec3f>& mesh_pts,
+                             const std::vector<cv::Vec3f>& mesh_normals,
+                             double fx,
+                             double fy,
+                             double cx,
+                             double cy,
+                             int img_w,
+                             int img_h,
+                             size_t mesh_stride,
+                             std::vector<cv::Vec3d>& out_pts,
+                             std::vector<cv::Vec3d>& out_norms)
+{
+    out_pts.clear();
+    out_norms.clear();
+    if (mesh_pts.empty()) return;
+    mesh_stride = std::max<size_t>(1, mesh_stride);
+    out_pts.reserve(mesh_pts.size() / mesh_stride + 1);
+    out_norms.reserve(mesh_pts.size() / mesh_stride + 1);
+
+    for (size_t i = 0; i < mesh_pts.size(); i += mesh_stride) {
+        cv::Vec3d p_cam = R * cv::Vec3d(mesh_pts[i]) + t;
+        if (p_cam[2] <= 0.05) continue;
+        cv::Vec3d n_cam = R * cv::Vec3d(mesh_normals[i]);
+        if (n_cam.dot(p_cam) > 0.15 * cv::norm(p_cam)) continue;
+
+        double u = p_cam[0] * fx / p_cam[2] + cx;
+        double v = p_cam[1] * fy / p_cam[2] + cy;
+        if (u >= -40.0 && u < img_w + 40.0 && v >= -40.0 && v < img_h + 40.0) {
+            out_pts.emplace_back(mesh_pts[i]);
+            out_norms.emplace_back(mesh_normals[i]);
+        }
+    }
+}
+
+struct BidirectionalConsensus {
+    double fwd_kernel{0.0};
+    double bwd_kernel{0.0};
+    double fwd_fit{0.0};
+    double rmse_m{0.05};
+    double bwd_rmse_m{0.08};
+    double score{-1e9};
+};
+
+BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
+                                                     const cv::Vec3d& t,
+                                                     double cad_diag,
+                                                     const std::vector<cv::Vec3f>& mesh_pts,
+                                                     const std::vector<cv::Vec3f>& mesh_normals,
+                                                     const std::vector<cv::Vec3d>& scene_fg_pts,
+                                                     double fx,
+                                                     double fy,
+                                                     double cx,
+                                                     double cy,
+                                                     int img_w,
+                                                     int img_h,
+                                                     bool fast_search = false)
+{
+    (void)fast_search;
+    BidirectionalConsensus res;
+    if (mesh_pts.empty() || scene_fg_pts.empty()) return res;
+
+    const size_t vis_stride = std::max<size_t>(1, mesh_pts.size() / 1600);
+    std::vector<cv::Vec3d> vis_pts, vis_norms;
+    computeVisibleCadSubset(R, t, mesh_pts, mesh_normals, fx, fy, cx, cy, img_w, img_h, vis_stride, vis_pts, vis_norms);
+    if (vis_pts.size() < 20) {
+        // Retry without frustum margin clamp in case coarse estimate was shifted
+        vis_pts.clear();
+        for (size_t i = 0; i < mesh_pts.size(); i += vis_stride) {
+            cv::Vec3d p_cam = R * cv::Vec3d(mesh_pts[i]) + t;
+            cv::Vec3d n_cam = R * cv::Vec3d(mesh_normals[i]);
+            if (p_cam[2] > 0.05 && n_cam.dot(p_cam) <= 0.15 * cv::norm(p_cam)) {
+                vis_pts.emplace_back(mesh_pts[i]);
+            }
+        }
+        if (vis_pts.size() < 20) return res;
+    }
+
+    const double tol = std::clamp(cad_diag * 0.055, 0.008, 0.020);
+    const double tol_sq = tol * tol;
+    const double sigma = std::clamp(cad_diag * 0.045, 0.007, 0.016);
+    const double inv_2sig2 = 0.5 / (sigma * sigma);
+    const double clamp_fwd = (3.0 * tol) * (3.0 * tol);
+    const double clamp_bwd = (5.0 * tol) * (5.0 * tol);
+
+    const cv::Matx33d R_inv = R.t();
+    const size_t max_samp = 220;
+    const size_t fg_step = std::max<size_t>(1, scene_fg_pts.size() / max_samp);
+    double fwd_kern_sum = 0.0;
+    double dsq_sum = 0.0;
+    int fwd_inliers = 0;
+    int fwd_total = 0;
+
+    for (size_t i = 0; i < scene_fg_pts.size(); i += fg_step) {
+        const cv::Vec3d p_cad = R_inv * (scene_fg_pts[i] - t);
+        double min_dsq = 1e10;
+        for (const auto& vp : vis_pts) {
+            const cv::Vec3d d = p_cad - vp;
+            const double dsq = d.dot(d);
+            if (dsq < min_dsq) min_dsq = dsq;
+        }
+        fwd_kern_sum += std::exp(-min_dsq * inv_2sig2);
+        dsq_sum += std::min(min_dsq, clamp_fwd);
+        if (min_dsq <= tol_sq) ++fwd_inliers;
+        ++fwd_total;
+    }
+
+    const size_t cad_step = std::max<size_t>(1, vis_pts.size() / max_samp);
+    double bwd_kern_sum = 0.0;
+    double bwd_dsq_sum = 0.0;
+    int bwd_total = 0;
+    for (size_t j = 0; j < vis_pts.size(); j += cad_step) {
+        const cv::Vec3d p_cam = R * vis_pts[j] + t;
+        double min_dsq = 1e10;
+        for (size_t i = 0; i < scene_fg_pts.size(); i += fg_step) {
+            const cv::Vec3d d = p_cam - scene_fg_pts[i];
+            const double dsq = d.dot(d);
+            if (dsq < min_dsq) min_dsq = dsq;
+        }
+        bwd_kern_sum += std::exp(-min_dsq * inv_2sig2);
+        bwd_dsq_sum += std::min(min_dsq, clamp_bwd);
+        ++bwd_total;
+    }
+
+    if (fwd_total > 0 && bwd_total > 0) {
+        res.fwd_kernel = fwd_kern_sum / static_cast<double>(fwd_total);
+        res.bwd_kernel = bwd_kern_sum / static_cast<double>(bwd_total);
+        res.fwd_fit = static_cast<double>(fwd_inliers) / static_cast<double>(fwd_total);
+        res.rmse_m = std::sqrt(dsq_sum / static_cast<double>(fwd_total));
+        res.bwd_rmse_m = std::sqrt(bwd_dsq_sum / static_cast<double>(bwd_total));
+        const double arith_mean = 0.5 * (res.fwd_kernel + res.bwd_kernel);
+        const double geom_mean = std::sqrt(std::max(0.0, res.fwd_kernel) * std::max(0.0, res.bwd_kernel));
+        res.score = 0.25 * arith_mean + 0.75 * geom_mean
+                  - 1.5 * std::min(0.06, 0.5 * (res.rmse_m + res.bwd_rmse_m));
+    }
+    return res;
+}
+
+void runPointToPlaneIcpGeneric(const cv::Matx33d& R_init,
+                               const cv::Vec3d& t_init,
+                               const std::vector<cv::Vec3f>& mesh_pts,
+                               const std::vector<cv::Vec3f>& mesh_normals,
+                               const std::vector<cv::Vec3d>& fg_pts,
+                               size_t fg_stride,
+                               size_t mesh_stride,
+                               const std::vector<double>& dist_scales,
+                               int max_iters_per_scale,
+                               double fx,
+                               double fy,
+                               double cx,
+                               double cy,
+                               int img_w,
+                               int img_h,
+                               cv::Matx33d& out_R,
+                               cv::Vec3d& out_t)
+{
+    out_R = R_init;
+    out_t = t_init;
+    if (mesh_pts.empty() || fg_pts.size() < 18) return;
+
+    fg_stride = std::max<size_t>(1, fg_stride);
+    cv::Matx33d R_icp = R_init.t();
+    cv::Vec3d t_icp = -R_icp * t_init;
+
+    std::vector<cv::Vec3d> cad_vis_pts;
+    std::vector<cv::Vec3d> cad_vis_norms;
+
+    for (double max_corr : dist_scales) {
+        max_corr = std::max(0.003, max_corr);
+        cv::Matx33d R_cur = R_icp.t();
+        cv::Vec3d t_cur = -R_cur * t_icp;
+        computeVisibleCadSubset(R_cur, t_cur, mesh_pts, mesh_normals, fx, fy, cx, cy, img_w, img_h,
+                                mesh_stride, cad_vis_pts, cad_vis_norms);
+        if (cad_vis_pts.size() < 32) {
+            cad_vis_pts.clear();
+            cad_vis_norms.clear();
+            const size_t fb_stride = std::max<size_t>(1, mesh_pts.size() / 1500);
+            for (size_t i = 0; i < mesh_pts.size(); i += fb_stride) {
+                cad_vis_pts.emplace_back(mesh_pts[i]);
+                cad_vis_norms.emplace_back(mesh_normals[i]);
+            }
+        }
+
+        const double tukey_k = std::max(0.0025, max_corr * 0.72);
+        const double max_corr_sq = max_corr * max_corr;
+        double prev_residual = 1e10;
+
+        for (int iter = 0; iter < max_iters_per_scale; ++iter) {
+            cv::Matx66d JtJ = cv::Matx66d::zeros();
+            cv::Matx61d Jtb = cv::Matx61d::zeros();
+            int n_corr = 0;
+            double sum_res = 0.0;
+
+            for (size_t fi = 0; fi < fg_pts.size(); fi += fg_stride) {
+                const cv::Vec3d p_trans = R_icp * fg_pts[fi] + t_icp;
+                double best_dsq = 1e10;
+                int best_j = -1;
+                for (size_t j = 0; j < cad_vis_pts.size(); ++j) {
+                    const cv::Vec3d d = p_trans - cad_vis_pts[j];
+                    const double dsq = d.dot(d);
+                    if (dsq < best_dsq) {
+                        best_dsq = dsq;
+                        best_j = static_cast<int>(j);
+                    }
+                }
+                if (best_dsq > max_corr_sq || best_j < 0) continue;
+
+                cv::Vec3d n = cad_vis_norms[best_j];
+                double n_norm = cv::norm(n);
+                if (n_norm < 1e-6) continue;
+                n *= (1.0 / n_norm);
+
+                const cv::Vec3d res = p_trans - cad_vis_pts[best_j];
+                const double r = n.dot(res);
+                const double abs_r = std::abs(r);
+                double w = 0.0;
+                if (abs_r < tukey_k) {
+                    const double rk = r / tukey_k;
+                    w = (1.0 - rk * rk);
+                    w = w * w;
+                }
+                if (w < 1e-8) continue;
+
+                const cv::Vec3d cross_np = p_trans.cross(n);
+                const double J[6] = {cross_np[0], cross_np[1], cross_np[2], n[0], n[1], n[2]};
+                for (int a = 0; a < 6; ++a) {
+                    for (int b = 0; b < 6; ++b) {
+                        JtJ(a, b) += w * J[a] * J[b];
+                    }
+                    Jtb(a, 0) -= w * J[a] * r;
+                }
+                sum_res += w * r * r;
+                ++n_corr;
+            }
+
+            if (n_corr < 14) break;
+            for (int d = 0; d < 6; ++d) JtJ(d, d) += 1e-5;
+
+            cv::Matx61d delta;
+            if (!cv::solve(JtJ, Jtb, delta, cv::DECOMP_CHOLESKY)) {
+                if (!cv::solve(JtJ, Jtb, delta, cv::DECOMP_SVD)) break;
+            }
+
+            const cv::Vec3d d_w(delta(0, 0), delta(1, 0), delta(2, 0));
+            const cv::Vec3d d_t(delta(3, 0), delta(4, 0), delta(5, 0));
+            const double d_theta = cv::norm(d_w);
+
+            cv::Matx33d d_R = cv::Matx33d::eye();
+            if (d_theta > 1e-8) {
+                const double clamp_th = std::min(d_theta, 0.25);
+                const cv::Vec3d axis = d_w * (1.0 / d_theta);
+                const cv::Matx33d K(
+                     0.0,     -axis[2],  axis[1],
+                     axis[2],  0.0,     -axis[0],
+                    -axis[1],  axis[0],  0.0);
+                d_R = cv::Matx33d::eye() + std::sin(clamp_th) * K + (1.0 - std::cos(clamp_th)) * (K * K);
+            }
+
+            R_icp = d_R * R_icp;
+            t_icp = d_R * t_icp + d_t;
+
+            const double rmse = std::sqrt(sum_res / n_corr);
+            if (cv::norm(d_t) < 1e-5 && d_theta < 1e-5) break;
+            if (std::abs(rmse - prev_residual) / (prev_residual + 1e-10) < 1e-5) break;
+            prev_residual = rmse;
+        }
+    }
+
+    out_R = R_icp.t();
+    out_t = -out_R * t_icp;
+}
+
+cv::Vec3d computeVisibleSurfaceOffset(const cv::Matx33d& R,
+                                      const cv::Vec3d& c_target,
+                                      const cv::Vec3d& cad_mid,
+                                      const std::vector<cv::Vec3f>& mesh_pts,
+                                      const std::vector<cv::Vec3f>& mesh_normals)
+{
+    cv::Vec3d t_guess = c_target - R * cad_mid;
+    if (mesh_pts.empty()) return t_guess;
+
+    cv::Vec3d vis_sum(0.0, 0.0, 0.0);
+    int vis_cnt = 0;
+    const size_t step = std::max<size_t>(1, mesh_pts.size() / 600);
+    for (size_t i = 0; i < mesh_pts.size(); i += step) {
+        const cv::Vec3d p_cam = R * cv::Vec3d(mesh_pts[i]) + t_guess;
+        const cv::Vec3d n_cam = R * cv::Vec3d(mesh_normals[i]);
+        if (n_cam.dot(p_cam) < -0.05 * cv::norm(p_cam)) {
+            vis_sum += cv::Vec3d(mesh_pts[i]);
+            ++vis_cnt;
+        }
+    }
+    if (vis_cnt >= 10) {
+        const cv::Vec3d vis_mean_local = vis_sum * (1.0 / static_cast<double>(vis_cnt));
+        return c_target - R * vis_mean_local;
+    }
+    return t_guess;
+}
+
+cv::Vec3d computePcaSigmas(const std::vector<cv::Vec3d>& pts)
+{
+    if (pts.size() < 6) return cv::Vec3d(0.0, 0.0, 0.0);
+    cv::Vec3d mean(0.0, 0.0, 0.0);
+    for (const auto& p : pts) mean += p;
+    mean *= (1.0 / static_cast<double>(pts.size()));
+
+    cv::Matx33d cov = cv::Matx33d::zeros();
+    for (const auto& p : pts) {
+        const cv::Vec3d d = p - mean;
+        cov += d * d.t();
+    }
+    cv::Mat eig_vals;
+    cv::eigen(cv::Mat(cov), eig_vals);
+    const double inv_n = 1.0 / static_cast<double>(pts.size());
+    double s0 = std::sqrt(std::max(0.0, eig_vals.at<double>(0, 0) * inv_n));
+    double s1 = std::sqrt(std::max(0.0, eig_vals.at<double>(1, 0) * inv_n));
+    double s2 = std::sqrt(std::max(0.0, eig_vals.at<double>(2, 0) * inv_n));
+    if (s0 < s1) std::swap(s0, s1);
+    if (s1 < s2) std::swap(s1, s2);
+    if (s0 < s1) std::swap(s0, s1);
+    return cv::Vec3d(s0, s1, s2);
+}
+
+void computeSilhouetteAndEmptyBehind(const cv::Matx33d& R,
+                                     const cv::Vec3d& t,
+                                     const std::vector<cv::Vec3f>& mesh_pts,
+                                     const cv::Mat& depth_z16,
+                                     double fx,
+                                     double fy,
+                                     double cx,
+                                     double cy,
+                                     double diag,
+                                     double& out_empty_behind_frac,
+                                     double& out_ring_jump_frac,
+                                     double& out_wide_out_frac,
+                                     double& out_wide_convex_ratio,
+                                     int& out_ring_tot)
+{
+    out_empty_behind_frac = 0.0;
+    out_ring_jump_frac = 1.0;
+    out_wide_out_frac = 1.0;
+    out_wide_convex_ratio = 1.0;
+    out_ring_tot = 0;
+
+    if (depth_z16.empty() || depth_z16.type() != CV_16UC1 ||
+        depth_z16.cols < 64 || depth_z16.rows < 64 || mesh_pts.empty()) {
+        return;
+    }
+
+    const int sw = depth_z16.cols / 2;
+    const int sh = depth_z16.rows / 2;
+    const double hfx = fx * 0.5;
+    const double hfy = fy * 0.5;
+    const double hcx = cx * 0.5;
+    const double hcy = cy * 0.5;
+
+    cv::Mat mask(sh, sw, CV_8UC1, cv::Scalar(0));
+    cv::Mat z_pred(sh, sw, CV_32FC1, cv::Scalar(1e6f));
+
+    int min_x = sw, max_x = -1, min_y = sh, max_y = -1;
+    const size_t stride = std::max<size_t>(1, mesh_pts.size() / 5000);
+    for (size_t j = 0; j < mesh_pts.size(); j += stride) {
+        const cv::Vec3d p_cam = R * cv::Vec3d(mesh_pts[j]) + t;
+        if (p_cam[2] <= 0.10) continue;
+        const int sx = static_cast<int>(std::round(hfx * p_cam[0] / p_cam[2] + hcx));
+        const int sy = static_cast<int>(std::round(hfy * p_cam[1] / p_cam[2] + hcy));
+        if (sx >= 1 && sx < sw - 1 && sy >= 1 && sy < sh - 1) {
+            mask.at<uint8_t>(sy, sx) = 255;
+            const float zf = static_cast<float>(p_cam[2]);
+            if (zf < z_pred.at<float>(sy, sx)) {
+                z_pred.at<float>(sy, sx) = zf;
+            }
+            if (sx < min_x) min_x = sx;
+            if (sx > max_x) max_x = sx;
+            if (sy < min_y) min_y = sy;
+            if (sy > max_y) max_y = sy;
+        }
+    }
+
+    if (max_x <= min_x || max_y <= min_y) return;
+
+    const int pad_px = 14;
+    const int rx0 = std::max(0, min_x - pad_px);
+    const int ry0 = std::max(0, min_y - pad_px);
+    const int rx1 = std::min(sw, max_x + pad_px + 1);
+    const int ry1 = std::min(sh, max_y + pad_px + 1);
+    const cv::Rect roi(rx0, ry0, rx1 - rx0, ry1 - ry0);
+    if (roi.width < 6 || roi.height < 6) return;
+
+    cv::Mat mask_roi = mask(roi);
+    cv::Mat zp_roi = z_pred(roi);
+    cv::Mat closed_roi, dil_roi, dil5_roi, dil17_roi;
+    cv::Mat k3 = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::Mat k5 = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    const int k_ring = (depth_z16.cols >= 1200) ? 9 : 7;
+    const int k_wide = (depth_z16.cols >= 1200) ? 17 : 13;
+    cv::Mat kr = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(k_ring, k_ring));
+    cv::Mat kw = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(k_wide, k_wide));
+    cv::dilate(mask_roi, closed_roi, k3);
+    cv::erode(closed_roi, closed_roi, k3);
+    cv::dilate(closed_roi, dil_roi, kr);
+    cv::dilate(closed_roi, dil5_roi, k5);
+    cv::dilate(closed_roi, dil17_roi, kw);
+    cv::Mat ring_roi = dil_roi - closed_roi;
+    cv::Mat wide_roi = dil17_roi - dil5_roi;
+
+    const float empty_tol = static_cast<float>(std::clamp(0.11 * diag, 0.016, 0.035));
+    const float jump_tol = static_cast<float>(std::clamp(0.075 * diag, 0.010, 0.024));
+
+    auto nearestMaskZ = [&](int ly, int lx, int rad) -> float {
+        float zr = 1e6f;
+        int best_d2 = 9999;
+        const int ny0 = std::max(0, ly - rad);
+        const int ny1 = std::min(roi.height - 1, ly + rad);
+        const int nx0 = std::max(0, lx - rad);
+        const int nx1 = std::min(roi.width - 1, lx + rad);
+        for (int ny = ny0; ny <= ny1; ++ny) {
+            const uint8_t* nm = mask_roi.ptr<uint8_t>(ny);
+            const float* nzp = zp_roi.ptr<float>(ny);
+            const int dy = ny - ly;
+            for (int nx = nx0; nx <= nx1; ++nx) {
+                if (nm[nx] > 0) {
+                    const int dx = nx - lx;
+                    const int d2 = dx * dx + dy * dy;
+                    if (d2 < best_d2) {
+                        best_d2 = d2;
+                        zr = nzp[nx];
+                    }
+                }
+            }
+        }
+        return zr;
+    };
+
+    int z_tot = 0;
+    int z_empty = 0;
+    int r_tot = 0;
+    int r_jump = 0;
+    int w_tot = 0;
+    int w_out = 0;
+    int w_in = 0;
+
+    for (int ly = 0; ly < roi.height; ++ly) {
+        const int sy = ry0 + ly;
+        const int py = sy * 2;
+        if (py < 0 || py >= depth_z16.rows) continue;
+        const uint16_t* dep_row = depth_z16.ptr<uint16_t>(py);
+        const uint8_t* m_row = mask_roi.ptr<uint8_t>(ly);
+        const uint8_t* r_row = ring_roi.ptr<uint8_t>(ly);
+        const uint8_t* w_row = wide_roi.ptr<uint8_t>(ly);
+        const float* zp_row = zp_roi.ptr<float>(ly);
+
+        for (int lx = 0; lx < roi.width; ++lx) {
+            const int sx = rx0 + lx;
+            const int px = sx * 2;
+            if (px < 0 || px >= depth_z16.cols) continue;
+            const uint16_t d = dep_row[px];
+            if (m_row[lx] > 0 && d > 0) {
+                const float z_obs = static_cast<float>(d) * 0.001f;
+                ++z_tot;
+                if (z_obs > zp_row[lx] + empty_tol) {
+                    ++z_empty;
+                }
+            } else {
+                const bool in_near = (r_row[lx] > 0);
+                const bool in_wide = (w_row[lx] > 0);
+                if (!in_near && !in_wide) continue;
+                const float zr = nearestMaskZ(ly, lx, in_wide ? 8 : 5);
+                if (zr >= 1e5f) continue;
+
+                if (in_near) {
+                    ++r_tot;
+                    if (d == 0 || std::abs(static_cast<float>(d) * 0.001f - zr) > jump_tol) {
+                        ++r_jump;
+                    }
+                }
+                if (in_wide) {
+                    ++w_tot;
+                    if (d == 0) {
+                        ++w_out;
+                    } else {
+                        const float diff = static_cast<float>(d) * 0.001f - zr;
+                        if (diff > jump_tol) ++w_out;
+                        else if (diff < -jump_tol) ++w_in;
+                    }
+                }
+            }
+        }
+    }
+
+    if (z_tot >= 20) {
+        out_empty_behind_frac = static_cast<double>(z_empty) / static_cast<double>(z_tot);
+    }
+    out_ring_tot = r_tot;
+    if (r_tot > 0) {
+        out_ring_jump_frac = static_cast<double>(r_jump) / static_cast<double>(r_tot);
+    }
+    if (w_tot >= 40) {
+        out_wide_out_frac = static_cast<double>(w_out) / static_cast<double>(w_tot);
+        const int w_noncop = w_out + w_in;
+        out_wide_convex_ratio = (w_noncop >= 20) ? (static_cast<double>(w_out) / static_cast<double>(w_noncop)) : out_wide_out_frac;
+    }
+}
 } // anonymous namespace
 
 UniversalPoseEstimator::UniversalPoseEstimator()
@@ -111,16 +616,27 @@ bool UniversalPoseEstimator::loadModelOnnx(const std::string& onnx_path)
         _is_floor_standing = false;
         _enable_2d_frame_anchor = false;
         _initialized = false;
+        _last_valid_depth_pts = 0;
+        _last_floor_locked = false;
+        _last_floor_pitch_deg = 0.0;
+        _last_sparse_depth_fallback = false;
+        _last_ai_latency_ms = 0.0;
+        _last_solve_latency_ms = 0.0;
+        _last_total_latency_ms = 0.0;
+        _last_segmented_points.clear();
 
         if (unpackBlackBoxOnnx()) {
             unpackBlackBoxOnnxMetadata();
 
             // Auto-discover optional <CAD_NAME>_profile.json for adaptive solver hints
             std::filesystem::path onnx_p(onnx_path);
+            std::filesystem::path repo_root_cand = onnx_p.parent_path().parent_path();
             std::vector<std::string> profile_cands = {
                 (onnx_p.parent_path() / (_model_name + "_profile.json")).string(),
                 "CAD_DATA/" + _model_name + "/" + _model_name + "_profile.json",
-                "configs/" + _model_name + "_profile.json"
+                (repo_root_cand / "CAD_DATA" / _model_name / (_model_name + "_profile.json")).string(),
+                "configs/" + _model_name + "_profile.json",
+                (repo_root_cand / "configs" / (_model_name + "_profile.json")).string()
             };
             for (const auto& prof : profile_cands) {
                 if (fileExists(prof) && loadUniversalProfile(prof)) {
@@ -131,7 +647,8 @@ bool UniversalPoseEstimator::loadModelOnnx(const std::string& onnx_path)
             if (_symmetry_code == 0) {
                 std::vector<std::string> sym_cands = {
                     (onnx_p.parent_path() / (_model_name + "_symmetry.json")).string(),
-                    "CAD_DATA/" + _model_name + "/" + _model_name + "_symmetry.json"
+                    "CAD_DATA/" + _model_name + "/" + _model_name + "_symmetry.json",
+                    (repo_root_cand / "CAD_DATA" / _model_name / (_model_name + "_symmetry.json")).string()
                 };
                 for (const auto& sym_p : sym_cands) {
                     if (fileExists(sym_p)) {
@@ -413,7 +930,7 @@ bool UniversalPoseEstimator::unpackBlackBoxOnnxMetadata()
 
     _topology_type = _is_floor_standing ? "FLOOR_STANDING" : "FREE_6DOF";
     _scene_segmenter.setExpectedObjectDimensions(length_m, width_m, height_m, _is_floor_standing);
-    _scene_segmenter.setMultiInstanceMode(!_is_floor_standing, 4);
+    _scene_segmenter.setMultiInstanceMode(!_is_floor_standing && _multi_instance_enabled, _max_instances);
     return true;
 }
 
@@ -428,8 +945,15 @@ bool UniversalPoseEstimator::loadUniversalProfile(const std::string& profile_jso
                           content.find("FRAME_HOLLOW") != std::string::npos);
     _enable_2d_frame_anchor = (content.find("\"enable_2d_frame_anchor\": true") != std::string::npos);
     _topology_type = _is_floor_standing ? "FLOOR_STANDING" : "FREE_6DOF";
-    _scene_segmenter.setMultiInstanceMode(!_is_floor_standing, 4);
+    _scene_segmenter.setMultiInstanceMode(!_is_floor_standing && _multi_instance_enabled, _max_instances);
     return true;
+}
+
+void UniversalPoseEstimator::setMultiInstanceMode(bool enable, int max_instances)
+{
+    _multi_instance_enabled = enable;
+    _max_instances = std::max(1, max_instances);
+    _scene_segmenter.setMultiInstanceMode(!_is_floor_standing && _multi_instance_enabled, _max_instances);
 }
 
 bool UniversalPoseEstimator::isInTargetWorkspace(const cv::Vec3d& t) const
@@ -521,6 +1045,7 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
     // 1. Cosine similarity matching (obs_i -> cad_j)
     std::vector<int> matches(N, 0);
     std::vector<float> top_scores(N, 0.0f);
+    float max_best_sim = -2.0f;
     for (size_t i = 0; i < N; ++i) {
         const float* o_vec = &obs_desc[i * _desc_dim];
         float best_sim = -2.0f;
@@ -536,6 +1061,7 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
         }
         matches[i] = best_j;
         top_scores[i] = best_sim;
+        if (best_sim > max_best_sim) max_best_sim = best_sim;
     }
 
     // 2. Cluster NMS: keep top 3 observation points per CAD centroid so symmetric modes stay balanced
@@ -562,10 +1088,45 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
         for (size_t i = 0; i < N; ++i) nms_indices[i] = static_cast<int>(i);
     }
 
-    const double inlier_thresh = std::clamp(_real_bounding_diag_m * 0.038, 0.008, 0.045);
+    const double density_factor = (M <= 160) ? 0.085 : ((M <= 320) ? 0.062 : 0.048);
+    const double inlier_thresh = _is_floor_standing
+        ? std::clamp(_real_bounding_diag_m * 0.038, 0.008, 0.045)
+        : std::clamp(_real_bounding_diag_m * density_factor, 0.015, 0.045);
+
     int best_inliers = 0;
     double best_err_sum = 0.0;
     std::vector<uint8_t> best_mask(N, 0);
+
+    cv::Vec3d obs_center(0.0, 0.0, 0.0);
+    for (size_t i = 0; i < N; ++i) obs_center += cv::Vec3d(obs_pts[i]);
+    obs_center *= (1.0 / static_cast<double>(N));
+    const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
+    const double bbox_pad = std::max(0.020, 0.14 * _real_bounding_diag_m);
+    const cv::Vec3d box_lo = _cad_min - cv::Vec3d(bbox_pad, bbox_pad, bbox_pad);
+    const cv::Vec3d box_hi = _cad_max + cv::Vec3d(bbox_pad, bbox_pad, bbox_pad);
+
+    std::vector<size_t> check_idx;
+    if (!_is_floor_standing) {
+        const size_t cstep = std::max<size_t>(1, N / 64);
+        for (size_t i = 0; i < N; i += cstep) check_idx.push_back(i);
+    }
+    auto passesClusterContainment = [&](const cv::Matx33d& R_cand, const cv::Vec3d& t_cand) -> bool {
+        if (_is_floor_standing) return true;
+        const cv::Vec3d pred_mid = R_cand * cad_mid + t_cand;
+        if (cv::norm(pred_mid - obs_center) > 0.65 * _real_bounding_diag_m + 0.035) return false;
+        if (check_idx.empty()) return true;
+        const cv::Matx33d Rt = R_cand.t();
+        int inside = 0;
+        for (size_t idx : check_idx) {
+            const cv::Vec3d p_loc = Rt * (cv::Vec3d(obs_pts[idx]) - t_cand);
+            if (p_loc[0] >= box_lo[0] && p_loc[0] <= box_hi[0] &&
+                p_loc[1] >= box_lo[1] && p_loc[1] <= box_hi[1] &&
+                p_loc[2] >= box_lo[2] && p_loc[2] <= box_hi[2]) {
+                ++inside;
+            }
+        }
+        return inside >= static_cast<int>(0.42 * check_idx.size());
+    };
 
     cv::Vec3d n_fl(floor_plane[0], floor_plane[1], floor_plane[2]);
     double n_fl_norm = cv::norm(n_fl);
@@ -652,11 +1213,17 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
     std::mt19937 rng(1337);
     std::vector<float> sample_weights(nms_indices.size());
     for (size_t i = 0; i < nms_indices.size(); ++i) {
-        sample_weights[i] = std::pow(std::max(0.001f, top_scores[nms_indices[i]]), 1.5f);
+        const float sc = top_scores[nms_indices[i]];
+        if (_is_floor_standing) {
+            sample_weights[i] = std::pow(std::max(0.001f, sc), 1.5f);
+        } else {
+            sample_weights[i] = std::max(0.01f, std::exp((sc - max_best_sim) / 0.10f));
+        }
     }
     std::discrete_distribution<int> dist(sample_weights.begin(), sample_weights.end());
 
-    for (int iter = 0; iter < 450; ++iter) {
+    const int max_ransac_iters = _is_floor_standing ? 450 : 900;
+    for (int iter = 0; iter < max_ransac_iters; ++iter) {
         int idxs[4];
         for (int s = 0; s < 4; ++s) {
             idxs[s] = nms_indices[dist(rng)];
@@ -699,6 +1266,7 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
 
         cv::Vec3d t_cand = p_mean - R_cand * q_mean;
         if (!isInTargetWorkspace(t_cand)) continue;
+        if (!passesClusterContainment(R_cand, t_cand)) continue;
 
         int inliers = 0;
         double err_sum = 0.0;
@@ -757,7 +1325,8 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
                     R_refit = U * fix * Vt;
                 }
                 cv::Vec3d t_refit = p_mean - R_refit * q_mean;
-                if (isCandidateRotationValid(R_refit) && isInTargetWorkspace(t_refit)) {
+                if (isCandidateRotationValid(R_refit) && isInTargetWorkspace(t_refit) &&
+                    passesClusterContainment(R_refit, t_refit)) {
                     best_pose.R = R_refit;
                     best_pose.t = t_refit;
                 }
@@ -765,9 +1334,63 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
         }
     }
 
-    const int min_valid_inliers = std::max(8, static_cast<int>(0.025 * N));
+    const int min_valid_inliers = std::max(8, static_cast<int>((_is_floor_standing ? 0.025 : 0.015) * N));
     if (best_pose.valid && best_inliers < min_valid_inliers) {
         best_pose.valid = false;
+    }
+
+    // Fallback geometric PCA seed for FREE_6DOF if descriptor RANSAC had heavy domain shift / noise
+    if (!best_pose.valid && !_is_floor_standing && obs_pts.size() >= 24 && isInTargetWorkspace(obs_center)) {
+        cv::Matx33d cov = cv::Matx33d::zeros();
+        for (size_t i = 0; i < N; ++i) {
+            const cv::Vec3d d = cv::Vec3d(obs_pts[i]) - obs_center;
+            cov += d * d.t();
+        }
+        cv::Mat eig_vals, eig_vecs;
+        cv::eigen(cv::Mat(cov), eig_vals, eig_vecs);
+        cv::Vec3d v0(eig_vecs.at<double>(0, 0), eig_vecs.at<double>(0, 1), eig_vecs.at<double>(0, 2));
+        cv::Vec3d v1(eig_vecs.at<double>(1, 0), eig_vecs.at<double>(1, 1), eig_vecs.at<double>(1, 2));
+        v0 *= (1.0 / std::max(1e-9, cv::norm(v0)));
+        v1 -= v0 * v0.dot(v1);
+        v1 *= (1.0 / std::max(1e-9, cv::norm(v1)));
+        cv::Vec3d v2 = v0.cross(v1);
+        cv::Matx33d R_obs_pca(v0[0], v1[0], v2[0],
+                              v0[1], v1[1], v2[1],
+                              v0[2], v1[2], v2[2]);
+
+        cv::Vec3d cad_ext = _cad_max - _cad_min;
+        int ax[3] = {0, 1, 2};
+        std::sort(ax, ax + 3, [&](int a, int b) { return cad_ext[a] > cad_ext[b]; });
+        cv::Matx33d R_cad_pca = cv::Matx33d::zeros();
+        R_cad_pca(ax[0], 0) = 1.0;
+        R_cad_pca(ax[1], 1) = 1.0;
+        cv::Vec3d c0(R_cad_pca(0, 0), R_cad_pca(1, 0), R_cad_pca(2, 0));
+        cv::Vec3d c1(R_cad_pca(0, 1), R_cad_pca(1, 1), R_cad_pca(2, 1));
+        cv::Vec3d c2 = c0.cross(c1);
+        R_cad_pca(0, 2) = c2[0]; R_cad_pca(1, 2) = c2[1]; R_cad_pca(2, 2) = c2[2];
+
+        cv::Matx33d R_seed = R_obs_pca * R_cad_pca.t();
+        cv::Vec3d t_seed = obs_center - R_seed * cad_mid;
+        if (isInTargetWorkspace(t_seed)) {
+            best_pose.valid = true;
+            best_pose.R = R_seed;
+            best_pose.t = t_seed;
+            best_pose.t_glass = t_seed;
+            best_pose.inliers_count = 0;
+            best_pose.inlier_ratio = 0.0;
+            best_pose.rmse_m = 0.05;
+            best_pose.confidence = 0.12f;
+            best_pose.cluster_points_count = static_cast<int>(obs_pts.size());
+            cv::Vec3d euler = rotationMatrixToEulerDeg(best_pose.R, false);
+            best_pose.roll_deg = euler[0];
+            best_pose.pitch_deg = euler[1];
+            best_pose.yaw_deg = euler[2];
+            best_pose.method = "pca_fallback_seed";
+            return best_pose;
+        }
+    }
+
+    if (!best_pose.valid) {
         return best_pose;
     }
 
@@ -820,166 +1443,445 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
     const int img_w = std::max(320, static_cast<int>(2.0 * cx + 0.5));
     const int img_h = std::max(240, static_cast<int>(2.0 * cy + 0.5));
 
-    cv::Matx33d R_curr = pose.R;
-    cv::Vec3d t_curr = pose.t;
+    if (_is_floor_standing) {
+        // FLOOR_STANDING branch preserved verbatim for TABLE-DEMO accuracy
+        cv::Matx33d R_curr = pose.R;
+        cv::Vec3d t_curr = pose.t;
 
-    // 1. Visibility + Frustum Culling on CAD mesh surface
-    std::vector<cv::Vec3d> cad_vis_pts;
-    std::vector<cv::Vec3d> cad_vis_norms;
-    const size_t mesh_stride = (_mesh_pts.size() > 6000) ? 2 : 1;
-    cad_vis_pts.reserve(_mesh_pts.size() / mesh_stride);
-    cad_vis_norms.reserve(_mesh_pts.size() / mesh_stride);
+        std::vector<cv::Vec3d> cad_vis_pts;
+        std::vector<cv::Vec3d> cad_vis_norms;
+        const size_t mesh_stride = (_mesh_pts.size() > 6000) ? 2 : 1;
+        computeVisibleCadSubset(R_curr, t_curr, _mesh_pts, _mesh_normals,
+                                fx, fy, cx, cy, img_w, img_h, mesh_stride,
+                                cad_vis_pts, cad_vis_norms);
+        if (cad_vis_pts.size() < 40) return;
 
-    for (size_t i = 0; i < _mesh_pts.size(); i += mesh_stride) {
-        cv::Vec3d p_cam = R_curr * cv::Vec3d(_mesh_pts[i]) + t_curr;
-        if (p_cam[2] <= 0.05) continue;
-        cv::Vec3d n_cam = R_curr * cv::Vec3d(_mesh_normals[i]);
-        // Visibility filter: prefer front-facing triangles toward camera optical origin
-        if (n_cam.dot(p_cam) > 0.15 * cv::norm(p_cam)) continue;
+        const double fg_thresh = std::clamp(_real_bounding_diag_m * 0.032, 0.008, 0.032);
+        const double fg_thresh_sq = fg_thresh * fg_thresh;
+        cv::Matx33d R_inv = R_curr.t();
+        std::vector<cv::Vec3d> fg_pts;
+        const size_t scene_step = std::max<size_t>(1, scene_pts.size() / 600);
+        fg_pts.reserve(600);
 
-        double u = p_cam[0] * fx / p_cam[2] + cx;
-        double v = p_cam[1] * fy / p_cam[2] + cy;
-        if (u >= -40 && u < img_w + 40 && v >= -40 && v < img_h + 40) {
-            cad_vis_pts.emplace_back(_mesh_pts[i]);
-            cad_vis_norms.emplace_back(_mesh_normals[i]);
+        for (size_t i = 0; i < scene_pts.size(); i += scene_step) {
+            cv::Vec3d p_scene(scene_pts[i]);
+            cv::Vec3d p_cad = R_inv * (p_scene - t_curr);
+            double min_dsq = 1e10;
+            for (size_t j = 0; j < cad_vis_pts.size(); j += 4) {
+                cv::Vec3d d = p_cad - cad_vis_pts[j];
+                double dsq = d.dot(d);
+                if (dsq < min_dsq) min_dsq = dsq;
+            }
+            if (min_dsq <= fg_thresh_sq) {
+                fg_pts.push_back(p_scene);
+            }
         }
-    }
-    if (cad_vis_pts.size() < 40) return;
+        if (fg_pts.size() < 24) return;
 
-    // 2. Scale-adaptive foreground extraction near coarse CAD pose
-    const double fg_thresh = std::clamp(_real_bounding_diag_m * 0.032, 0.008, 0.032);
-    const double fg_thresh_sq = fg_thresh * fg_thresh;
-    cv::Matx33d R_inv = R_curr.t();
-    std::vector<cv::Vec3d> fg_pts;
+        const double scale_k = std::clamp(_real_bounding_diag_m, 0.18, 1.40);
+        const double dist_scales[4] = {0.032 * scale_k, 0.016 * scale_k, 0.007 * scale_k, 0.003 * scale_k};
+
+        cv::Matx33d R_icp = R_inv;
+        cv::Vec3d t_icp = -R_inv * t_curr;
+
+        for (double max_corr : dist_scales) {
+            max_corr = std::max(0.003, max_corr);
+            double tukey_k = std::max(0.002, max_corr * 0.65);
+            double max_corr_sq = max_corr * max_corr;
+            double prev_residual = 1e10;
+
+            for (int iter = 0; iter < 15; ++iter) {
+                cv::Matx66d JtJ = cv::Matx66d::zeros();
+                cv::Matx61d Jtb = cv::Matx61d::zeros();
+                int n_corr = 0;
+                double sum_res = 0.0;
+
+                for (const auto& p_sc : fg_pts) {
+                    cv::Vec3d p_trans = R_icp * p_sc + t_icp;
+                    double best_dsq = 1e10;
+                    int best_j = -1;
+                    for (size_t j = 0; j < cad_vis_pts.size(); j += 2) {
+                        cv::Vec3d d = p_trans - cad_vis_pts[j];
+                        double dsq = d.dot(d);
+                        if (dsq < best_dsq) {
+                            best_dsq = dsq;
+                            best_j = static_cast<int>(j);
+                        }
+                    }
+                    if (best_dsq > max_corr_sq || best_j < 0) continue;
+
+                    cv::Vec3d n = cad_vis_norms[best_j];
+                    double n_norm = cv::norm(n);
+                    if (n_norm < 1e-6) continue;
+                    n *= (1.0 / n_norm);
+
+                    cv::Vec3d res = p_trans - cad_vis_pts[best_j];
+                    double r = n.dot(res);
+                    double abs_r = std::abs(r);
+                    double w = 0.0;
+                    if (abs_r < tukey_k) {
+                        double rk = r / tukey_k;
+                        w = (1.0 - rk * rk);
+                        w = w * w;
+                    }
+                    if (w < 1e-8) continue;
+
+                    cv::Vec3d cross_np = p_trans.cross(n);
+                    double J[6] = {cross_np[0], cross_np[1], cross_np[2], n[0], n[1], n[2]};
+                    for (int a = 0; a < 6; ++a) {
+                        for (int b = 0; b < 6; ++b) {
+                            JtJ(a, b) += w * J[a] * J[b];
+                        }
+                        Jtb(a, 0) -= w * J[a] * r;
+                    }
+                    sum_res += w * r * r;
+                    ++n_corr;
+                }
+
+                if (n_corr < 18) break;
+                for (int d = 0; d < 6; ++d) JtJ(d, d) += 1e-5;
+
+                cv::Matx61d delta;
+                if (!cv::solve(JtJ, Jtb, delta, cv::DECOMP_CHOLESKY)) {
+                    if (!cv::solve(JtJ, Jtb, delta, cv::DECOMP_SVD)) break;
+                }
+
+                cv::Vec3d d_w(delta(0, 0), delta(1, 0), delta(2, 0));
+                cv::Vec3d d_t(delta(3, 0), delta(4, 0), delta(5, 0));
+                double d_theta = cv::norm(d_w);
+
+                cv::Matx33d d_R = cv::Matx33d::eye();
+                if (d_theta > 1e-8) {
+                    double clamp_th = std::min(d_theta, 0.25);
+                    cv::Vec3d axis = d_w * (1.0 / d_theta);
+                    cv::Matx33d K(
+                         0.0,     -axis[2],  axis[1],
+                         axis[2],  0.0,     -axis[0],
+                        -axis[1],  axis[0],  0.0);
+                    d_R = cv::Matx33d::eye() + std::sin(clamp_th) * K + (1.0 - std::cos(clamp_th)) * (K * K);
+                }
+
+                R_icp = d_R * R_icp;
+                t_icp = d_R * t_icp + d_t;
+
+                double rmse = std::sqrt(sum_res / n_corr);
+                if (cv::norm(d_t) < 1e-5 && d_theta < 1e-5) break;
+                if (std::abs(rmse - prev_residual) / (prev_residual + 1e-10) < 1e-5) break;
+                prev_residual = rmse;
+            }
+        }
+
+        cv::Matx33d R_final = R_icp.t();
+        cv::Vec3d t_final = -R_final * t_icp;
+
+        const double max_drift = std::clamp(_real_bounding_diag_m * 0.085, 0.025, 0.095);
+        if (cv::norm(t_final - pose.t) > max_drift || !isInTargetWorkspace(t_final)) {
+            return;
+        }
+
+        pose.R = R_final;
+        pose.t = t_final;
+        pose.t_glass = t_final;
+        const bool fold_c2 = (_symmetry_code >= 1);
+        cv::Vec3d euler = rotationMatrixToEulerDeg(pose.R, fold_c2);
+        pose.roll_deg = euler[0];
+        pose.pitch_deg = euler[1];
+        pose.yaw_deg = euler[2];
+        pose.method = "universal_mesh_icp";
+
+        const cv::Matx33d R_check_inv = R_final.t();
+        const double fit_thresh = std::clamp(_real_bounding_diag_m * 0.025, 0.006, 0.025);
+        const double fit_thresh_sq = fit_thresh * fit_thresh;
+        const size_t vis_step = (cad_vis_pts.size() > 1500) ? 2 : 1;
+        int surf_inliers = 0;
+        double inlier_dsq_sum = 0.0;
+        for (const auto& p_sc : fg_pts) {
+            const cv::Vec3d p_cad = R_check_inv * (p_sc - t_final);
+            double min_dsq = 1e10;
+            for (size_t j = 0; j < cad_vis_pts.size(); j += vis_step) {
+                const cv::Vec3d d = p_cad - cad_vis_pts[j];
+                const double dsq = d.dot(d);
+                if (dsq < min_dsq) min_dsq = dsq;
+            }
+            if (min_dsq <= fit_thresh_sq) {
+                ++surf_inliers;
+                inlier_dsq_sum += min_dsq;
+            }
+        }
+        if (surf_inliers >= 12) {
+            const double icp_rmse = std::sqrt(inlier_dsq_sum / static_cast<double>(surf_inliers));
+            const double icp_fitness = static_cast<double>(surf_inliers) / static_cast<double>(fg_pts.size());
+            pose.rmse_m = icp_rmse;
+            pose.inlier_ratio = icp_fitness;
+            pose.inliers_count = std::max(pose.inliers_count, surf_inliers);
+            pose.confidence = std::clamp(
+                static_cast<float>(0.65 * icp_fitness + 0.35 * static_cast<double>(pose.confidence)),
+                0.10f, 0.99f);
+        }
+        return;
+    }
+
+    // FREE_6DOF: Widened foreground recovery + Multi-Hypothesis Flip/PCA ICP + Bidirectional Consensus
+    const double diag = std::max(0.05, _real_bounding_diag_m);
+    const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
+
+    std::vector<cv::Vec3d> scene_sub;
     const size_t scene_step = std::max<size_t>(1, scene_pts.size() / 600);
-    fg_pts.reserve(600);
-
+    scene_sub.reserve(scene_pts.size() / scene_step + 1);
     for (size_t i = 0; i < scene_pts.size(); i += scene_step) {
-        cv::Vec3d p_scene(scene_pts[i]);
-        cv::Vec3d p_cad = R_inv * (p_scene - t_curr);
-        double min_dsq = 1e10;
-        for (size_t j = 0; j < cad_vis_pts.size(); j += 4) {
-            cv::Vec3d d = p_cad - cad_vis_pts[j];
-            double dsq = d.dot(d);
-            if (dsq < min_dsq) min_dsq = dsq;
-        }
-        if (min_dsq <= fg_thresh_sq) {
-            fg_pts.push_back(p_scene);
-        }
+        scene_sub.emplace_back(scene_pts[i]);
     }
-    if (fg_pts.size() < 24) return;
+    if (scene_sub.size() < 24) return;
 
-    // 3. Scale-Adaptive Multi-Scale 6DoF Point-to-Plane ICP with Tukey Biweight Loss
-    const double scale_k = std::clamp(_real_bounding_diag_m, 0.18, 1.40);
-    const double dist_scales[4] = {0.032 * scale_k, 0.016 * scale_k, 0.007 * scale_k, 0.003 * scale_k};
+    // Extract foreground subset around coarse pose only if cluster is substantially oversized vs CAD;
+    // never crop an object-sized cluster around a potentially noisy coarse RANSAC seed.
+    std::vector<cv::Vec3d> fg_pts;
+    bool cluster_is_object_sized = false;
+    {
+        std::vector<double> xs, ys, zs;
+        xs.reserve(scene_sub.size());
+        ys.reserve(scene_sub.size());
+        zs.reserve(scene_sub.size());
+        for (const auto& p : scene_sub) {
+            xs.push_back(p[0]);
+            ys.push_back(p[1]);
+            zs.push_back(p[2]);
+        }
+        std::sort(xs.begin(), xs.end());
+        std::sort(ys.begin(), ys.end());
+        std::sort(zs.begin(), zs.end());
+        const size_t nq = xs.size();
+        const size_t lo = static_cast<size_t>(0.03 * nq);
+        const size_t hi = std::min(nq - 1, static_cast<size_t>(0.97 * nq));
+        const double q_diag = std::sqrt((xs[hi] - xs[lo]) * (xs[hi] - xs[lo]) +
+                                        (ys[hi] - ys[lo]) * (ys[hi] - ys[lo]) +
+                                        (zs[hi] - zs[lo]) * (zs[hi] - zs[lo]));
+        cluster_is_object_sized = (q_diag <= 1.42 * diag);
+    }
 
-    cv::Matx33d R_icp = R_inv;
-    cv::Vec3d t_icp = -R_inv * t_curr;
-
-    for (double max_corr : dist_scales) {
-        max_corr = std::max(0.003, max_corr);
-        double tukey_k = std::max(0.002, max_corr * 0.65);
-        double max_corr_sq = max_corr * max_corr;
-        double prev_residual = 1e10;
-
-        for (int iter = 0; iter < 15; ++iter) {
-            cv::Matx66d JtJ = cv::Matx66d::zeros();
-            cv::Matx61d Jtb = cv::Matx61d::zeros();
-            int n_corr = 0;
-            double sum_res = 0.0;
-
-            for (const auto& p_sc : fg_pts) {
-                cv::Vec3d p_trans = R_icp * p_sc + t_icp;
-                double best_dsq = 1e10;
-                int best_j = -1;
-                for (size_t j = 0; j < cad_vis_pts.size(); j += 2) {
-                    cv::Vec3d d = p_trans - cad_vis_pts[j];
-                    double dsq = d.dot(d);
-                    if (dsq < best_dsq) {
-                        best_dsq = dsq;
-                        best_j = static_cast<int>(j);
-                    }
-                }
-                if (best_dsq > max_corr_sq || best_j < 0) continue;
-
-                cv::Vec3d n = cad_vis_norms[best_j];
-                double n_norm = cv::norm(n);
-                if (n_norm < 1e-6) continue;
-                n *= (1.0 / n_norm);
-
-                cv::Vec3d res = p_trans - cad_vis_pts[best_j];
-                double r = n.dot(res);
-                double abs_r = std::abs(r);
-                double w = 0.0;
-                if (abs_r < tukey_k) {
-                    double rk = r / tukey_k;
-                    w = (1.0 - rk * rk);
-                    w = w * w;
-                }
-                if (w < 1e-8) continue;
-
-                cv::Vec3d cross_np = p_trans.cross(n);
-                double J[6] = {cross_np[0], cross_np[1], cross_np[2], n[0], n[1], n[2]};
-                for (int a = 0; a < 6; ++a) {
-                    for (int b = 0; b < 6; ++b) {
-                        JtJ(a, b) += w * J[a] * J[b];
-                    }
-                    Jtb(a, 0) -= w * J[a] * r;
-                }
-                sum_res += w * r * r;
-                ++n_corr;
+    if (cluster_is_object_sized) {
+        fg_pts = scene_sub;
+    } else {
+        std::vector<cv::Vec3d> coarse_vis, coarse_norms;
+        const size_t c_stride = std::max<size_t>(1, _mesh_pts.size() / 1200);
+        computeVisibleCadSubset(pose.R, pose.t, _mesh_pts, _mesh_normals,
+                                fx, fy, cx, cy, img_w, img_h, c_stride, coarse_vis, coarse_norms);
+        if (coarse_vis.size() < 24) {
+            for (size_t i = 0; i < _mesh_pts.size(); i += c_stride) coarse_vis.emplace_back(_mesh_pts[i]);
+        }
+        const double fg_thresh = std::clamp(diag * 0.16, 0.028, 0.060);
+        const double fg_thresh_sq = fg_thresh * fg_thresh;
+        const cv::Matx33d R_inv0 = pose.R.t();
+        fg_pts.reserve(scene_sub.size());
+        for (const auto& p_sc : scene_sub) {
+            const cv::Vec3d p_cad = R_inv0 * (p_sc - pose.t);
+            double min_dsq = 1e10;
+            for (size_t j = 0; j < coarse_vis.size(); j += 2) {
+                const cv::Vec3d d = p_cad - coarse_vis[j];
+                const double dsq = d.dot(d);
+                if (dsq < min_dsq) min_dsq = dsq;
             }
-
-            if (n_corr < 18) break;
-            for (int d = 0; d < 6; ++d) JtJ(d, d) += 1e-5;
-
-            cv::Matx61d delta;
-            if (!cv::solve(JtJ, Jtb, delta, cv::DECOMP_CHOLESKY)) {
-                if (!cv::solve(JtJ, Jtb, delta, cv::DECOMP_SVD)) break;
-            }
-
-            cv::Vec3d d_w(delta(0, 0), delta(1, 0), delta(2, 0));
-            cv::Vec3d d_t(delta(3, 0), delta(4, 0), delta(5, 0));
-            double d_theta = cv::norm(d_w);
-
-            cv::Matx33d d_R = cv::Matx33d::eye();
-            if (d_theta > 1e-8) {
-                double clamp_th = std::min(d_theta, 0.25);
-                cv::Vec3d axis = d_w * (1.0 / d_theta);
-                cv::Matx33d K(
-                     0.0,     -axis[2],  axis[1],
-                     axis[2],  0.0,     -axis[0],
-                    -axis[1],  axis[0],  0.0);
-                d_R = cv::Matx33d::eye() + std::sin(clamp_th) * K + (1.0 - std::cos(clamp_th)) * (K * K);
-            }
-
-            R_icp = d_R * R_icp;
-            t_icp = d_R * t_icp + d_t;
-
-            double rmse = std::sqrt(sum_res / n_corr);
-            if (cv::norm(d_t) < 1e-5 && d_theta < 1e-5) break;
-            if (std::abs(rmse - prev_residual) / (prev_residual + 1e-10) < 1e-5) break;
-            prev_residual = rmse;
+            if (min_dsq <= fg_thresh_sq) fg_pts.push_back(p_sc);
+        }
+        if (fg_pts.size() < 24 || fg_pts.size() < scene_sub.size() / 4) {
+            fg_pts = scene_sub;
         }
     }
 
-    cv::Matx33d R_final = R_icp.t();
-    cv::Vec3d t_final = -R_final * t_icp;
+    cv::Vec3d c_fg(0.0, 0.0, 0.0);
+    for (const auto& p : fg_pts) c_fg += p;
+    c_fg *= (1.0 / static_cast<double>(fg_pts.size()));
 
-    const double max_drift = std::clamp(_real_bounding_diag_m * 0.085, 0.025, 0.095);
-    if (cv::norm(t_final - pose.t) > max_drift || !isInTargetWorkspace(t_final)) {
+    const std::vector<double> search_scales = {
+        std::clamp(diag * 0.16, 0.028, 0.060),
+        std::clamp(diag * 0.08, 0.014, 0.030),
+        std::clamp(diag * 0.035, 0.007, 0.014)
+    };
+    const std::vector<double> polish_scales = {
+        std::clamp(diag * 0.060, 0.012, 0.026),
+        std::clamp(diag * 0.028, 0.006, 0.014),
+        std::clamp(diag * 0.013, 0.0035, 0.007)
+    };
+    const size_t search_fg_stride = std::max<size_t>(1, fg_pts.size() / 220);
+    const size_t search_mesh_stride = std::max<size_t>(1, _mesh_pts.size() / 520);
+    const size_t polish_fg_stride = 1;
+    const size_t polish_mesh_stride = (_mesh_pts.size() > 6000) ? 2 : 1;
+
+    struct PoseSeed {
+        cv::Matx33d R;
+        cv::Vec3d t;
+        double bonus;
+    };
+    std::vector<PoseSeed> seeds;
+
+    // 1. Candidate 0: As-Is (run ICP first so flips pivot around the surface-settled axis!)
+    cv::Matx33d R_cand0 = pose.R;
+    cv::Vec3d t_cand0 = pose.t;
+    const cv::Vec3d t_recentered0 = computeVisibleSurfaceOffset(pose.R, c_fg, cad_mid, _mesh_pts, _mesh_normals);
+    if (cv::norm(t_recentered0 - pose.t) > 0.018) {
+        // Test BOTH original pose.t and visible-centroid-aligned t_recentered0
+        cv::Matx33d R_a, R_b;
+        cv::Vec3d t_a, t_b;
+        runPointToPlaneIcpGeneric(pose.R, pose.t, _mesh_pts, _mesh_normals, fg_pts,
+                                  search_fg_stride, search_mesh_stride, search_scales, 8,
+                                  fx, fy, cx, cy, img_w, img_h, R_a, t_a);
+        runPointToPlaneIcpGeneric(pose.R, t_recentered0, _mesh_pts, _mesh_normals, fg_pts,
+                                  search_fg_stride, search_mesh_stride, search_scales, 8,
+                                  fx, fy, cx, cy, img_w, img_h, R_b, t_b);
+        auto sa = evaluateBidirectionalConsensus(R_a, t_a, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+        auto sb = evaluateBidirectionalConsensus(R_b, t_b, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+        if (sb.score > sa.score) { R_cand0 = R_b; t_cand0 = t_b; }
+        else { R_cand0 = R_a; t_cand0 = t_a; }
+    } else {
+        runPointToPlaneIcpGeneric(pose.R, pose.t, _mesh_pts, _mesh_normals, fg_pts,
+                                  search_fg_stride, search_mesh_stride, search_scales, 8,
+                                  fx, fy, cx, cy, img_w, img_h, R_cand0, t_cand0);
+    }
+
+    auto score_cand0 = evaluateBidirectionalConsensus(R_cand0, t_cand0, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+
+    double best_total = -1e9;
+    cv::Matx33d best_R = pose.R;
+    cv::Vec3d best_t = pose.t;
+    BidirectionalConsensus best_cons;
+
+    const double max_center_drift = std::max(0.065, 0.45 * diag);
+    auto considerSolution = [&](const cv::Matx33d& R_sol, const cv::Vec3d& t_sol,
+                                const BidirectionalConsensus& c_sol, double bonus) {
+        if (!isInTargetWorkspace(t_sol)) return;
+        const cv::Vec3d pred_mid = R_sol * cad_mid + t_sol;
+        if (cv::norm(pred_mid - c_fg) > max_center_drift + 0.35 * diag) return;
+        const double adj = c_sol.score + bonus;
+        if (adj > best_total) {
+            best_total = adj;
+            best_R = R_sol;
+            best_t = t_sol;
+            best_cons = c_sol;
+        }
+    };
+    considerSolution(R_cand0, t_cand0, score_cand0, 0.0);
+
+    // 2. Transverse 180-deg Flips (Rx180/Ry180 compete purely on geometry to fix upside-down neck/cap;
+    //    Rz180 carries a mild -0.008 hysteresis so Z-axis C2 objects keep AI front/back preference on ties)
+    const cv::Matx33d Rx180(1.0,  0.0,  0.0,  0.0, -1.0,  0.0,  0.0,  0.0, -1.0);
+    const cv::Matx33d Ry180(-1.0, 0.0,  0.0,  0.0,  1.0,  0.0,  0.0,  0.0, -1.0);
+    const cv::Matx33d Rz180(-1.0, 0.0,  0.0,  0.0, -1.0,  0.0,  0.0,  0.0,  1.0);
+    seeds.push_back(PoseSeed{R_cand0 * Rx180, computeVisibleSurfaceOffset(R_cand0 * Rx180, c_fg, cad_mid, _mesh_pts, _mesh_normals), 0.0});
+    seeds.push_back(PoseSeed{R_cand0 * Ry180, computeVisibleSurfaceOffset(R_cand0 * Ry180, c_fg, cad_mid, _mesh_pts, _mesh_normals), 0.0});
+    seeds.push_back(PoseSeed{R_cand0 * Rz180, computeVisibleSurfaceOffset(R_cand0 * Rz180, c_fg, cad_mid, _mesh_pts, _mesh_normals), -0.008});
+
+    // 3. PCA Principal-Axis Hypotheses (recovers from ~90 deg coarse RANSAC minima)
+    if (score_cand0.fwd_fit < 0.84 || score_cand0.bwd_kernel < 0.72 || pose.method == "pca_fallback_seed") {
+        cv::Matx33d cov = cv::Matx33d::zeros();
+        for (const auto& p : fg_pts) {
+            const cv::Vec3d d = p - c_fg;
+            cov += d * d.t();
+        }
+        cv::Mat eig_vals, eig_vecs;
+        cv::eigen(cv::Mat(cov), eig_vals, eig_vecs);
+        cv::Vec3d v0(eig_vecs.at<double>(0, 0), eig_vecs.at<double>(0, 1), eig_vecs.at<double>(0, 2));
+        cv::Vec3d v1(eig_vecs.at<double>(1, 0), eig_vecs.at<double>(1, 1), eig_vecs.at<double>(1, 2));
+        cv::Vec3d v2(eig_vecs.at<double>(2, 0), eig_vecs.at<double>(2, 1), eig_vecs.at<double>(2, 2));
+        v0 *= (1.0 / std::max(1e-9, cv::norm(v0)));
+        v1 -= v0 * v0.dot(v1);
+        v1 *= (1.0 / std::max(1e-9, cv::norm(v1)));
+        v2 = v0.cross(v1);
+
+        const cv::Vec3d cad_ext = _cad_max - _cad_min;
+        int ax[3] = {0, 1, 2};
+        std::sort(ax, ax + 3, [&](int a, int b) { return cad_ext[a] > cad_ext[b]; });
+        cv::Matx33d R_cad_pca = cv::Matx33d::zeros();
+        R_cad_pca(ax[0], 0) = 1.0;
+        R_cad_pca(ax[1], 1) = 1.0;
+        cv::Vec3d ca0(R_cad_pca(0, 0), R_cad_pca(1, 0), R_cad_pca(2, 0));
+        cv::Vec3d ca1(R_cad_pca(0, 1), R_cad_pca(1, 1), R_cad_pca(2, 1));
+        cv::Vec3d ca2 = ca0.cross(ca1);
+        R_cad_pca(0, 2) = ca2[0]; R_cad_pca(1, 2) = ca2[1]; R_cad_pca(2, 2) = ca2[2];
+        const cv::Matx33d R_cad_pca_t = R_cad_pca.t();
+
+        struct RankedSeed { double pre; cv::Matx33d R; cv::Vec3d t; };
+        std::vector<RankedSeed> pca_pool;
+        for (double s0 : {-1.0, 1.0}) {
+            for (double s1 : {-1.0, 1.0}) {
+                // Pair A: (s0*v0, s1*v1) and Pair B: (s0*v0, s1*v2) to cover 90-deg roll around principal axis
+                for (int mode = 0; mode < 2; ++mode) {
+                    cv::Vec3d a0 = s0 * v0;
+                    cv::Vec3d a1 = s1 * (mode == 0 ? v1 : v2);
+                    cv::Vec3d a2 = a0.cross(a1);
+                    cv::Matx33d R_obs_b(a0[0], a1[0], a2[0],
+                                        a0[1], a1[1], a2[1],
+                                        a0[2], a1[2], a2[2]);
+                    cv::Matx33d R_p = R_obs_b * R_cad_pca_t;
+                    cv::Vec3d t_p = computeVisibleSurfaceOffset(R_p, c_fg, cad_mid, _mesh_pts, _mesh_normals);
+                    auto sc_p = evaluateBidirectionalConsensus(R_p, t_p, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+                    pca_pool.push_back(RankedSeed{sc_p.score, R_p, t_p});
+                }
+            }
+        }
+        std::sort(pca_pool.begin(), pca_pool.end(), [](const RankedSeed& a, const RankedSeed& b) {
+            return a.pre > b.pre;
+        });
+        const size_t take_pca = std::min<size_t>(3, pca_pool.size());
+        for (size_t k = 0; k < take_pca; ++k) {
+            seeds.push_back(PoseSeed{pca_pool[k].R, pca_pool[k].t, 0.0});
+        }
+    }
+
+    for (const auto& sd : seeds) {
+        cv::Matx33d R_out;
+        cv::Vec3d t_out;
+        runPointToPlaneIcpGeneric(sd.R, sd.t, _mesh_pts, _mesh_normals, fg_pts,
+                                  search_fg_stride, search_mesh_stride, search_scales, 8,
+                                  fx, fy, cx, cy, img_w, img_h, R_out, t_out);
+        auto sc = evaluateBidirectionalConsensus(R_out, t_out, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+        considerSolution(R_out, t_out, sc, sd.bonus);
+    }
+
+    if (best_total <= -1e8) return;
+
+    // 4. Final dense polish on winning hypothesis
+    cv::Matx33d R_final = best_R;
+    cv::Vec3d t_final = best_t;
+    BidirectionalConsensus final_cons = best_cons;
+    {
+        cv::Matx33d R_pol;
+        cv::Vec3d t_pol;
+        runPointToPlaneIcpGeneric(best_R, best_t, _mesh_pts, _mesh_normals, fg_pts,
+                                  polish_fg_stride, polish_mesh_stride, polish_scales, 15,
+                                  fx, fy, cx, cy, img_w, img_h, R_pol, t_pol);
+        if (isInTargetWorkspace(t_pol) && cv::norm((R_pol * cad_mid + t_pol) - c_fg) <= max_center_drift + 0.35 * diag) {
+            auto pol_cons = evaluateBidirectionalConsensus(R_pol, t_pol, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h);
+            if (pol_cons.score >= best_cons.score - 0.005) {
+                R_final = R_pol;
+                t_final = t_pol;
+                final_cons = pol_cons;
+            }
+        }
+    }
+
+    const double max_drift = std::clamp(diag * 0.48, 0.085, 0.160);
+    if ((cv::norm(t_final - pose.t) > max_drift && cv::norm((R_final * cad_mid + t_final) - c_fg) > max_center_drift) ||
+        !isInTargetWorkspace(t_final)) {
         return;
     }
 
     pose.R = R_final;
     pose.t = t_final;
     pose.t_glass = t_final;
-    const bool fold_c2 = (_is_floor_standing && _symmetry_code >= 1);
-    cv::Vec3d euler = rotationMatrixToEulerDeg(pose.R, fold_c2);
+    cv::Vec3d euler = rotationMatrixToEulerDeg(pose.R, false);
     pose.roll_deg = euler[0];
     pose.pitch_deg = euler[1];
     pose.yaw_deg = euler[2];
     pose.method = "universal_mesh_icp";
+
+    const int surf_inliers = static_cast<int>(std::round(final_cons.fwd_fit * static_cast<double>(fg_pts.size())));
+    pose.rmse_m = final_cons.rmse_m;
+    pose.inlier_ratio = final_cons.fwd_fit;
+    pose.inliers_count = std::max(pose.inliers_count, surf_inliers);
+    const double bidir_conf = std::clamp(final_cons.score + 0.05, 0.05, 0.99);
+    pose.confidence = std::clamp(
+        static_cast<float>(0.88 * bidir_conf + 0.12 * static_cast<double>(pose.confidence)),
+        0.05f, 0.99f);
 }
 
 void UniversalPoseEstimator::refinePoseUniversalCrease2D3D(ObjectPose& pose,
@@ -987,6 +1889,9 @@ void UniversalPoseEstimator::refinePoseUniversalCrease2D3D(ObjectPose& pose,
                                                            const CameraIntrinsics& intr) const
 {
     if (!pose.valid || rgb.empty() || _cad_feature_edges.empty()) return;
+    // Skip OBB-box fallback edges (<=16 edges) on smooth/curved FREE_6DOF parts
+    // so RGB Canny clutter does not pull the 3D pose away from the fitted depth surface.
+    if (!_is_floor_standing && _cad_feature_edges.size() <= 16) return;
 
     cv::Mat gray, edges, dt;
     if (rgb.channels() == 3) cv::cvtColor(rgb, gray, cv::COLOR_BGR2GRAY);
@@ -1035,62 +1940,416 @@ void UniversalPoseEstimator::refinePoseUniversalCrease2D3D(ObjectPose& pose,
     }
 }
 
-ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
-                                            const cv::Mat& depth_z16,
-                                            const CameraIntrinsics& intr)
+ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::Vec3f>& sampled_pts,
+                                                         const std::vector<cv::Vec3f>& dense_pts,
+                                                         const cv::Vec4d& floor_plane,
+                                                         bool floor_detected,
+                                                         double floor_pitch_deg,
+                                                         const cv::Mat& rgb,
+                                                         const CameraIntrinsics& intr,
+                                                         int img_w,
+                                                         int img_h,
+                                                         double* out_ai_ms) const
 {
     ObjectPose pose;
     pose.model_name = _model_name;
-    if (!_initialized || depth_z16.empty()) return pose;
+    if (sampled_pts.size() < 16) return pose;
 
-    SegmentationResult seg_res = _scene_segmenter.segment(depth_z16, intr, cv::Rect(), _num_obs_points);
-    if (!seg_res.valid) return pose;
+    // Eliminate off-axis (X, Y) domain shift for FREE_6DOF ONNX descriptor extraction
+    // while keeping original camera-space points for Kabsch / ICP pose solving.
+    std::vector<cv::Vec3f> ai_input_pts = sampled_pts;
+    if (!_is_floor_standing && !ai_input_pts.empty()) {
+        double sx = 0.0, sy = 0.0;
+        for (const auto& p : ai_input_pts) {
+            sx += p[0];
+            sy += p[1];
+        }
+        const float mean_x = static_cast<float>(sx / ai_input_pts.size());
+        const float mean_y = static_cast<float>(sy / ai_input_pts.size());
+        if (std::hypot(mean_x, mean_y) > 0.015f) {
+            for (auto& p : ai_input_pts) {
+                p[0] -= mean_x;
+                p[1] -= mean_y;
+            }
+        }
+    }
 
+    auto t_ai_0 = std::chrono::steady_clock::now();
     std::vector<float> obs_desc;
-    if (!runInference(seg_res.object_points, obs_desc)) return pose;
+    if (!runInference(ai_input_pts, obs_desc)) {
+        if (out_ai_ms) *out_ai_ms = 0.0;
+        return pose;
+    }
+    auto t_ai_1 = std::chrono::steady_clock::now();
+    if (out_ai_ms) {
+        *out_ai_ms = std::chrono::duration<double, std::milli>(t_ai_1 - t_ai_0).count();
+    }
 
-    pose = solveRansacKabsch(seg_res.object_points, obs_desc, seg_res.floor_plane, seg_res.floor_detected);
+    pose = solveRansacKabsch(sampled_pts, obs_desc, floor_plane, floor_detected);
     if (!pose.valid) return pose;
 
-    refineMultiScaleMeshICP(seg_res.dense_object_points, pose, intr);
+    const std::vector<cv::Vec3f>& icp_cloud = dense_pts.empty() ? sampled_pts : dense_pts;
+    refineMultiScaleMeshICP(icp_cloud, pose, intr);
     refinePoseUniversalCrease2D3D(pose, rgb, intr);
-    pose.bbox_2d = projectCadBoundingBox(pose.R, pose.t, intr, depth_z16.cols, depth_z16.rows, &pose.corners_2d);
+    pose.bbox_2d = projectCadBoundingBox(pose.R, pose.t, intr, img_w, img_h, &pose.corners_2d);
+
+    pose.cluster_points_count = static_cast<int>(icp_cloud.size());
+    pose.valid_depth_pts = static_cast<int>(icp_cloud.size());
+    pose.floor_locked = (_is_floor_standing && floor_detected);
+    pose.floor_pitch_deg = floor_pitch_deg;
+    pose.sparse_depth_fallback = (pose.valid_depth_pts < 250);
+    pose.segmented_points = icp_cloud;
+    return pose;
+}
+
+bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
+                                                  const std::vector<cv::Vec3f>& full_fg_pts,
+                                                  const cv::Mat& depth_z16,
+                                                  const CameraIntrinsics& intr,
+                                                  int img_w,
+                                                  int img_h,
+                                                  bool strict_clutter_gate) const
+{
+    if (_is_floor_standing || !pose.valid || full_fg_pts.empty() || _mesh_pts.empty()) return true;
+
+    const double diag = std::max(0.05, _real_bounding_diag_m);
+    const double pad = std::clamp(0.068 * diag, 0.008, 0.018);
+    const cv::Matx33d R_inv = pose.R.t();
+
+    // Collect unclipped points inside the tight rotated CAD OBB so adjacent objects do not corrupt fit/RMSE
+    std::vector<cv::Vec3d> local_raw;
+    local_raw.reserve(1024);
+    for (const auto& p : full_fg_pts) {
+        const cv::Vec3d pc = R_inv * (cv::Vec3d(p) - pose.t);
+        if (pc[0] >= _cad_min[0] - pad && pc[0] <= _cad_max[0] + pad &&
+            pc[1] >= _cad_min[1] - pad && pc[1] <= _cad_max[1] + pad &&
+            pc[2] >= _cad_min[2] - pad && pc[2] <= _cad_max[2] + pad) {
+            local_raw.emplace_back(p);
+        }
+    }
+    if (local_raw.size() < 36) {
+        return !strict_clutter_gate;
+    }
+
+    std::vector<cv::Vec3d> unclipped;
+    unclipped.reserve(std::min<size_t>(local_raw.size(), 600));
+    const size_t step = std::max<size_t>(1, local_raw.size() / 600);
+    for (size_t i = 0; i < local_raw.size(); i += step) {
+        unclipped.push_back(local_raw[i]);
+    }
+
+    const double fx = (intr.fx > 100.0) ? intr.fx : 608.215;
+    const double fy = (intr.fy > 100.0) ? intr.fy : 608.128;
+    const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * img_w);
+    const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * img_h);
+
+    auto cons = evaluateBidirectionalConsensus(pose.R, pose.t, diag,
+                                             _mesh_pts, _mesh_normals, unclipped,
+                                             fx, fy, cx, cy, img_w, img_h);
+
+    if (cons.score > -100.0) {
+        pose.confidence = std::clamp(static_cast<float>(cons.score + 0.05), 0.05f, 0.99f);
+        pose.rmse_m = cons.rmse_m;
+        pose.inlier_ratio = cons.fwd_fit;
+        pose.inliers_count = std::max(pose.inliers_count, static_cast<int>(std::round(cons.fwd_fit * local_raw.size())));
+    } else if (strict_clutter_gate) {
+        return false;
+    }
+
+    const bool is_cluttered = (full_fg_pts.size() > std::max<size_t>(400, local_raw.size() * 3 / 2));
+    if (!is_cluttered) {
+        return true;
+    }
+
+    // 0. In-frame visibility guard in cluttered scenes (rejects partially off-screen wall/armrest crops)
+    if (strict_clutter_gate && img_w > 0 && img_h > 0) {
+        int tot_proj = 0;
+        int in_frame = 0;
+        const size_t p_stride = std::max<size_t>(1, _mesh_pts.size() / 400);
+        for (size_t i = 0; i < _mesh_pts.size(); i += p_stride) {
+            const cv::Vec3d pc = pose.R * cv::Vec3d(_mesh_pts[i]) + pose.t;
+            if (pc[2] <= 0.10) continue;
+            const double u = fx * pc[0] / pc[2] + cx;
+            const double v = fy * pc[1] / pc[2] + cy;
+            ++tot_proj;
+            if (u >= 6.0 && u < img_w - 6.0 && v >= 6.0 && v < img_h - 6.0) {
+                ++in_frame;
+            }
+        }
+        if (tot_proj >= 20 && static_cast<double>(in_frame) < 0.90 * static_cast<double>(tot_proj)) {
+            return false;
+        }
+    }
+
+    // 1. Physical Non-Planarity Check vs predicted visible CAD PCA spread (rejects 1D strips & flat plane patches)
+    const size_t vis_stride = std::max<size_t>(1, _mesh_pts.size() / 800);
+    std::vector<cv::Vec3d> vis_pts, vis_norms;
+    computeVisibleCadSubset(pose.R, pose.t, _mesh_pts, _mesh_normals,
+                            fx, fy, cx, cy, img_w, img_h, vis_stride, vis_pts, vis_norms);
+    if (vis_pts.size() >= 20 && unclipped.size() >= 20) {
+        const cv::Vec3d vis_sig = computePcaSigmas(vis_pts);
+        const cv::Vec3d obs_sig = computePcaSigmas(unclipped);
+        if (vis_sig[2] >= 0.0040 && (obs_sig[2] < 0.28 * vis_sig[2] || obs_sig[1] < 0.40 * vis_sig[1])) {
+            if (strict_clutter_gate) return false;
+            pose.confidence = std::max(0.05f, pose.confidence * 0.35f);
+        }
+    }
+
+    // 2. Z-Buffer Free-Space & Outer Boundary Convexity/Discontinuity Verification
+    double empty_behind_frac = 0.0;
+    double ring_jump_frac = 1.0;
+    double wide_out_frac = 1.0;
+    double wide_convex_ratio = 1.0;
+    int ring_tot = 0;
+    computeSilhouetteAndEmptyBehind(pose.R, pose.t, _mesh_pts, depth_z16,
+                                    fx, fy, cx, cy, diag,
+                                    empty_behind_frac, ring_jump_frac,
+                                    wide_out_frac, wide_convex_ratio, ring_tot);
+    const bool concave_crease = (ring_tot >= 40 && (wide_out_frac < 0.14 || wide_convex_ratio < 0.24));
+    if (empty_behind_frac > 0.16 || (ring_tot >= 40 && ring_jump_frac < 0.36) || concave_crease) {
+        if (strict_clutter_gate) return false;
+        pose.confidence = std::max(0.05f, pose.confidence * 0.40f);
+    }
+
+    const double sil_adj = 0.08 * std::clamp((ring_jump_frac - 0.40) / 0.35, -0.5, 1.0)
+                         - 0.18 * empty_behind_frac;
+    pose.confidence = std::clamp(static_cast<float>(static_cast<double>(pose.confidence) + sil_adj), 0.05f, 0.99f);
+
+    if (strict_clutter_gate) {
+        const double max_clutter_rmse = std::clamp(0.082 * diag, 0.012, 0.028);
+        if (pose.rmse_m > max_clutter_rmse || pose.inlier_ratio < 0.48) {
+            return false;
+        }
+    }
+    return true;
+}
+
+ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
+                                            const cv::Mat& depth_z16,
+                                            const CameraIntrinsics& intr,
+                                            const cv::Rect& roi_hint)
+{
+    auto t_start = std::chrono::steady_clock::now();
+    ObjectPose pose;
+    pose.model_name = _model_name;
+    _last_valid_depth_pts = 0;
+    _last_floor_locked = false;
+    _last_floor_pitch_deg = 0.0;
+    _last_sparse_depth_fallback = false;
+    _last_ai_latency_ms = 0.0;
+    _last_solve_latency_ms = 0.0;
+    _last_total_latency_ms = 0.0;
+    _last_segmented_points.clear();
+
+    if (!_initialized || depth_z16.empty()) return pose;
+
+    SegmentationResult seg_res = _scene_segmenter.segment(depth_z16, intr, roi_hint, _num_obs_points);
+    _last_valid_depth_pts = static_cast<int>(seg_res.dense_object_points.size());
+    _last_floor_locked = (_is_floor_standing && seg_res.floor_detected);
+    _last_floor_pitch_deg = seg_res.floor_pitch_deg;
+    _last_sparse_depth_fallback = (_last_valid_depth_pts >= 20 && _last_valid_depth_pts < 250);
+    _last_segmented_points = seg_res.dense_object_points;
+
+    if (!seg_res.valid) {
+        auto t_end = std::chrono::steady_clock::now();
+        _last_total_latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        _last_solve_latency_ms = _last_total_latency_ms;
+        return pose;
+    }
+
+    double ai_ms = 0.0;
+    if (!_is_floor_standing && seg_res.multi_clusters.size() > 1) {
+        double best_strict_rank = -1e9;
+        double best_fb_rank = -1e9;
+        ObjectPose best_fb_pose;
+        const size_t n_try = std::min<size_t>(seg_res.multi_clusters.size(), 32);
+        for (size_t i = 0; i < n_try; ++i) {
+            const auto& cl = seg_res.multi_clusters[i];
+            if (cl.points.size() < 20) continue;
+            const std::vector<cv::Vec3f>& dense_cl = cl.dense_points.empty() ? cl.points : cl.dense_points;
+            double c_ai = 0.0;
+            ObjectPose cand = estimateSingleCluster(cl.points, dense_cl, seg_res.floor_plane, false,
+                                                    seg_res.floor_pitch_deg, rgb, intr, depth_z16.cols, depth_z16.rows, &c_ai);
+            ai_ms += c_ai;
+            if (!cand.valid) continue;
+            ObjectPose strict_cand = cand;
+            if (rescorePoseUnclipped(strict_cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true)) {
+                double rank = static_cast<double>(strict_cand.confidence) - 2.0 * std::max(0.0, strict_cand.rmse_m - 0.015);
+                if (rank > best_strict_rank) {
+                    best_strict_rank = rank;
+                    pose = std::move(strict_cand);
+                }
+            } else {
+                rescorePoseUnclipped(cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
+                double rank = static_cast<double>(cand.confidence) - 2.0 * std::max(0.0, cand.rmse_m - 0.015);
+                if (rank > best_fb_rank) {
+                    best_fb_rank = rank;
+                    best_fb_pose = std::move(cand);
+                }
+            }
+        }
+        if (!pose.valid && best_fb_pose.valid) {
+            pose = std::move(best_fb_pose);
+        }
+        if (pose.valid) {
+            _last_valid_depth_pts = pose.valid_depth_pts;
+            _last_sparse_depth_fallback = pose.sparse_depth_fallback;
+            _last_segmented_points = pose.segmented_points;
+        }
+    } else {
+        pose = estimateSingleCluster(seg_res.object_points,
+                                     seg_res.dense_object_points,
+                                     seg_res.floor_plane,
+                                     seg_res.floor_detected,
+                                     seg_res.floor_pitch_deg,
+                                     rgb, intr, depth_z16.cols, depth_z16.rows, &ai_ms);
+        if (pose.valid && !_is_floor_standing &&
+            seg_res.foreground_points.size() > static_cast<size_t>(pose.valid_depth_pts * 1.18)) {
+            rescorePoseUnclipped(pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
+        }
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+    _last_ai_latency_ms = ai_ms;
+    _last_total_latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    _last_solve_latency_ms = std::max(0.0, _last_total_latency_ms - _last_ai_latency_ms);
     return pose;
 }
 
 std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::Mat& rgb,
                                                                      const cv::Mat& depth_z16,
-                                                                     const CameraIntrinsics& intr)
+                                                                     const CameraIntrinsics& intr,
+                                                                     const cv::Rect& roi_hint)
 {
+    auto t_start = std::chrono::steady_clock::now();
     std::vector<ObjectPose> results;
+    _last_valid_depth_pts = 0;
+    _last_floor_locked = false;
+    _last_floor_pitch_deg = 0.0;
+    _last_sparse_depth_fallback = false;
+    _last_ai_latency_ms = 0.0;
+    _last_solve_latency_ms = 0.0;
+    _last_total_latency_ms = 0.0;
+    _last_segmented_points.clear();
+
     if (!_initialized || depth_z16.empty()) return results;
 
-    SegmentationResult seg_res = _scene_segmenter.segment(depth_z16, intr, cv::Rect(), _num_obs_points);
-    if (!seg_res.valid) return results;
+    SegmentationResult seg_res = _scene_segmenter.segment(depth_z16, intr, roi_hint, _num_obs_points);
+    _last_valid_depth_pts = static_cast<int>(seg_res.dense_object_points.size());
+    _last_floor_locked = (_is_floor_standing && seg_res.floor_detected);
+    _last_floor_pitch_deg = seg_res.floor_pitch_deg;
+    _last_sparse_depth_fallback = (_last_valid_depth_pts >= 20 && _last_valid_depth_pts < 250);
+    _last_segmented_points = seg_res.dense_object_points;
 
-    if (_is_floor_standing || seg_res.multi_clusters.size() <= 1) {
-        ObjectPose single = estimate(rgb, depth_z16, intr);
-        if (single.valid) results.push_back(single);
+    if (!seg_res.valid) {
+        auto t_end = std::chrono::steady_clock::now();
+        _last_total_latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        _last_solve_latency_ms = _last_total_latency_ms;
         return results;
     }
 
-    for (size_t i = 0; i < seg_res.multi_clusters.size(); ++i) {
-        const auto& cl = seg_res.multi_clusters[i];
-        if (cl.points.size() < 20) continue;
+    double total_ai_ms = 0.0;
+    if (_is_floor_standing || !_multi_instance_enabled || seg_res.multi_clusters.size() <= 1) {
+        ObjectPose single = estimateSingleCluster(seg_res.object_points,
+                                                  seg_res.dense_object_points,
+                                                  seg_res.floor_plane,
+                                                  seg_res.floor_detected,
+                                                  seg_res.floor_pitch_deg,
+                                                  rgb, intr, depth_z16.cols, depth_z16.rows, &total_ai_ms);
+        if (single.valid) {
+            if (!_is_floor_standing &&
+                seg_res.foreground_points.size() > static_cast<size_t>(single.valid_depth_pts * 1.18)) {
+                rescorePoseUnclipped(single, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
+            }
+            results.push_back(std::move(single));
+        }
+    } else {
+        const size_t n_try = std::min<size_t>(seg_res.multi_clusters.size(), 36);
+        std::vector<ObjectPose> relaxed_pool;
+        relaxed_pool.reserve(n_try);
+        for (size_t i = 0; i < n_try; ++i) {
+            const auto& cl = seg_res.multi_clusters[i];
+            if (cl.points.size() < 20) continue;
+            const std::vector<cv::Vec3f>& dense_cl = cl.dense_points.empty() ? cl.points : cl.dense_points;
 
-        std::vector<float> obs_desc;
-        if (!runInference(cl.points, obs_desc)) continue;
+            double ai_ms = 0.0;
+            ObjectPose inst_pose = estimateSingleCluster(cl.points,
+                                                         dense_cl,
+                                                         seg_res.floor_plane,
+                                                         false,
+                                                         seg_res.floor_pitch_deg,
+                                                         rgb, intr, depth_z16.cols, depth_z16.rows, &ai_ms);
+            total_ai_ms += ai_ms;
+            if (!inst_pose.valid) continue;
 
-        ObjectPose inst_pose = solveRansacKabsch(cl.points, obs_desc, seg_res.floor_plane, false);
-        if (!inst_pose.valid) continue;
+            ObjectPose strict_pose = inst_pose;
+            if (rescorePoseUnclipped(strict_pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true)) {
+                results.push_back(std::move(strict_pose));
+            } else {
+                rescorePoseUnclipped(inst_pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
+                relaxed_pool.push_back(std::move(inst_pose));
+            }
+        }
+        if (results.empty() && !relaxed_pool.empty()) {
+            results = std::move(relaxed_pool);
+        }
 
-        refineMultiScaleMeshICP(cl.points, inst_pose, intr);
-        refinePoseUniversalCrease2D3D(inst_pose, rgb, intr);
-        inst_pose.bbox_2d = projectCadBoundingBox(inst_pose.R, inst_pose.t, intr,
-                                                  depth_z16.cols, depth_z16.rows, &inst_pose.corners_2d);
-        inst_pose.model_name = _model_name + " #" + std::to_string(i + 1);
-        results.push_back(inst_pose);
+        if (!results.empty()) {
+            std::sort(results.begin(), results.end(), [](const ObjectPose& a, const ObjectPose& b) {
+                const double ra = static_cast<double>(a.confidence) - 2.0 * std::max(0.0, a.rmse_m - 0.015);
+                const double rb = static_cast<double>(b.confidence) - 2.0 * std::max(0.0, b.rmse_m - 0.015);
+                return ra > rb;
+            });
+
+            // 3D NMS to merge duplicate spherical proposals on the same physical object instance
+            const double nms_min_sep = std::max(0.045, 0.35 * _real_bounding_diag_m);
+            std::vector<ObjectPose> nms_kept;
+            nms_kept.reserve(results.size());
+            for (auto& cand : results) {
+                bool dup = false;
+                for (const auto& kept : nms_kept) {
+                    if (cv::norm(cand.t - kept.t) < nms_min_sep) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    nms_kept.push_back(std::move(cand));
+                }
+            }
+            results = std::move(nms_kept);
+
+            const float best_conf = results.front().confidence;
+            if (best_conf >= 0.45f) {
+                const float min_keep_conf = std::max(0.35f, 0.78f * best_conf);
+                results.erase(std::remove_if(results.begin() + 1, results.end(),
+                                             [min_keep_conf](const ObjectPose& p) { return p.confidence < min_keep_conf; }),
+                              results.end());
+            }
+            if (static_cast<int>(results.size()) > _max_instances) {
+                results.resize(static_cast<size_t>(_max_instances));
+            }
+            size_t total_cl_pts = 0;
+            std::vector<cv::Vec3f> combined_seg_pts;
+            for (size_t k = 0; k < results.size(); ++k) {
+                results[k].model_name = _model_name + " #" + std::to_string(k + 1);
+                total_cl_pts += results[k].segmented_points.size();
+                combined_seg_pts.insert(combined_seg_pts.end(),
+                                        results[k].segmented_points.begin(),
+                                        results[k].segmented_points.end());
+            }
+            if (total_cl_pts > 0) {
+                _last_valid_depth_pts = static_cast<int>(total_cl_pts);
+                _last_sparse_depth_fallback = (_last_valid_depth_pts >= 20 && _last_valid_depth_pts < 250);
+                _last_segmented_points = std::move(combined_seg_pts);
+            }
+        }
     }
+
+    auto t_end = std::chrono::steady_clock::now();
+    _last_ai_latency_ms = total_ai_ms;
+    _last_total_latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    _last_solve_latency_ms = std::max(0.0, _last_total_latency_ms - _last_ai_latency_ms);
     return results;
 }
 
