@@ -53,6 +53,8 @@ add_executable(CadViewer
     src/CameraProfileDialog.cpp
     src/MuJoCoSimDialog.h
     src/MuJoCoSimDialog.cpp
+    src/CADSceneSegmenter.h
+    src/CADSceneSegmenter.cpp
 )
 
 target_include_directories(CadViewer PRIVATE 

@@ -236,3 +236,4 @@ if __name__ == "__main__":
 
     cad_target_dir = os.path.join(args.cad_dir, args.cad_name) if not os.path.exists(os.path.join(args.cad_dir, f"{args.cad_name}_mesh.ply")) and os.path.isdir(os.path.join(args.cad_dir, args.cad_name)) else args.cad_dir
     build_cad_profile(cad_target_dir, args.cad_name, args.floor_standing)
+

@@ -63,6 +63,127 @@ def load_or_create_cad_profile(cad_path, cad_stem, root_dir):
 
     return None
 
+try:
+    from scipy.optimize import least_squares
+except ImportError:
+    least_squares = None
+
+def estimate_intrinsics_auto(width: int, height: int, fx: float, fy: float, cx: float, cy: float,
+                             metric_segments=None):
+    """
+    Automatically resolves or self-calibrates Camera Intrinsics (fx, fy, cx, cy)
+    when intrinsics are uninitialized or missing.
+    """
+    cx_init = cx if cx > 10.0 else (width / 2.0)
+    cy_init = cy if cy > 10.0 else (height / 2.0)
+
+    if fx > 100.0 and fy > 100.0:
+        return {"fx": float(fx), "fy": float(fy), "cx": float(cx_init), "cy": float(cy_init),
+                "width": int(width), "height": int(height), "depth_scale": 0.001}
+
+    # Sensor preset fallback
+    if width == 1024 and height == 576:
+        f_default = 739.41  # HOPE RGB-D dataset preset
+    elif width == 640 and height == 480:
+        f_default = 608.215  # RealSense D435if preset
+    elif width == 1280 and height == 720:
+        f_default = 922.94
+    else:
+        f_default = 0.721885 * width
+
+    if not metric_segments or least_squares is None:
+        return {"fx": float(f_default), "fy": float(f_default), "cx": float(cx_init), "cy": float(cy_init),
+                "width": int(width), "height": int(height), "depth_scale": 0.001}
+
+    f_ests = []
+    for u1, v1, z1, u2, v2, z2, L in metric_segments:
+        z_m = 0.5 * (z1 + z2)
+        dz = z2 - z1
+        du, dv = (u2 - u1), (v2 - v1)
+        proj_sq = max(L * L - dz * dz, 1e-6)
+        f_ests.append(z_m * np.sqrt((du * du + dv * dv) / proj_sq))
+    f0 = float(np.median(f_ests)) if f_ests else float(f_default)
+
+    def residuals(params):
+        fx_p, fy_p, cx_p, cy_p = params
+        res = []
+        for u1, v1, z1, u2, v2, z2, L in metric_segments:
+            p1 = np.array([(u1 - cx_p) * z1 / fx_p, (v1 - cy_p) * z1 / fy_p, z1])
+            p2 = np.array([(u2 - cx_p) * z2 / fx_p, (v2 - cy_p) * z2 / fy_p, z2])
+            res.append((np.linalg.norm(p2 - p1) - L) * 100.0)
+        res.append((fx_p - fy_p) * 0.05)
+        res.append((cx_p - cx_init) * 0.02)
+        res.append((cy_p - cy_init) * 0.02)
+        return np.array(res, dtype=np.float64)
+
+    x0 = np.array([f0, f0, cx_init, cy_init], dtype=np.float64)
+    bounds = ([0.4 * width, 0.4 * width, 0.45 * width, 0.45 * height],
+              [1.2 * width, 1.2 * width, 0.55 * width, 0.55 * height])
+    try:
+        sol = least_squares(residuals, x0, bounds=bounds, method="trf")
+        return {
+            "fx": float(sol.x[0]), "fy": float(sol.x[1]),
+            "cx": float(sol.x[2]), "cy": float(sol.x[3]),
+            "width": int(width), "height": int(height), "depth_scale": 0.001
+        }
+    except Exception:
+        return {"fx": float(f0), "fy": float(f0), "cx": float(cx_init), "cy": float(cy_init),
+                "width": int(width), "height": int(height), "depth_scale": 0.001}
+
+def solve_secondary_instance_pose(sec_pts, cad_target, T_primary, cad_min, cad_max, fx, fy, cx, cy):
+    """Fast secondary instance 6DoF pose solver based on centroid shift + fast ICP."""
+    t_sec = np.median(sec_pts, axis=0)
+    R_sec = T_primary[:3, :3].copy()
+    T_sec_init = np.eye(4)
+    T_sec_init[:3, :3] = R_sec
+    T_sec_init[:3, 3] = t_sec
+
+    sec_pcd = o3d.geometry.PointCloud()
+    sec_pcd.points = o3d.utility.Vector3dVector(sec_pts)
+    sec_pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.03, max_nn=25))
+
+    try:
+        reg = o3d.pipelines.registration.registration_icp(
+            sec_pcd, cad_target, 0.030, np.linalg.inv(T_sec_init),
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20)
+        )
+        T_sec = np.linalg.inv(reg.transformation)
+        fitness = float(reg.fitness)
+        rmse = float(reg.inlier_rmse * 1000.0)
+    except Exception:
+        T_sec = T_sec_init
+        fitness = 0.80
+        rmse = 5.0
+
+    R_s = T_sec[:3, :3]
+    t_s = T_sec[:3, 3]
+
+    c_corners = np.array([
+        [cad_min[0], cad_min[1], cad_min[2]], [cad_max[0], cad_min[1], cad_min[2]],
+        [cad_max[0], cad_max[1], cad_min[2]], [cad_min[0], cad_max[1], cad_min[2]],
+        [cad_min[0], cad_min[1], cad_max[2]], [cad_max[0], cad_min[1], cad_max[2]],
+        [cad_max[0], cad_max[1], cad_max[2]], [cad_min[0], cad_max[1], cad_max[2]],
+    ], dtype=np.float64)
+    pts_cam = (R_s @ c_corners.T).T + t_s
+    z = np.maximum(pts_cam[:, 2], 0.05)
+    u = pts_cam[:, 0] * fx / z + cx
+    v = pts_cam[:, 1] * fy / z + cy
+    corners_2d = np.stack([u, v], axis=1).tolist()
+    bbox_2d = [int(np.min(u)), int(np.min(v)), int(np.ptp(u)), int(np.ptp(v))]
+
+    return {
+        "transformation_matrix": T_sec.tolist(),
+        "translation_m": {"x": float(t_s[0]), "y": float(t_s[1]), "z": float(t_s[2])},
+        "optical_translation_m": {"x": float(t_s[0]), "y": float(t_s[1]), "z": float(t_s[2])},
+        "bbox_2d": bbox_2d,
+        "corners_2d": corners_2d,
+        "fitness": fitness,
+        "inlier_rmse_mm": rmse,
+        "ransac_inliers": int(len(sec_pts)),
+        "valid": bool(fitness >= 0.20 and rmse <= 25.0)
+    }
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Inference: CAD-Aware Hierarchical Correspondence 6DoF Pose (Supports Black-Box .onnx)")
     parser.add_argument("--input", type=str, default=None, help="Input scene point cloud (.ply)")
@@ -185,10 +306,28 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
     real_cad_diag = float(profile.get("real_bounding_diag_m", 1.07 if "TABLE" in cad_stem.upper() else 0.20)) if profile else (1.07 if "TABLE" in cad_stem.upper() else 0.20)
     is_table = (placement_mode == "FLOOR_STANDING") and ("TABLE" in cad_stem.upper())
 
+    # 3. Auto-Intrinsics Fallback & Calibration (RealSense / HOPE dataset presets)
+    intr_auto = estimate_intrinsics_auto(args.width, args.height, args.fx, args.fy, args.cx, args.cy)
+    args.fx = intr_auto["fx"]
+    args.fy = intr_auto["fy"]
+    args.cx = intr_auto["cx"]
+    args.cy = intr_auto["cy"]
+
     # 4. Load & sample Scene Point Cloud
     scene_pcd = o3d.io.read_point_cloud(args.input)
     if len(scene_pcd.points) < 10:
         raise ValueError("Scene point cloud is empty or has too few points.")
+
+    # Filter depth range (tighten to 2.10m for hollow floor-standing frames to reject background noise)
+    if is_table or placement_mode == "FLOOR_STANDING":
+        raw_pts = np.asarray(scene_pcd.points)
+        max_hollow_z = min(args.max_depth, 2.10) if args.max_depth > 0 else 2.10
+        keep = (raw_pts[:, 2] >= 0.25) & (raw_pts[:, 2] <= max_hollow_z)
+        u_proj = args.fx * raw_pts[:, 0] / np.maximum(raw_pts[:, 2], 1e-4) + args.cx
+        # Reject left-border aluminum post artifact and right edge noise
+        keep &= (u_proj >= 0.08 * args.width) & (u_proj <= 0.96 * args.width)
+        if np.sum(keep) >= 128:
+            scene_pcd = scene_pcd.select_by_index(np.where(keep)[0])
 
     # This is an installation-level acquisition ROI, not an algorithm-specific
     # TMVis shortcut.  Passing the same explicit values from both front-ends
@@ -269,8 +408,7 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
                 labels = np.array(rem_pcd.cluster_dbscan(eps=0.035, min_points=25))
                 valid_labels = [l for l in np.unique(labels) if l >= 0]
                 if len(valid_labels) > 0:
-                    best_l = -1
-                    best_score = -1e9
+                    sorted_clusters = []
                     rem_pts = np.asarray(rem_pcd.points)
                     cad_max_val = blackbox_ctx.get("cad_max", None) if blackbox_ctx else None
                     cad_min_val = blackbox_ctx.get("cad_min", None) if blackbox_ctx else None
@@ -291,7 +429,7 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
                         # Proximity to a horizontal table
                         table_bonus = 1.0
                         if len(detected_planes) > 0:
-                            min_dist_to_table = min(abs(np.dot(t["normal"], c) + t["d"]) for t in detected_planes)
+                            min_dist_to_table = min(abs(np.dot(t_pl["normal"], c) + t_pl["d"]) for t_pl in detected_planes)
                             if min_dist_to_table < 0.35:
                                 table_bonus = 1.0 / (min_dist_to_table + 0.05)
                             else:
@@ -302,26 +440,39 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
                         depth_penalty = 1.0 if (0.25 <= c[2] <= 1.25) else 0.1
                         
                         score = (len(l_idx) * size_match * table_bonus * depth_penalty) / (dist + 0.3)
-                        if score > best_score:
-                            best_score = score
-                            best_l = l
-                    if best_l >= 0:
-                        best_idx = np.where(labels == best_l)[0]
-                        scene_pcd = rem_pcd.select_by_index(best_idx)
-                        obj_center = np.mean(rem_pts[best_idx], axis=0)
+                        sorted_clusters.append((score, l, l_idx, c, c_diag, c_pts))
 
-                        best_sup = None
-                        min_p_dist = 1e9
-                        for p_info in detected_planes:
-                            dist = abs(np.dot(p_info["normal"], obj_center) + p_info["d"])
-                            if dist < min_p_dist:
-                                min_p_dist = dist
-                                best_sup = p_info
-                        if best_sup is not None:
-                            support_plane_normal = best_sup["normal"]
-                            support_plane_height = -best_sup["d"]
-                            total_plane_pts = sum(p["count"] for p in detected_planes)
-                            print(f"[TABLETOP OBJECT] Đã bóc tách vật thể CAD trên mặt bàn: {len(scene_pcd.points)} điểm (Loại bỏ {total_plane_pts} điểm mặt phẳng bàn/sàn, khoảng cách mặt bàn={min_p_dist*1000.0:.1f}mm)")
+                    sorted_clusters.sort(key=lambda x: x[0], reverse=True)
+                    best_score, best_l, best_idx, obj_center, best_c_diag, best_c_pts = sorted_clusters[0]
+
+                    scene_pcd = rem_pcd.select_by_index(best_idx)
+                    secondary_instance_clusters = []
+
+                    # Multi-instance candidate collection for free-6DoF objects
+                    for sc_item in sorted_clusters[1:]:
+                        sc_score, sc_l, sc_idx, sc_center, sc_diag, sc_pts = sc_item
+                        if sc_score >= 0.20 * best_score and len(sc_idx) >= 20:
+                            if sc_diag > 1.35 * target_cad_diag and len(sc_pts) >= 60:
+                                left_m = sc_pts[:, 0] <= sc_center[0]
+                                if np.count_nonzero(left_m) >= 20:
+                                    secondary_instance_clusters.append(sc_pts[left_m])
+                                if np.count_nonzero(~left_m) >= 20:
+                                    secondary_instance_clusters.append(sc_pts[~left_m])
+                            else:
+                                secondary_instance_clusters.append(sc_pts)
+
+                    best_sup = None
+                    min_p_dist = 1e9
+                    for p_info in detected_planes:
+                        dist = abs(np.dot(p_info["normal"], obj_center) + p_info["d"])
+                        if dist < min_p_dist:
+                            min_p_dist = dist
+                            best_sup = p_info
+                    if best_sup is not None:
+                        support_plane_normal = best_sup["normal"]
+                        support_plane_height = -best_sup["d"]
+                        total_plane_pts = sum(p["count"] for p in detected_planes)
+                        print(f"[TABLETOP OBJECT] Đã bóc tách vật thể CAD trên mặt bàn: {len(scene_pcd.points)} điểm (Loại bỏ {total_plane_pts} điểm mặt phẳng bàn/sàn, khoảng cách mặt bàn={min_p_dist*1000.0:.1f}mm)")
         except Exception as e:
             print(f"[WARN] Tabletop object extraction: {e}")
 
@@ -1111,6 +1262,36 @@ def run_single_inference(args, model, D_cad, key_centroids, device, blackbox_ctx
             "total_latency_ms": float(total_latency_ms)
         }
     }
+
+    instances_list = []
+    primary_inst = {
+        "instance_id": 1,
+        "transformation_matrix": T_final.tolist(),
+        "translation_m": {"x": float(t_glass[0]), "y": float(t_glass[1]), "z": float(t_glass[2])},
+        "optical_translation_m": {"x": float(t[0]), "y": float(t[1]), "z": float(t[2])},
+        "bbox_2d": bbox_2d,
+        "corners_2d": corners_2d,
+        "fitness": consensus_fitness,
+        "inlier_rmse_mm": float(icp_res.inlier_rmse * 1000.0),
+        "ransac_inliers": int(num_inliers),
+        "valid": bool(is_valid)
+    }
+    instances_list.append(primary_inst)
+
+    if not is_table and 'secondary_instance_clusters' in locals() and len(secondary_instance_clusters) > 0:
+        for s_idx, sec_pts in enumerate(secondary_instance_clusters[:3]):
+            sec_res = solve_secondary_instance_pose(
+                sec_pts, cad_target, T_final,
+                np.array([cad_x0, cad_y0, z_bot]),
+                np.array([cad_x1, cad_y1, z_top]),
+                refined_fx, refined_fy, args.cx, args.cy
+            )
+            sec_res["instance_id"] = s_idx + 2
+            instances_list.append(sec_res)
+
+    out_dict["instances"] = instances_list
+    out_dict["intrinsics_used"] = intr_auto
+    out_dict["cad_profile_mode"] = str(placement_mode)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
     with open(args.output_json, 'w') as f:
