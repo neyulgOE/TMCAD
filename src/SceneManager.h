@@ -36,6 +36,9 @@ public:
                        const std::string& samplingMethod = "");
 
     void removeObject(int id);
+    void removeObjectAndCache(int id);
+    void clearInferenceOverlays();
+    void clearAllAndResetCache();
     SceneObject* getObject(int id);
     const std::vector<std::unique_ptr<SceneObject>>& objects() const { return objects_; }
 

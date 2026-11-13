@@ -4,6 +4,8 @@
 #include <GLFW/glfw3.h>
 #include <EGL/egl.h>
 #include <open3d/Open3D.h>
+#include <opencv2/core.hpp>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <fstream>
@@ -1002,15 +1004,23 @@ bool MuJoCoD435SimSource::grabFrame(RGBDFrame& outFrame) {
     // Đọc RGB và Depth buffers
     mjr_readPixels(impl_->rgbBuffer.data(), impl_->depthBuffer.data(), viewport, &(impl_->con));
 
-    // Tạo đối tượng Open3D Images
+    // Tạo đối tượng Open3D Images (dùng cv::flip SIMD thay vòng lặp 2 chiều)
+    cv::Mat rawRgb(h, w, CV_8UC3, impl_->rgbBuffer.data());
+    cv::Mat flippedRgb;
+    cv::flip(rawRgb, flippedRgb, 0);
+
     auto colorImg = std::make_shared<open3d::geometry::Image>();
     colorImg->Prepare(w, h, 3, 1); // 3 channels, 8-bit unsigned char
+    std::memcpy(colorImg->data_.data(), flippedRgb.data, static_cast<size_t>(w * h * 3));
+
+    cv::Mat rawDepth(h, w, CV_32FC1, impl_->depthBuffer.data());
+    cv::Mat flippedDepth;
+    cv::flip(rawDepth, flippedDepth, 0);
 
     auto depthImg = std::make_shared<open3d::geometry::Image>();
     depthImg->Prepare(w, h, 1, 2); // 1 channel, 16-bit uint16
-
-    uint8_t* colorData = colorImg->data_.data();
     uint16_t* depthData = reinterpret_cast<uint16_t*>(depthImg->data_.data());
+    const float* srcDepth = reinterpret_cast<const float*>(flippedDepth.data);
 
     float extent = impl_->m->stat.extent;
     float zNear = impl_->m->vis.map.znear * extent;
@@ -1025,32 +1035,17 @@ bool MuJoCoD435SimSource::grabFrame(RGBDFrame& outFrame) {
         printedDepthStats = true;
     }
 
-    // OpenGL render lộn ngược từ dưới lên (row 0 ở đáy), cần lật lại theo trục dọc (flip Y)
-    for (int y = 0; y < h; ++y) {
-        int srcRow = (h - 1 - y);
-        for (int x = 0; x < w; ++x) {
-            int srcIdx = srcRow * w + x;
-            int dstIdx = y * w + x;
-
-            // 1. Copy RGB
-            colorData[dstIdx * 3 + 0] = impl_->rgbBuffer[srcIdx * 3 + 0]; // R
-            colorData[dstIdx * 3 + 1] = impl_->rgbBuffer[srcIdx * 3 + 1]; // G
-            colorData[dstIdx * 3 + 2] = impl_->rgbBuffer[srcIdx * 3 + 2]; // B
-
-            // 2. Tuyến tính hóa Depth Buffer
-            float zNorm = impl_->depthBuffer[srcIdx];
-            if (zNorm >= 0.9999f || zNorm <= 0.0f) {
-                depthData[dstIdx] = 0; // Invalid / Sky / Beyond range
+    const int totalPixels = w * h;
+    for (int i = 0; i < totalPixels; ++i) {
+        float zNorm = srcDepth[i];
+        if (zNorm >= 0.9999f || zNorm <= 0.0f) {
+            depthData[i] = 0; // Invalid / Sky / Beyond range
+        } else {
+            float zMeters = (zNear * zFar) / (zFar - zNorm * (zFar - zNear));
+            if (zMeters < 0.12f || zMeters > 3.5f) {
+                depthData[i] = 0;
             } else {
-                float zMeters = (zNear * zFar) / (zFar - zNorm * (zFar - zNear));
-                
-                // Giới hạn tầm đo D435if (0.12m - 3.5m)
-                if (zMeters < 0.12f || zMeters > 3.5f) {
-                    depthData[dstIdx] = 0;
-                } else {
-                    uint16_t depthMm = static_cast<uint16_t>(std::clamp(zMeters * 1000.0f, 0.0f, 65535.0f));
-                    depthData[dstIdx] = depthMm;
-                }
+                depthData[i] = static_cast<uint16_t>(std::clamp(zMeters * 1000.0f + 0.5f, 0.0f, 65535.0f));
             }
         }
     }

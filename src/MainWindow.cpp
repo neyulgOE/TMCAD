@@ -31,6 +31,7 @@
 #include <QTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QShortcut>
 #include <QLabel>
 #include <QLineEdit>
 #include <QInputDialog>
@@ -1119,14 +1120,36 @@ void MainWindow::buildUi() {
 
     removeSelectedBtn_ = new QPushButton("🗑️", step1Box);
     removeSelectedBtn_->setFixedWidth(30);
-    removeSelectedBtn_->setToolTip("Xóa đối tượng đang chọn khỏi cảnh");
+    removeSelectedBtn_->setToolTip("Xóa đối tượng đang chọn khỏi cảnh và dọn cache");
     removeSelectedBtn_->setStyleSheet("QPushButton { background: #263238; color: #ff8a80; padding: 4px; border-radius: 4px; }");
-    connect(removeSelectedBtn_, &QPushButton::clicked, this, &MainWindow::onRemoveSelected);
+    connect(removeSelectedBtn_, &QPushButton::clicked, this, &MainWindow::onRemoveSelectedCadObject);
 
     step1SubLayout->addWidget(generateDatasetBtn_, 1);
     step1SubLayout->addWidget(exportRknnBtn_, 1);
     step1SubLayout->addWidget(removeSelectedBtn_);
     step1Layout->addLayout(step1SubLayout);
+
+    QHBoxLayout* step1TaskLayout = new QHBoxLayout();
+    replaceCadBtn_ = new QPushButton("🔄 Đổi CAD Mới...", step1Box);
+    replaceCadBtn_->setCursor(Qt::PointingHandCursor);
+    replaceCadBtn_->setToolTip("Dừng tác vụ cũ, xóa cảnh hiện tại và nạp file CAD mới");
+    replaceCadBtn_->setStyleSheet(
+        "QPushButton { background: #1e293b; color: #7dd3fc; padding: 4px 6px; border-radius: 4px; font-size: 11px; }"
+        "QPushButton:hover { background: #334155; color: white; }");
+    connect(replaceCadBtn_, &QPushButton::clicked, this, &MainWindow::onReplaceActiveCadObject);
+
+    resetSessionBtn_ = new QPushButton("🧹 Reset Tác Vụ", step1Box);
+    resetSessionBtn_->setCursor(Qt::PointingHandCursor);
+    resetSessionBtn_->setToolTip("Dừng MuJoCo, AI Daemon và xóa overlay kết quả (Ctrl+Shift+R)");
+    resetSessionBtn_->setStyleSheet(
+        "QPushButton { background: #3b1f2b; color: #fda4af; padding: 4px 6px; border-radius: 4px; font-size: 11px; }"
+        "QPushButton:hover { background: #581c36; color: white; }");
+    connect(resetSessionBtn_, &QPushButton::clicked, this, &MainWindow::onResetAllTasksAndSession);
+    new QShortcut(QKeySequence("Ctrl+Shift+R"), this, SLOT(onResetAllTasksAndSession()));
+
+    step1TaskLayout->addWidget(replaceCadBtn_, 1);
+    step1TaskLayout->addWidget(resetSessionBtn_, 1);
+    step1Layout->addLayout(step1TaskLayout);
 
     leftLayout->addWidget(step1Box);
 
@@ -1466,6 +1489,7 @@ void MainWindow::buildUi() {
 
 MainWindow::~MainWindow() {
     autoBuildCanceled_.store(true);
+    stopMuJoCoSimulation();
     if (autoBuildProcess_) {
         if (autoBuildProcess_->state() != QProcess::NotRunning) {
             autoBuildProcess_->kill();
@@ -1642,6 +1666,7 @@ void MainWindow::onActiveOnnxModelSwitched(const QString& onnxPath) {
     if (!universalPoseEstimator_) {
         universalPoseEstimator_ = std::make_unique<tmcad::UniversalPoseEstimator>();
     }
+    liveLoadedOnnxPath_.clear();
     stopAiDaemon();
 
     const bool ok = universalPoseEstimator_->loadModelOnnx(onnxPath.toStdString());
@@ -4360,7 +4385,7 @@ void MainWindow::onDetectOnImage() {
 
     QListWidgetItem* item = objectList_->currentItem();
     if (!item && objectList_->count() > 0) {
-        item = objectList_->item(0);
+        item = objectList_->item(objectList_->count() - 1);
         objectList_->setCurrentItem(item);
     }
 
@@ -6869,7 +6894,8 @@ void MainWindow::onStartMuJoCoSimulation() {
     QString activeCadPath;
     QListWidgetItem* item = objectList_ ? objectList_->currentItem() : nullptr;
     if (!item && objectList_ && objectList_->count() > 0) {
-        item = objectList_->item(0);
+        item = objectList_->item(objectList_->count() - 1);
+        objectList_->setCurrentItem(item);
     }
     if (item) {
         int id = item->data(Qt::UserRole).toInt();
@@ -6972,19 +6998,21 @@ void MainWindow::onStartMuJoCoSimulation() {
         }
     }
 
-    // 3. Khởi tạo vòng lặp mô phỏng thời gian thực 30 FPS
+    // 3. Khởi tạo vòng lặp render 60 FPS (AI chạy ngầm bất đồng bộ mỗi 4 nhịp)
     if (!muJoCoSimTimer_) {
         muJoCoSimTimer_ = new QTimer(this);
         connect(muJoCoSimTimer_, &QTimer::timeout, this, &MainWindow::onMuJoCoSimTick);
     }
     muJoCoFrameSkip_ = 0;
+    muJoCoTickCounter_ = 0;
     isMuJoCoInferencing_ = false;
-    muJoCoSimTimer_->start(33); // ~30 FPS
+    asyncWorkerBusy_.store(false);
+    muJoCoSimTimer_->start(16); // ~60 FPS render
 
     pipelineLog(QString("🎮 [MUJOCO DUAL VIEW] Đã khởi chạy mô phỏng tương tác 2 bên song song:"));
-    pipelineLog(QString("   📍 Bên Trái: TMCAD Camera Stream HUD (RGB-D + AI 6DoF Tracking)"));
+    pipelineLog(QString("   📍 Bên Trái: TMCAD Camera Stream HUD (RGB-D + Async C++ 6DoF Tracking)"));
     pipelineLog(QString("   📍 Bên Phải: Cửa sổ MuJoCo 3D Interactive (Chuột phải: Xoay | Chuột trái: Pan | Giữ Ctrl: Kéo/Xoay CAD | Space: Auto-spin)"));
-    statusBar()->showMessage("Mô phỏng MuJoCo 3D Interactive đang chạy song song 2 bên (30 FPS)...", 8000);
+    statusBar()->showMessage("Mô phỏng MuJoCo 3D Interactive đang chạy (60 FPS render / Async AI)...", 8000);
 }
 
 void MainWindow::onMuJoCoSimTick() {
@@ -6993,61 +7021,116 @@ void MainWindow::onMuJoCoSimTick() {
         return;
     }
 
-    // 1. Xử lý chuột/phím và cập nhật khung nhìn 3D của MuJoCo
+    // 1. Luôn cập nhật xoay chuột & vẽ cửa sổ 3D MuJoCo ngay lập tức (Mượt 60 FPS)
     if (!activeMuJoCoSim_->pollInteractiveEvents()) {
         stopMuJoCoSimulation();
         return;
     }
+    ++muJoCoTickCounter_;
 
-    // 2. Lấy khung hình từ Camera ảo RealSense D435if
+    // 2. Nếu luồng AI ngầm vừa tính xong kết quả của frame trước -> Cập nhật HUD ngay (0ms block)
+    if (asyncWorkerBusy_.load() &&
+        asyncMuJoCoPoseFuture_.valid() &&
+        asyncMuJoCoPoseFuture_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+
+        tmcad::ObjectPose pose = asyncMuJoCoPoseFuture_.get();
+        asyncWorkerBusy_.store(false);
+
+        if (liveCameraStreamWidget_ && liveCppEstimator_) {
+            if (pose.valid) {
+                QString telemetry = QString("Pose6DoF | %1 | t=(%2, %3, %4)m | Yaw=%5° | RMSE=%6mm")
+                    .arg(QString::fromStdString(pose.model_name))
+                    .arg(pose.t[0], 0, 'f', 2)
+                    .arg(pose.t[1], 0, 'f', 2)
+                    .arg(pose.t[2], 0, 'f', 2)
+                    .arg(pose.yaw_deg, 0, 'f', 1)
+                    .arg(pose.rmse_m * 1000.0, 0, 'f', 1);
+                liveCameraStreamWidget_->setUniversalPoseOverlays(
+                    {pose}, *liveCppEstimator_, lastAsyncIntr_, telemetry, "MuJoCo_Live_D435if");
+            } else {
+                liveCameraStreamWidget_->clearOverlayDetection();
+            }
+        }
+
+        if (pose.valid) {
+            statusBar()->showMessage(
+                QString("🎯 [MuJoCo Live 6DoF] %1 | X:%2m Y:%3m Z:%4m | Yaw:%5° | RMSE:%6mm")
+                .arg(QString::fromStdString(pose.model_name))
+                .arg(pose.t[0], 0, 'f', 2)
+                .arg(pose.t[1], 0, 'f', 2)
+                .arg(pose.t[2], 0, 'f', 2)
+                .arg(pose.yaw_deg, 0, 'f', 1)
+                .arg(pose.rmse_m * 1000.0, 0, 'f', 1));
+        }
+    }
+
+    // 3. Chỉ chụp frame và đẩy vào luồng AI ngầm mỗi 4 nhịp (~15 FPS cho AI) khi worker đang rảnh
+    if (asyncWorkerBusy_.load() || (muJoCoTickCounter_ % 4 != 0)) {
+        return;
+    }
+
     RGBDFrame simFrame;
     if (!activeMuJoCoSim_->grabFrame(simFrame) || !simFrame.valid()) {
         return;
     }
 
     CameraIntrinsics intr = activeMuJoCoSim_->intrinsics();
+    const int w = simFrame.color->width_;
+    const int h = simFrame.color->height_;
 
-    // 3. Hiển thị lên CameraStreamWidget
     if (liveCameraStreamWidget_) {
-        QImage qColor(simFrame.color->data_.data(), simFrame.color->width_, simFrame.color->height_,
-                      simFrame.color->width_ * 3, QImage::Format_RGB888);
-        QImage qDepth(simFrame.depth->width_, simFrame.depth->height_, QImage::Format_Grayscale8);
+        QImage qColor(simFrame.color->data_.data(), w, h, w * 3, QImage::Format_RGB888);
+        QImage qDepth(w, h, QImage::Format_Grayscale8);
         const uint16_t* depth16 = reinterpret_cast<const uint16_t*>(simFrame.depth->data_.data());
         uint8_t* depth8 = qDepth.bits();
-        int numPixels = simFrame.depth->width_ * simFrame.depth->height_;
+        const int numPixels = w * h;
         for (int i = 0; i < numPixels; ++i) {
             depth8[i] = static_cast<uint8_t>(std::clamp(depth16[i] / 15, 0, 255));
         }
-
         Eigen::Matrix3d gtR;
         Eigen::Vector3d gtt;
         activeMuJoCoSim_->getGroundTruthPose(gtR, gtt);
-
         liveCameraStreamWidget_->displayStaticRGBDFrame(qColor.copy(), qDepth.copy(), static_cast<float>(gtt.z()));
     }
 
-    // 4. Chạy nhận diện AI (bước đệm 2 tick ~ 15 FPS để nhẹ máy tối đa)
-    ++muJoCoFrameSkip_;
-    if (muJoCoFrameSkip_ >= 2 && !isMuJoCoInferencing_) {
-        isMuJoCoInferencing_ = true;
-
-        Eigen::Matrix3d gtR;
-        Eigen::Vector3d gtt;
-        activeMuJoCoSim_->getGroundTruthPose(gtR, gtt);
-
-        Eigen::Matrix4d gtPose = Eigen::Matrix4d::Identity();
-        gtPose.block<3, 3>(0, 0) = gtR;
-        gtPose.block<3, 1>(0, 3) = gtt;
-
-        runPoseEstimationAI(simFrame, intr, &gtPose, "MuJoCo_Live_D435if");
-        isMuJoCoInferencing_ = false;
+    std::string desiredOnnx = selectedOnnxPath().toStdString();
+    if (desiredOnnx.empty()) {
+        return;
     }
+    if (!liveCppEstimator_) {
+        liveCppEstimator_ = std::make_unique<tmcad::UniversalPoseEstimator>();
+    }
+    if (desiredOnnx != liveLoadedOnnxPath_) {
+        if (liveCppEstimator_->loadModelOnnx(desiredOnnx)) {
+            liveLoadedOnnxPath_ = desiredOnnx;
+        } else {
+            return;
+        }
+    }
+
+    cv::Mat rgbMat(h, w, CV_8UC3, simFrame.color->data_.data());
+    cv::Mat depthZ16(h, w, CV_16UC1, simFrame.depth->data_.data());
+    cv::Mat rgbCopy = rgbMat.clone();
+    cv::Mat depthCopy = depthZ16.clone();
+    lastAsyncIntr_ = intr;
+
+    // Chạy suy luận C++ trên background thread (không khóa luồng giao diện Qt)
+    asyncWorkerBusy_.store(true);
+    asyncMuJoCoPoseFuture_ = std::async(std::launch::async,
+        [this, rgbCopy, depthCopy, intr]() -> tmcad::ObjectPose {
+            return liveCppEstimator_->estimate(rgbCopy, depthCopy, intr);
+        });
 }
 
 void MainWindow::stopMuJoCoSimulation() {
     if (muJoCoSimTimer_ && muJoCoSimTimer_->isActive()) {
         muJoCoSimTimer_->stop();
     }
+    if (asyncMuJoCoPoseFuture_.valid()) {
+        asyncMuJoCoPoseFuture_.wait();
+    }
+    asyncWorkerBusy_.store(false);
+    isMuJoCoInferencing_.store(false);
     if (activeMuJoCoSim_) {
         activeMuJoCoSim_->closeInteractiveWindow();
         activeMuJoCoSim_->close();
@@ -7055,5 +7138,84 @@ void MainWindow::stopMuJoCoSimulation() {
     }
     pipelineLog("⏹️ [MUJOCO SIMULATION] Đã dừng mô phỏng tương tác MuJoCo.");
     statusBar()->showMessage("Đã dừng mô phỏng MuJoCo.", 4000);
+}
+
+void MainWindow::onRemoveSelectedCadObject() {
+    if (!objectList_) return;
+    QListWidgetItem* item = objectList_->currentItem();
+    if (!item && objectList_->count() > 0) {
+        item = objectList_->item(objectList_->count() - 1);
+    }
+    if (!item) {
+        statusBar()->showMessage("Chưa chọn mô hình nào để xóa.", 3000);
+        return;
+    }
+
+    const int id = item->data(Qt::UserRole).toInt();
+    const QString name = item->text();
+    stopAiDaemon();
+
+    viewport_->makeCurrent();
+    scene_->clearInferenceOverlays();
+    scene_->removeObjectAndCache(id);
+    viewport_->doneCurrent();
+
+    if (objectList_->count() > 0) {
+        objectList_->setCurrentRow(objectList_->count() - 1);
+    }
+    viewport_->update();
+    syncPropertiesUi();
+    pipelineLog(QString("🗑️ [SCENE] Đã xóa mô hình CAD '%1' và dọn bộ nhớ đệm.").arg(name));
+    statusBar()->showMessage("Đã xóa: " + name, 3000);
+}
+
+void MainWindow::onReplaceActiveCadObject() {
+    QDir tmcadDir(QCoreApplication::applicationDirPath());
+    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
+
+    QString path = QFileDialog::getOpenFileName(
+        this, "Chọn Mô Hình CAD Mới (.stl *.obj *.ply)",
+        tmcadDir.absoluteFilePath("CAD_DATA"),
+        "CAD Mesh (*.stl *.STL *.obj *.OBJ *.ply *.PLY);;All files (*)");
+    if (path.isEmpty()) return;
+
+    stopMuJoCoSimulation();
+    stopAiDaemon();
+
+    viewport_->makeCurrent();
+    scene_->clearAllAndResetCache();
+    viewport_->doneCurrent();
+
+    scene_->addFile(path.toStdString());
+    if (objectList_ && objectList_->count() > 0) {
+        objectList_->setCurrentRow(objectList_->count() - 1);
+    }
+    viewport_->frameAll();
+    syncPropertiesUi();
+
+    pipelineLog(QString("🔄 [REPLACE CAD] Đã thay thế và chuyển sang mô hình CAD mới: %1")
+                .arg(QFileInfo(path).fileName()));
+}
+
+void MainWindow::onResetAllTasksAndSession() {
+    stopMuJoCoSimulation();
+    stopAiDaemon();
+
+    if (liveCppEstimator_) {
+        liveCppEstimator_.reset();
+        liveLoadedOnnxPath_.clear();
+    }
+
+    viewport_->makeCurrent();
+    scene_->clearInferenceOverlays();
+    viewport_->doneCurrent();
+    if (liveCameraStreamWidget_) {
+        liveCameraStreamWidget_->clearOverlayDetection();
+    }
+    viewport_->update();
+    syncPropertiesUi();
+
+    pipelineLog("🧹 [RESET SESSION] Đã dừng toàn bộ tác vụ ngầm và dọn sạch kết quả cũ!");
+    statusBar()->showMessage("Đã reset toàn bộ tác vụ. Bạn có thể chọn CAD hoặc ONNX mới ngay lập tức.", 5000);
 }
 

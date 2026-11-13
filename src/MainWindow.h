@@ -33,6 +33,8 @@ class CameraProfileDialog;
 #include "CameraHardwareProfile.h"
 #include <QProcess>
 #include <QProgressDialog>
+#include <future>
+#include <atomic>
 #include <QTimer>
 #include <QSlider>
 #include <atomic>
@@ -257,6 +259,9 @@ private slots:
 
     void onQuickLoadCad(const QString& cadName);
     void onClearAllObjects();
+    void onRemoveSelectedCadObject();
+    void onReplaceActiveCadObject();
+    void onResetAllTasksAndSession();
     void loadRealSenseBagFile(const QString& bagPath);
     void onOpenBagForStepping();
     void stepNextBagFrame();
@@ -432,6 +437,14 @@ private:
     QTimer* muJoCoSimTimer_ = nullptr;
     std::atomic<bool> isMuJoCoInferencing_{false};
     int muJoCoFrameSkip_ = 0;
+    std::unique_ptr<tmcad::UniversalPoseEstimator> liveCppEstimator_;
+    std::string liveLoadedOnnxPath_;
+    std::future<tmcad::ObjectPose> asyncMuJoCoPoseFuture_;
+    std::atomic<bool> asyncWorkerBusy_{false};
+    int muJoCoTickCounter_{0};
+    CameraIntrinsics lastAsyncIntr_;
+    QPushButton* replaceCadBtn_ = nullptr;
+    QPushButton* resetSessionBtn_ = nullptr;
     void onMuJoCoSimTick();
     void stopMuJoCoSimulation();
     CameraHardwareProfile currentCamProfile_;

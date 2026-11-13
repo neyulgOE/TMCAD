@@ -214,3 +214,44 @@ const CADAsset& SceneManager::getOrProcessCADAsset(const std::string& path) {
     auto [insertedIt, ok] = cadAssetCache_.emplace(path, std::move(asset));
     return insertedIt->second;
 }
+
+void SceneManager::removeObjectAndCache(int id) {
+    SceneObject* obj = getObject(id);
+    if (obj) {
+        const std::string& path = obj->filePath();
+        if (!path.empty()) {
+            cadAssetCache_.erase(path);
+        }
+    }
+    removeObject(id);
+}
+
+void SceneManager::clearInferenceOverlays() {
+    std::vector<int> idsToRemove;
+    for (const auto& obj : objects_) {
+        if (!obj) continue;
+        const std::string& n = obj->name();
+        if (obj->type() != SceneObjectType::Mesh ||
+            n == "ONNX CAD Surface" ||
+            n == "Aligned Scene Points" ||
+            n == "Scene Cloud" ||
+            n == "Segmented Object" ||
+            n == "Camera Frustum" ||
+            n.find("Aligned") != std::string::npos ||
+            n.find("Overlay") != std::string::npos ||
+            n.find("Cloud") != std::string::npos) {
+            idsToRemove.push_back(obj->id());
+        }
+    }
+    for (int id : idsToRemove) {
+        removeObject(id);
+    }
+}
+
+void SceneManager::clearAllAndResetCache() {
+    cadAssetCache_.clear();
+    pendingUpload_.clear();
+    objects_.clear();
+    emit objectListChanged();
+    emit sceneChanged();
+}
