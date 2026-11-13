@@ -943,7 +943,16 @@ bool MuJoCoD435SimSource::loadTargetMesh(const std::string& objPath,
         impl_->targetSize = impl_->targetMaxBound - impl_->targetMinBound;
 
         const bool tooManyFaces = (mesh->triangles_.size() > 95000);
-        if (ext == ".ply" || isAsciiStl || tooManyFaces || !mesh->HasTriangles()) {
+        if (ext == ".ply" || isAsciiStl || tooManyFaces || !mesh->HasTriangles() || impl_->isFloorStandingLargeObject()) {
+            const Eigen::Vector3d centerXY(0.5 * (bmin.x() + bmax.x()), 0.5 * (bmin.y() + bmax.y()), 0.0);
+            if (centerXY.norm() > 1e-6) {
+                mesh->Translate(-centerXY);
+                bmin = mesh->GetMinBound();
+                bmax = mesh->GetMaxBound();
+                impl_->targetMinBound = bmin.cwiseProduct(effScale);
+                impl_->targetMaxBound = bmax.cwiseProduct(effScale);
+                impl_->targetSize = impl_->targetMaxBound - impl_->targetMinBound;
+            }
             if (!mesh->HasTriangles()) {
                 open3d::geometry::PointCloud pcd(mesh->vertices_);
                 auto hull = pcd.ComputeConvexHull();

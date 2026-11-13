@@ -331,15 +331,15 @@ bool MuJoCoSimDialog::autoDetectCadForOnnx(bool showWarningIfNotFound) {
     QDir projDir(resolveProjectRoot());
 
     QStringList candidates = {
+        projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + "_mesh.ply"),
+        projDir.absoluteFilePath("CAD_DATA/" + baseName + "_mesh.ply"),
         projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".obj"),
         projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".stl"),
         projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".STL"),
         projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".ply"),
-        projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + "_mesh.ply"),
         projDir.absoluteFilePath("CAD_DATA/" + baseName + ".obj"),
         projDir.absoluteFilePath("CAD_DATA/" + baseName + ".stl"),
         projDir.absoluteFilePath("CAD_DATA/" + baseName + ".STL"),
-        projDir.absoluteFilePath("CAD_DATA/" + baseName + "_mesh.ply"),
         projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".obj"),
         projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".stl"),
         projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".ply")

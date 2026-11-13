@@ -1139,17 +1139,17 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
 
     // 3. Deterministic Floor-Aligned PCA Hypothesis (for FLOOR_STANDING frames like TABLE-DEMO)
     if (_is_floor_standing && valid_floor) {
-        cv::Vec3d mu_obs_all(0.0, 0.0, 0.0), mu_cad_all(0.0, 0.0, 0.0);
+        cv::Vec3d mu_obs_all(0.0, 0.0, 0.0);
         for (size_t i = 0; i < N; ++i) {
             mu_obs_all += cv::Vec3d(obs_pts[i]);
-            mu_cad_all += cv::Vec3d(_cad_centroids[matches[i]]);
         }
         mu_obs_all *= (1.0 / static_cast<double>(N));
-        mu_cad_all *= (1.0 / static_cast<double>(N));
 
+        // Project centered observations onto the floor plane before PCA
         cv::Matx33d cov = cv::Matx33d::zeros();
         for (size_t i = 0; i < N; ++i) {
             cv::Vec3d d = cv::Vec3d(obs_pts[i]) - mu_obs_all;
+            d -= n_fl * d.dot(n_fl);
             cov += d * d.t();
         }
         cv::Matx33d U_cov, Vt_cov;
@@ -1174,30 +1174,56 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
                     cad_x[1], cad_y[1], cad_z[1],
                     cad_x[2], cad_y[2], cad_z[2]
                 );
-                cv::Matx33d R_flip(-1.0,  0.0, 0.0,
-                                    0.0, -1.0, 0.0,
-                                    0.0,  0.0, 1.0);
-                cv::Matx33d R_cands[2] = {R_fl, R_fl * R_flip};
+                const cv::Matx33d R_180(-1.0,  0.0, 0.0,
+                                         0.0, -1.0, 0.0,
+                                         0.0,  0.0, 1.0);
+                const cv::Matx33d R_90( 0.0, -1.0, 0.0,
+                                        1.0,  0.0, 0.0,
+                                        0.0,  0.0, 1.0);
+                const cv::Matx33d R_270( 0.0,  1.0, 0.0,
+                                        -1.0,  0.0, 0.0,
+                                         0.0,  0.0, 1.0);
+                cv::Matx33d R_cands[4] = {R_fl, R_fl * R_180, R_fl * R_90, R_fl * R_270};
 
-                for (int h = 0; h < 2; ++h) {
+                const bool use_mesh_score = !_mesh_pts.empty();
+                const size_t mesh_step = use_mesh_score ? std::max<size_t>(1, _mesh_pts.size() / 400) : 1;
+                const double thresh_sq = inlier_thresh * inlier_thresh;
+
+                for (int h = 0; h < 4; ++h) {
                     const auto& R_cand = R_cands[h];
                     if (!isCandidateRotationValid(R_cand)) continue;
-                    cv::Vec3d t_cand = mu_obs_all - R_cand * mu_cad_all;
+                    cv::Vec3d t_cand = mu_obs_all - R_cand * cad_mid;
                     if (!isInTargetWorkspace(t_cand)) continue;
 
+                    const cv::Matx33d Rt_cand = R_cand.t();
                     int inliers = 0;
                     double err_sum = 0.0;
                     std::vector<uint8_t> mask(N, 0);
                     for (size_t i = 0; i < N; ++i) {
-                        cv::Vec3d pred = R_cand * cv::Vec3d(_cad_centroids[matches[i]]) + t_cand;
-                        double e = cv::norm(pred - cv::Vec3d(obs_pts[i]));
-                        if (e <= inlier_thresh) {
-                            ++inliers;
-                            err_sum += e * e;
-                            mask[i] = 1;
+                        if (use_mesh_score) {
+                            const cv::Vec3d p_loc = Rt_cand * (cv::Vec3d(obs_pts[i]) - t_cand);
+                            double min_dsq = 1e10;
+                            for (size_t j = 0; j < _mesh_pts.size(); j += mesh_step) {
+                                const cv::Vec3d d = p_loc - cv::Vec3d(_mesh_pts[j]);
+                                const double dsq = d.dot(d);
+                                if (dsq < min_dsq) min_dsq = dsq;
+                            }
+                            if (min_dsq <= thresh_sq) {
+                                ++inliers;
+                                err_sum += min_dsq;
+                                mask[i] = 1;
+                            }
+                        } else {
+                            cv::Vec3d pred = R_cand * cv::Vec3d(_cad_centroids[matches[i]]) + t_cand;
+                            double e = cv::norm(pred - cv::Vec3d(obs_pts[i]));
+                            if (e <= inlier_thresh) {
+                                ++inliers;
+                                err_sum += e * e;
+                                mask[i] = 1;
+                            }
                         }
                     }
-                    if (inliers > best_inliers) {
+                    if (inliers > best_inliers || (inliers == best_inliers && err_sum < best_err_sum)) {
                         best_inliers = inliers;
                         best_err_sum = err_sum;
                         best_mask = std::move(mask);
@@ -1463,7 +1489,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
                                 cad_vis_pts, cad_vis_norms);
         if (cad_vis_pts.size() < 40) return;
 
-        const double fg_thresh = std::clamp(_real_bounding_diag_m * 0.032, 0.008, 0.032);
+        const double fg_thresh = std::clamp(_real_bounding_diag_m * 0.18, 0.04, 0.22);
         const double fg_thresh_sq = fg_thresh * fg_thresh;
         cv::Matx33d R_inv = R_curr.t();
         std::vector<cv::Vec3d> fg_pts;
@@ -1581,7 +1607,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         cv::Matx33d R_final = R_icp.t();
         cv::Vec3d t_final = -R_final * t_icp;
 
-        const double max_drift = std::clamp(_real_bounding_diag_m * 0.085, 0.025, 0.095);
+        const double max_drift = std::clamp(_real_bounding_diag_m * 0.35, 0.08, 0.40);
         if (cv::norm(t_final - pose.t) > max_drift || !isInTargetWorkspace(t_final)) {
             return;
         }
@@ -1963,17 +1989,26 @@ ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::V
     if (sampled_pts.size() < 16) return pose;
 
     // Eliminate off-axis (X, Y) domain shift for FREE_6DOF ONNX descriptor extraction
+    // and zero-center XYZ for FLOOR_STANDING (matching dataset_hierarchy.py),
     // while keeping original camera-space points for Kabsch / ICP pose solving.
     std::vector<cv::Vec3f> ai_input_pts = sampled_pts;
-    if (!_is_floor_standing && !ai_input_pts.empty()) {
-        double sx = 0.0, sy = 0.0;
+    if (!ai_input_pts.empty()) {
+        double sx = 0.0, sy = 0.0, sz = 0.0;
         for (const auto& p : ai_input_pts) {
             sx += p[0];
             sy += p[1];
+            sz += p[2];
         }
         const float mean_x = static_cast<float>(sx / ai_input_pts.size());
         const float mean_y = static_cast<float>(sy / ai_input_pts.size());
-        if (std::hypot(mean_x, mean_y) > 0.015f) {
+        const float mean_z = static_cast<float>(sz / ai_input_pts.size());
+        if (_is_floor_standing) {
+            for (auto& p : ai_input_pts) {
+                p[0] -= mean_x;
+                p[1] -= mean_y;
+                p[2] -= mean_z;
+            }
+        } else if (std::hypot(mean_x, mean_y) > 0.015f) {
             for (auto& p : ai_input_pts) {
                 p[0] -= mean_x;
                 p[1] -= mean_y;

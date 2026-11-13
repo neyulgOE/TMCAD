@@ -1696,13 +1696,13 @@ void MainWindow::onActiveOnnxModelSwitched(const QString& onnxPath) {
             }
             QDir projDir(projectRootDir());
             QStringList cands = {
+                projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + "_mesh.ply"),
+                projDir.absoluteFilePath("CAD_DATA/" + baseName + "_mesh.ply"),
                 projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".obj"),
                 projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".stl"),
                 projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".STL"),
-                projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + "_mesh.ply"),
                 projDir.absoluteFilePath("CAD_DATA/" + baseName + ".obj"),
                 projDir.absoluteFilePath("CAD_DATA/" + baseName + ".stl"),
-                projDir.absoluteFilePath("CAD_DATA/" + baseName + "_mesh.ply"),
                 projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".obj"),
                 projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".stl"),
                 projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".ply")
