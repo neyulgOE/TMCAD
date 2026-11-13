@@ -58,6 +58,8 @@ struct MuJoCoD435SimSource::Impl {
     Eigen::Vector3d targetT = Eigen::Vector3d(0.0, 0.0, 0.0); // Offset trên mặt bàn (m)
     double currentDistanceMeters = 0.58;
     double currentCamHeightMeters = 0.95; // Độ cao camera so với mặt sàn (m)
+    double currentCamAzimuthDeg = 0.0;    // Góc xoay quỹ đạo camera quanh vật thể (độ)
+    double currentCamPanX = 0.0;          // Dịch ngang camera trái/phải (m)
 
     // Occluder State (Lon nấm hoặc vật cản)
     bool occluderEnabled = false; // Tắt mặc định, chỉ bật khi người dùng muốn test che khuất
@@ -118,7 +120,19 @@ struct MuJoCoD435SimSource::Impl {
         glfwGetWindowSize(window, &width, &height);
         if (height <= 0) height = 1;
 
-        if (impl->mod_ctrl) {
+        if (impl->mod_ctrl && impl->mod_shift) {
+            // Giữ Ctrl + Shift: Điều khiển trực tiếp vị trí/độ cao giá đỡ Camera D435if
+            if (impl->button_left) {
+                // Kéo ngang: xoay quỹ đạo quanh vật; Kéo dọc: nâng/hạ độ cao camera so với sàn
+                impl->currentCamAzimuthDeg = std::clamp(impl->currentCamAzimuthDeg + (dx / width) * 180.0, -180.0, 180.0);
+                impl->currentCamHeightMeters = std::clamp(impl->currentCamHeightMeters - (dy / height) * 1.2, 0.12, 1.80);
+                impl->updateKinematics();
+            } else if (impl->button_right) {
+                // Kéo phải: dịch ngang camera trái/phải
+                impl->currentCamPanX = std::clamp(impl->currentCamPanX + (dx / width) * 1.0, -0.80, 0.80);
+                impl->updateKinematics();
+            }
+        } else if (impl->mod_ctrl) {
             // Giữ Ctrl: Tương tác TRỰC TIẾP lên vật thể CAD trên mặt bàn
             if (impl->button_left) {
                 // Chuột trái + Ctrl: Trượt vật thể trên mặt bàn (X / Y)
@@ -166,6 +180,34 @@ struct MuJoCoD435SimSource::Impl {
         Impl* impl = static_cast<Impl*>(glfwGetWindowUserPointer(window));
         if (!impl) return;
 
+        if (act == GLFW_PRESS || act == GLFW_REPEAT) {
+            if (key == GLFW_KEY_W) {
+                impl->currentCamHeightMeters = std::clamp(impl->currentCamHeightMeters + 0.04, 0.12, 1.80);
+                impl->updateKinematics();
+                return;
+            } else if (key == GLFW_KEY_S) {
+                impl->currentCamHeightMeters = std::clamp(impl->currentCamHeightMeters - 0.04, 0.12, 1.80);
+                impl->updateKinematics();
+                return;
+            } else if (key == GLFW_KEY_A) {
+                impl->currentCamAzimuthDeg = std::clamp(impl->currentCamAzimuthDeg - 6.0, -180.0, 180.0);
+                impl->updateKinematics();
+                return;
+            } else if (key == GLFW_KEY_D) {
+                impl->currentCamAzimuthDeg = std::clamp(impl->currentCamAzimuthDeg + 6.0, -180.0, 180.0);
+                impl->updateKinematics();
+                return;
+            } else if (key == GLFW_KEY_Q) {
+                impl->currentDistanceMeters = std::clamp(impl->currentDistanceMeters - 0.05, 0.35, 3.00);
+                impl->updateKinematics();
+                return;
+            } else if (key == GLFW_KEY_E) {
+                impl->currentDistanceMeters = std::clamp(impl->currentDistanceMeters + 0.05, 0.35, 3.00);
+                impl->updateKinematics();
+                return;
+            }
+        }
+
         if (act == GLFW_PRESS) {
             if (key == GLFW_KEY_SPACE) {
                 impl->autoSpin = !impl->autoSpin;
@@ -175,6 +217,9 @@ struct MuJoCoD435SimSource::Impl {
             } else if (key == GLFW_KEY_R) {
                 impl->targetR = Eigen::Matrix3d::Identity();
                 impl->targetT = Eigen::Vector3d::Zero();
+                impl->currentCamAzimuthDeg = 0.0;
+                impl->currentCamPanX = 0.0;
+                impl->currentCamHeightMeters = impl->isFloorStandingLargeObject() ? 0.42 : 0.95;
                 impl->currentDistanceMeters = impl->isFloorStandingLargeObject() ? 1.35 : 0.58;
                 impl->updateKinematics();
             } else if (key == GLFW_KEY_ESCAPE) {
@@ -530,7 +575,7 @@ struct MuJoCoD435SimSource::Impl {
             m->body_quat[4 * targetBodyId + 3] = q.z();
         }
 
-        // 2. Cập nhật vị trí camera_rig theo cự ly quan sát & độ cao camera so với mặt sàn
+        // 2. Cập nhật vị trí camera_rig theo quỹ đạo 3D (Khoảng cách, Độ cao Z, Azimuth, Pan X)
         int camRigId = mj_name2id(m, mjOBJ_BODY, "camera_rig");
         if (camRigId >= 0) {
             double dist = std::max(0.35, currentDistanceMeters);
@@ -538,9 +583,25 @@ struct MuJoCoD435SimSource::Impl {
             double dz = camZ - centerZ;
             double horizDist = std::sqrt(std::max(0.09, dist * dist - dz * dz));
 
-            m->body_pos[3 * camRigId + 0] = 0.0;
-            m->body_pos[3 * camRigId + 1] = -horizDist;
+            double azRad = currentCamAzimuthDeg * M_PI / 180.0;
+            double camX = targetT.x() + currentCamPanX + horizDist * std::sin(azRad);
+            double camY = targetT.y() - horizDist * std::cos(azRad);
+
+            m->body_pos[3 * camRigId + 0] = camX;
+            m->body_pos[3 * camRigId + 1] = camY;
             m->body_pos[3 * camRigId + 2] = camZ;
+
+            // Xoay cả thân vỏ 3D của camera_rig luôn hướng vào target_body
+            double lookYaw = -azRad;
+            double lookPitch = std::atan2(centerZ - camZ, horizDist);
+            Eigen::Matrix3d R_rig =
+                Eigen::AngleAxisd(lookYaw, Eigen::Vector3d::UnitZ()).toRotationMatrix() *
+                Eigen::AngleAxisd(lookPitch, Eigen::Vector3d::UnitX()).toRotationMatrix();
+            Eigen::Quaterniond q_rig(R_rig);
+            m->body_quat[4 * camRigId + 0] = q_rig.w();
+            m->body_quat[4 * camRigId + 1] = q_rig.x();
+            m->body_quat[4 * camRigId + 2] = q_rig.y();
+            m->body_quat[4 * camRigId + 3] = q_rig.z();
         }
 
         // 3. Cập nhật tư thế occluder_body (vật cản)
@@ -774,6 +835,23 @@ void MuJoCoD435SimSource::setCameraHeightAboveFloor(double heightMeters) {
 
 double MuJoCoD435SimSource::cameraHeightAboveFloor() const {
     return impl_->currentCamHeightMeters;
+}
+
+void MuJoCoD435SimSource::setCameraOrbitPose(double heightMeters, double distanceMeters, double azimuthDeg, double panXMeters) {
+    impl_->currentCamHeightMeters = std::clamp(heightMeters, 0.12, 1.80);
+    impl_->currentDistanceMeters = std::clamp(distanceMeters, 0.35, 3.00);
+    impl_->currentCamAzimuthDeg = std::clamp(azimuthDeg, -180.0, 180.0);
+    impl_->currentCamPanX = std::clamp(panXMeters, -0.80, 0.80);
+    if (impl_->mujocoInitialized) {
+        impl_->updateKinematics();
+    }
+}
+
+void MuJoCoD435SimSource::getCameraOrbitPose(double& outHeightMeters, double& outDistanceMeters, double& outAzimuthDeg, double& outPanXMeters) const {
+    outHeightMeters = impl_->currentCamHeightMeters;
+    outDistanceMeters = impl_->currentDistanceMeters;
+    outAzimuthDeg = impl_->currentCamAzimuthDeg;
+    outPanXMeters = impl_->currentCamPanX;
 }
 
 void MuJoCoD435SimSource::getGroundTruthPose(Eigen::Matrix3d& outR, Eigen::Vector3d& outt) const {

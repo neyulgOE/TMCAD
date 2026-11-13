@@ -1330,6 +1330,113 @@ void MainWindow::buildUi() {
     testRow->addWidget(estimatePoseSyntheticBtn_, 1);
     step2Layout->addLayout(testRow);
 
+    // ── Live MuJoCo Camera Control Panel (hiện khi đang chạy mô phỏng, không cần tắt/bật lại) ──
+    liveSimCamBox_ = new QGroupBox("🎛️ Điều khiển Camera MuJoCo (Live)", step2Box);
+    liveSimCamBox_->setStyleSheet(
+        "QGroupBox { background: #141a22; border: 1px solid #2962ff; border-radius: 6px; margin-top: 8px; padding: 6px; font-weight: bold; color: #82b1ff; font-size: 11px; }"
+        "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+    );
+    QVBoxLayout* simCamLayout = new QVBoxLayout(liveSimCamBox_);
+    simCamLayout->setContentsMargins(6, 10, 6, 6);
+    simCamLayout->setSpacing(4);
+
+    auto addSimSliderRow = [&](const QString& title, int minV, int maxV, int initV,
+                               QSlider*& outSlider, QLabel*& outValLabel, const QString& initText) {
+        QHBoxLayout* row = new QHBoxLayout();
+        row->setSpacing(6);
+        QLabel* lbl = new QLabel(title, liveSimCamBox_);
+        lbl->setFixedWidth(74);
+        lbl->setStyleSheet("color: #b0bec5; font-size: 10px; font-weight: normal;");
+        outSlider = new QSlider(Qt::Horizontal, liveSimCamBox_);
+        outSlider->setRange(minV, maxV);
+        outSlider->setValue(initV);
+        outValLabel = new QLabel(initText, liveSimCamBox_);
+        outValLabel->setFixedWidth(48);
+        outValLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        outValLabel->setStyleSheet("color: #82b1ff; font-family: monospace; font-size: 10px; font-weight: bold;");
+        row->addWidget(lbl);
+        row->addWidget(outSlider, 1);
+        row->addWidget(outValLabel);
+        simCamLayout->addLayout(row);
+    };
+
+    addSimSliderRow("Cao Cam (Z):", 12, 180, 42, liveCamHeightSlider_, liveCamHeightVal_, "0.42m");
+    addSimSliderRow("Cự ly (Dist):", 35, 280, 135, liveCamDistSlider_, liveCamDistVal_, "1.35m");
+    addSimSliderRow("Quanh vật:", -180, 180, 0, liveCamAzimuthSlider_, liveCamAzimuthVal_, "0°");
+    addSimSliderRow("Dịch ngang X:", -80, 80, 0, liveCamPanXSlider_, liveCamPanXVal_, "0.00m");
+    addSimSliderRow("Xoay vật Yaw:", -180, 180, 0, liveObjYawSlider_, liveObjYawVal_, "0°");
+
+    auto applyLiveCamOrbit = [this]() {
+        const double h = liveCamHeightSlider_->value() / 100.0;
+        const double d = liveCamDistSlider_->value() / 100.0;
+        const double az = static_cast<double>(liveCamAzimuthSlider_->value());
+        const double px = liveCamPanXSlider_->value() / 100.0;
+        liveCamHeightVal_->setText(QString("%1m").arg(h, 0, 'f', 2));
+        liveCamDistVal_->setText(QString("%1m").arg(d, 0, 'f', 2));
+        liveCamAzimuthVal_->setText(QString("%1°").arg(static_cast<int>(az)));
+        liveCamPanXVal_->setText(QString("%1m").arg(px, 0, 'f', 2));
+        if (activeMuJoCoSim_) {
+            activeMuJoCoSim_->setCameraOrbitPose(h, d, az, px);
+        }
+    };
+    connect(liveCamHeightSlider_, &QSlider::valueChanged, this, applyLiveCamOrbit);
+    connect(liveCamDistSlider_, &QSlider::valueChanged, this, applyLiveCamOrbit);
+    connect(liveCamAzimuthSlider_, &QSlider::valueChanged, this, applyLiveCamOrbit);
+    connect(liveCamPanXSlider_, &QSlider::valueChanged, this, applyLiveCamOrbit);
+
+    connect(liveObjYawSlider_, &QSlider::valueChanged, this, [this](int val) {
+        liveObjYawVal_->setText(QString("%1°").arg(val));
+        if (activeMuJoCoSim_) {
+            Eigen::Matrix3d R_cur;
+            Eigen::Vector3d t_cur;
+            activeMuJoCoSim_->getGroundTruthPose(R_cur, t_cur);
+            Eigen::Matrix3d R_new = Eigen::AngleAxisd(val * M_PI / 180.0, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+            activeMuJoCoSim_->setTargetPose(R_new, Eigen::Vector3d(0.0, 0.0, liveCamDistSlider_->value() / 100.0));
+        }
+    });
+
+    QHBoxLayout* presetRow = new QHBoxLayout();
+    presetRow->setSpacing(4);
+    QPushButton* amrPresetBtn = new QPushButton("🤖 AMR 0.28m", liveSimCamBox_);
+    QPushButton* tripodPresetBtn = new QPushButton("📐 Tripod 0.95m", liveSimCamBox_);
+    QPushButton* resetCamBtn = new QPushButton("🔄 Reset", liveSimCamBox_);
+    QPushButton* stopSimBtn = new QPushButton("⏹ Dừng", liveSimCamBox_);
+    const QString miniBtnStyle =
+        "QPushButton { background: #1e293b; color: #cbd5e1; border: 1px solid #334155; border-radius: 3px; padding: 3px 5px; font-size: 10px; font-weight: bold; }"
+        "QPushButton:hover { background: #2962ff; color: white; }";
+    amrPresetBtn->setStyleSheet(miniBtnStyle);
+    tripodPresetBtn->setStyleSheet(miniBtnStyle);
+    resetCamBtn->setStyleSheet(miniBtnStyle);
+    stopSimBtn->setStyleSheet(
+        "QPushButton { background: #7f1d1d; color: #fecaca; border: 1px solid #991b1b; border-radius: 3px; padding: 3px 6px; font-size: 10px; font-weight: bold; }"
+        "QPushButton:hover { background: #dc2626; color: white; }");
+
+    connect(amrPresetBtn, &QPushButton::clicked, this, [this]() {
+        liveCamHeightSlider_->setValue(28);
+    });
+    connect(tripodPresetBtn, &QPushButton::clicked, this, [this]() {
+        liveCamHeightSlider_->setValue(95);
+    });
+    connect(resetCamBtn, &QPushButton::clicked, this, [this]() {
+        liveCamAzimuthSlider_->setValue(0);
+        liveCamPanXSlider_->setValue(0);
+        liveObjYawSlider_->setValue(0);
+        if (activeMuJoCoSim_) {
+            activeMuJoCoSim_->setTargetPose(Eigen::Matrix3d::Identity(),
+                                            Eigen::Vector3d(0.0, 0.0, liveCamDistSlider_->value() / 100.0));
+        }
+    });
+    connect(stopSimBtn, &QPushButton::clicked, this, &MainWindow::stopMuJoCoSimulation);
+
+    presetRow->addWidget(amrPresetBtn);
+    presetRow->addWidget(tripodPresetBtn);
+    presetRow->addWidget(resetCamBtn);
+    presetRow->addWidget(stopSimBtn);
+    simCamLayout->addLayout(presetRow);
+
+    liveSimCamBox_->setVisible(false);
+    step2Layout->addWidget(liveSimCamBox_);
+
     // 6DoF Telemetry Card
     livePoseResultCard_ = new QLabel("Chưa có kết quả.\nChọn model .onnx và bấm chạy nhận diện.", step2Box);
     livePoseResultCard_->setWordWrap(true);
@@ -7014,9 +7121,28 @@ void MainWindow::onStartMuJoCoSimulation() {
     lastMuJoCoPose_ = tmcad::ObjectPose{};
     muJoCoSimTimer_->start(16); // ~60 FPS render
 
+    if (liveSimCamBox_) {
+        QSignalBlocker b1(liveCamHeightSlider_);
+        QSignalBlocker b2(liveCamDistSlider_);
+        QSignalBlocker b3(liveCamAzimuthSlider_);
+        QSignalBlocker b4(liveCamPanXSlider_);
+        QSignalBlocker b5(liveObjYawSlider_);
+        liveCamHeightSlider_->setValue(static_cast<int>(std::round(cfg.camHeightMeters * 100.0)));
+        liveCamDistSlider_->setValue(static_cast<int>(std::round(cfg.distanceMeters * 100.0)));
+        liveCamAzimuthSlider_->setValue(0);
+        liveCamPanXSlider_->setValue(0);
+        liveObjYawSlider_->setValue(static_cast<int>(std::round(cfg.yawDeg)));
+        liveCamHeightVal_->setText(QString("%1m").arg(cfg.camHeightMeters, 0, 'f', 2));
+        liveCamDistVal_->setText(QString("%1m").arg(cfg.distanceMeters, 0, 'f', 2));
+        liveCamAzimuthVal_->setText("0°");
+        liveCamPanXVal_->setText("0.00m");
+        liveObjYawVal_->setText(QString("%1°").arg(static_cast<int>(std::round(cfg.yawDeg))));
+        liveSimCamBox_->setVisible(true);
+    }
+
     pipelineLog(QString("🎮 [MUJOCO DUAL VIEW] Đã khởi chạy mô phỏng tương tác 2 bên song song:"));
-    pipelineLog(QString("   📍 Bên Trái: TMCAD Camera Stream HUD (RGB-D + Async C++ 6DoF Tracking)"));
-    pipelineLog(QString("   📍 Bên Phải: Cửa sổ MuJoCo 3D Interactive (Chuột phải: Xoay | Chuột trái: Pan | Giữ Ctrl: Kéo/Xoay CAD | Space: Auto-spin)"));
+    pipelineLog(QString("   📍 Bên Trái: TMCAD Camera Stream HUD + Bảng điều khiển Camera Live (không cần tắt bật lại)"));
+    pipelineLog(QString("   📍 Bên Phải: Cửa sổ MuJoCo 3D (W/S: Độ cao Cam | A/D: Xoay quanh vật | Q/E: Gần/Xa | Ctrl+Shift+Chuột: Kéo Cam | Ctrl+Chuột: Kéo CAD | R: Reset)"));
     statusBar()->showMessage("Mô phỏng MuJoCo 3D Interactive đang chạy (60 FPS render / Async AI)...", 8000);
 }
 
@@ -7031,6 +7157,7 @@ void MainWindow::onMuJoCoSimTick() {
         stopMuJoCoSimulation();
         return;
     }
+    syncLiveSimCamSliders();
     ++muJoCoTickCounter_;
 
     // 2. Nếu luồng AI ngầm vừa tính xong kết quả của frame trước -> Cập nhật HUD ngay (0ms block)
@@ -7149,6 +7276,9 @@ void MainWindow::stopMuJoCoSimulation() {
     asyncWorkerBusy_.store(false);
     isMuJoCoInferencing_.store(false);
     lastMuJoCoPose_ = tmcad::ObjectPose{};
+    if (liveSimCamBox_) {
+        liveSimCamBox_->setVisible(false);
+    }
     if (activeMuJoCoSim_) {
         activeMuJoCoSim_->closeInteractiveWindow();
         activeMuJoCoSim_->close();
@@ -7156,6 +7286,37 @@ void MainWindow::stopMuJoCoSimulation() {
     }
     pipelineLog("⏹️ [MUJOCO SIMULATION] Đã dừng mô phỏng tương tác MuJoCo.");
     statusBar()->showMessage("Đã dừng mô phỏng MuJoCo.", 4000);
+}
+
+void MainWindow::syncLiveSimCamSliders() {
+    if (!activeMuJoCoSim_ || !liveSimCamBox_ || !liveSimCamBox_->isVisible()) return;
+    double h = 0.42, d = 1.35, az = 0.0, px = 0.0;
+    activeMuJoCoSim_->getCameraOrbitPose(h, d, az, px);
+    const int ih = static_cast<int>(std::round(h * 100.0));
+    const int id = static_cast<int>(std::round(d * 100.0));
+    const int iaz = static_cast<int>(std::round(az));
+    const int ipx = static_cast<int>(std::round(px * 100.0));
+
+    if (liveCamHeightSlider_->value() != ih) {
+        QSignalBlocker b(liveCamHeightSlider_);
+        liveCamHeightSlider_->setValue(ih);
+        liveCamHeightVal_->setText(QString("%1m").arg(h, 0, 'f', 2));
+    }
+    if (liveCamDistSlider_->value() != id) {
+        QSignalBlocker b(liveCamDistSlider_);
+        liveCamDistSlider_->setValue(id);
+        liveCamDistVal_->setText(QString("%1m").arg(d, 0, 'f', 2));
+    }
+    if (liveCamAzimuthSlider_->value() != iaz) {
+        QSignalBlocker b(liveCamAzimuthSlider_);
+        liveCamAzimuthSlider_->setValue(iaz);
+        liveCamAzimuthVal_->setText(QString("%1°").arg(iaz));
+    }
+    if (liveCamPanXSlider_->value() != ipx) {
+        QSignalBlocker b(liveCamPanXSlider_);
+        liveCamPanXSlider_->setValue(ipx);
+        liveCamPanXVal_->setText(QString("%1m").arg(px, 0, 'f', 2));
+    }
 }
 
 void MainWindow::onRemoveSelectedCadObject() {

@@ -30,6 +30,8 @@ public:
     void setTargetPose(const Eigen::Matrix3d& R, const Eigen::Vector3d& t);
     void setCameraHeightAboveFloor(double heightMeters);
     double cameraHeightAboveFloor() const;
+    void setCameraOrbitPose(double heightMeters, double distanceMeters, double azimuthDeg, double panXMeters = 0.0);
+    void getCameraOrbitPose(double& outHeightMeters, double& outDistanceMeters, double& outAzimuthDeg, double& outPanXMeters) const;
     void getGroundTruthPose(Eigen::Matrix3d& outR, Eigen::Vector3d& outt) const;
     void getGroundTruthBBox3D(std::vector<Eigen::Vector3d>& corners) const;
 
