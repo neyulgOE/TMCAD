@@ -1860,6 +1860,33 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         }
     }
 
+    // 3b. Turntable / SO(3) Azimuthal Multi-Angle Search (12 angles x 30 deg = 360 deg)
+    // Đảm bảo khi xoay chi tiết máy có hình học đặc biệt (như engine_block) ở bất kỳ góc Yaw nào,
+    // bộ giải luôn tìm trúng góc xoay thực tế trước khi chạy Point-to-Plane ICP!
+    if (score_cand0.fwd_fit < 0.88 || score_cand0.bwd_kernel < 0.78) {
+        struct AngleSeed { double pre; cv::Matx33d R; cv::Vec3d t; };
+        std::vector<AngleSeed> rot_pool;
+        rot_pool.reserve(11);
+        for (int deg = 30; deg < 360; deg += 30) {
+            double rad = static_cast<double>(deg) * kPi / 180.0;
+            double cs = std::cos(rad), sn = std::sin(rad);
+            // Xoay quanh trục Z cục bộ của CAD
+            cv::Matx33d Rz_step(cs, -sn, 0.0,
+                                sn,  cs, 0.0,
+                                0.0, 0.0, 1.0);
+            cv::Matx33d R_try = R_cand0 * Rz_step;
+            cv::Vec3d t_try = computeVisibleSurfaceOffset(R_try, c_fg, cad_mid, _mesh_pts, _mesh_normals);
+            auto sc_try = evaluateBidirectionalConsensus(R_try, t_try, diag, _mesh_pts, _mesh_normals,
+                                                         fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+            rot_pool.push_back(AngleSeed{sc_try.score, R_try, t_try});
+        }
+        std::sort(rot_pool.begin(), rot_pool.end(),
+                  [](const AngleSeed& a, const AngleSeed& b) { return a.pre > b.pre; });
+        for (size_t k = 0; k < std::min<size_t>(4, rot_pool.size()); ++k) {
+            seeds.push_back(PoseSeed{rot_pool[k].R, rot_pool[k].t, 0.0});
+        }
+    }
+
     for (const auto& sd : seeds) {
         cv::Matx33d R_out;
         cv::Vec3d t_out;
@@ -1988,9 +2015,9 @@ ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::V
     pose.model_name = _model_name;
     if (sampled_pts.size() < 16) return pose;
 
-    // Eliminate off-axis (X, Y) domain shift for FREE_6DOF ONNX descriptor extraction
-    // and zero-center XYZ for FLOOR_STANDING (matching dataset_hierarchy.py),
-    // while keeping original camera-space points for Kabsch / ICP pose solving.
+    // Chuẩn hóa đám mây điểm quan sát về tâm (0,0,0) và chia cho _real_bounding_diag_m (FREE_6DOF)
+    // khớp 100% với: pts_cam_norm = (pts_cam - centroid) / self.cad_diag trong dataset_hierarchy.py,
+    // đồng thời giữ nguyên tọa độ camera-space (sampled_pts) cho Kabsch / ICP.
     std::vector<cv::Vec3f> ai_input_pts = sampled_pts;
     if (!ai_input_pts.empty()) {
         double sx = 0.0, sy = 0.0, sz = 0.0;
@@ -1999,19 +2026,22 @@ ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::V
             sy += p[1];
             sz += p[2];
         }
-        const float mean_x = static_cast<float>(sx / ai_input_pts.size());
-        const float mean_y = static_cast<float>(sy / ai_input_pts.size());
-        const float mean_z = static_cast<float>(sz / ai_input_pts.size());
+        const float inv_n = 1.0f / static_cast<float>(ai_input_pts.size());
+        const float cx_pt = static_cast<float>(sx) * inv_n;
+        const float cy_pt = static_cast<float>(sy) * inv_n;
+        const float cz_pt = static_cast<float>(sz) * inv_n;
         if (_is_floor_standing) {
             for (auto& p : ai_input_pts) {
-                p[0] -= mean_x;
-                p[1] -= mean_y;
-                p[2] -= mean_z;
+                p[0] -= cx_pt;
+                p[1] -= cy_pt;
+                p[2] -= cz_pt;
             }
-        } else if (std::hypot(mean_x, mean_y) > 0.015f) {
+        } else {
+            const float inv_diag = 1.0f / std::max(0.05f, static_cast<float>(_real_bounding_diag_m));
             for (auto& p : ai_input_pts) {
-                p[0] -= mean_x;
-                p[1] -= mean_y;
+                p[0] = (p[0] - cx_pt) * inv_diag;
+                p[1] = (p[1] - cy_pt) * inv_diag;
+                p[2] = (p[2] - cz_pt) * inv_diag;
             }
         }
     }
