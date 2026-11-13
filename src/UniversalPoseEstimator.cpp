@@ -41,20 +41,46 @@ void computeVisibleCadSubset(const cv::Matx33d& R,
     out_norms.clear();
     if (mesh_pts.empty()) return;
     mesh_stride = std::max<size_t>(1, mesh_stride);
-    out_pts.reserve(mesh_pts.size() / mesh_stride + 1);
-    out_norms.reserve(mesh_pts.size() / mesh_stride + 1);
+
+    // Lưới Z-buffer thô (8x8 pixel/ô) để loại bỏ các vách ngăn/hốc xi-lanh bị che khuất bên trong ruột CAD
+    const int grid_w = std::max(32, img_w / 8);
+    const int grid_h = std::max(24, img_h / 8);
+    std::vector<float> z_buf(static_cast<size_t>(grid_w) * grid_h, 1e6f);
+
+    struct CandPt {
+        size_t idx;
+        int gx;
+        int gy;
+        float z;
+    };
+    std::vector<CandPt> cands;
+    cands.reserve(mesh_pts.size() / mesh_stride + 1);
 
     for (size_t i = 0; i < mesh_pts.size(); i += mesh_stride) {
         cv::Vec3d p_cam = R * cv::Vec3d(mesh_pts[i]) + t;
         if (p_cam[2] <= 0.05) continue;
         cv::Vec3d n_cam = R * cv::Vec3d(mesh_normals[i]);
-        if (n_cam.dot(p_cam) > 0.15 * cv::norm(p_cam)) continue;
+        if (n_cam.dot(p_cam) > 0.10 * cv::norm(p_cam)) continue;
 
         double u = p_cam[0] * fx / p_cam[2] + cx;
         double v = p_cam[1] * fy / p_cam[2] + cy;
-        if (u >= -40.0 && u < img_w + 40.0 && v >= -40.0 && v < img_h + 40.0) {
-            out_pts.emplace_back(mesh_pts[i]);
-            out_norms.emplace_back(mesh_normals[i]);
+        if (u >= -32.0 && u < img_w + 32.0 && v >= -32.0 && v < img_h + 32.0) {
+            int gx = std::clamp(static_cast<int>(u / 8.0), 0, grid_w - 1);
+            int gy = std::clamp(static_cast<int>(v / 8.0), 0, grid_h - 1);
+            float zf = static_cast<float>(p_cam[2]);
+            float& cell_z = z_buf[static_cast<size_t>(gy) * grid_w + gx];
+            if (zf < cell_z) cell_z = zf;
+            cands.push_back(CandPt{i, gx, gy, zf});
+        }
+    }
+
+    // Chỉ giữ các điểm nằm gần lớp vỏ ngoài cùng nhìn thấy (trong phạm vi 12mm tính từ z_buf mặt trước)
+    out_pts.reserve(cands.size());
+    out_norms.reserve(cands.size());
+    for (const auto& c : cands) {
+        if (c.z <= z_buf[static_cast<size_t>(c.gy) * grid_w + c.gx] + 0.012f) {
+            out_pts.emplace_back(mesh_pts[c.idx]);
+            out_norms.emplace_back(mesh_normals[c.idx]);
         }
     }
 }
@@ -305,14 +331,28 @@ cv::Vec3d computeVisibleSurfaceOffset(const cv::Matx33d& R,
     cv::Vec3d t_guess = c_target - R * cad_mid;
     if (mesh_pts.empty()) return t_guess;
 
+    const cv::Vec3d view_dir = c_target * (1.0 / std::max(1e-6, cv::norm(c_target)));
+    const size_t step = std::max<size_t>(1, mesh_pts.size() / 800);
+
+    // Tìm độ sâu mặt trước gần camera nhất (min_proj) của mô hình CAD ở hướng xoay R
+    double min_proj = 1e9, max_proj = -1e9;
+    for (size_t i = 0; i < mesh_pts.size(); i += step) {
+        const cv::Vec3d p_rot = R * (cv::Vec3d(mesh_pts[i]) - cad_mid);
+        const double pr = p_rot.dot(view_dir);
+        if (pr < min_proj) min_proj = pr;
+        if (pr > max_proj) max_proj = pr;
+    }
+    const double front_shell_cutoff = min_proj + 0.42 * (max_proj - min_proj);
+
     cv::Vec3d vis_sum(0.0, 0.0, 0.0);
     int vis_cnt = 0;
-    const size_t step = std::max<size_t>(1, mesh_pts.size() / 600);
     for (size_t i = 0; i < mesh_pts.size(); i += step) {
-        const cv::Vec3d p_cam = R * cv::Vec3d(mesh_pts[i]) + t_guess;
+        const cv::Vec3d p_local(mesh_pts[i]);
+        const cv::Vec3d p_rot = R * (p_local - cad_mid);
+        if (p_rot.dot(view_dir) > front_shell_cutoff) continue; // Loại bỏ mặt lưng & vách sâu phía sau
         const cv::Vec3d n_cam = R * cv::Vec3d(mesh_normals[i]);
-        if (n_cam.dot(p_cam) < -0.05 * cv::norm(p_cam)) {
-            vis_sum += cv::Vec3d(mesh_pts[i]);
+        if (n_cam.dot(view_dir) < -0.05) {
+            vis_sum += p_local;
             ++vis_cnt;
         }
     }
@@ -1885,7 +1925,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         std::sort(cand_pool.begin(), cand_pool.end(),
                   [](const RankedSeed& a, const RankedSeed& b) { return a.pre > b.pre; });
 
-        const size_t take_top = std::min<size_t>(7, cand_pool.size());
+        const size_t take_top = std::min<size_t>(16, cand_pool.size());
         for (size_t k = 0; k < take_top; ++k) {
             seeds.push_back(PoseSeed{cand_pool[k].R, cand_pool[k].t, 0.0});
         }
