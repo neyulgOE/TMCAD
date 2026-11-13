@@ -117,6 +117,64 @@ static void computePcaSpread(const std::vector<cv::Vec3f>& pts, float& s0, float
     s2 = static_cast<float>(std::sqrt(std::max(0.0, ev.at<double>(2))));
 }
 
+static void computePcaObbExtents(const std::vector<cv::Vec3f>& pts,
+                                 float& out_e0,
+                                 float& out_e1,
+                                 float& out_e2,
+                                 float& out_diag) {
+    out_e0 = out_e1 = out_e2 = out_diag = 0.0f;
+    if (pts.size() < 12) return;
+    const size_t step = std::max<size_t>(1, pts.size() / 256);
+    cv::Vec3d mu(0.0, 0.0, 0.0);
+    size_t n = 0;
+    for (size_t i = 0; i < pts.size(); i += step) {
+        mu += cv::Vec3d(pts[i][0], pts[i][1], pts[i][2]);
+        ++n;
+    }
+    if (n < 8) return;
+    mu *= (1.0 / static_cast<double>(n));
+
+    cv::Matx33d cov = cv::Matx33d::zeros();
+    for (size_t i = 0; i < pts.size(); i += step) {
+        const cv::Vec3d d(pts[i][0] - mu[0], pts[i][1] - mu[1], pts[i][2] - mu[2]);
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                cov(r, c) += d[r] * d[c];
+    }
+    cov *= (1.0 / static_cast<double>(n));
+    cv::Mat ev, evec;
+    cv::eigen(cv::Mat(cov), ev, evec);
+
+    cv::Vec3d ax[3];
+    for (int k = 0; k < 3; ++k) {
+        ax[k] = cv::Vec3d(evec.at<double>(k, 0), evec.at<double>(k, 1), evec.at<double>(k, 2));
+        ax[k] *= (1.0 / std::max(1e-9, cv::norm(ax[k])));
+    }
+
+    std::vector<float> p0, p1, p2;
+    p0.reserve(n);
+    p1.reserve(n);
+    p2.reserve(n);
+    for (size_t i = 0; i < pts.size(); i += step) {
+        const cv::Vec3d d(pts[i][0] - mu[0], pts[i][1] - mu[1], pts[i][2] - mu[2]);
+        p0.push_back(static_cast<float>(d.dot(ax[0])));
+        p1.push_back(static_cast<float>(d.dot(ax[1])));
+        p2.push_back(static_cast<float>(d.dot(ax[2])));
+    }
+    auto qSpan = [](std::vector<float>& v) -> float {
+        std::sort(v.begin(), v.end());
+        const size_t lo = static_cast<size_t>(0.03 * (v.size() - 1));
+        const size_t hi = static_cast<size_t>(0.97 * (v.size() - 1));
+        return std::max(0.0f, v[hi] - v[lo]);
+    };
+    float ext[3] = { qSpan(p0), qSpan(p1), qSpan(p2) };
+    std::sort(ext, ext + 3, std::greater<float>());
+    out_e0 = ext[0];
+    out_e1 = ext[1];
+    out_e2 = ext[2];
+    out_diag = std::sqrt(out_e0 * out_e0 + out_e1 * out_e1 + out_e2 * out_e2);
+}
+
 static std::vector<cv::Vec3f> voxelDownsampleCentroids(const std::vector<cv::Vec3f>& pts, float leaf) {
     if (pts.empty() || leaf <= 1e-5f) return pts;
     const float inv = 1.0f / leaf;
@@ -654,15 +712,16 @@ bool CADSceneSegmenter::fitSupportPlaneRANSAC(const std::vector<cv::Vec3f>& pts,
             best_plane = cv::Vec4d(n_svd[0], n_svd[1], n_svd[2], -n_svd.dot(mean));
         }
 
-        const bool is_horizontal = (std::abs(best_plane[1]) >= 0.55);
+        const bool is_horizontal = (std::abs(best_plane[1]) >= 0.65);
         bool accept_peel = false;
         const size_t min_dom_inliers = std::max<size_t>(450, pts.size() / 8);
         if (is_horizontal) {
             accept_peel = (inl_pts.size() >= min_dom_inliers) &&
-                          (inl_qdiag > std::max(0.30f, 1.75f * _bounding_diag_m));
-        } else {
-            accept_peel = (inl_pts.size() >= min_dom_inliers) &&
-                          (inl_qdiag > std::max(0.32f, 1.80f * _bounding_diag_m));
+                          (inl_qdiag > std::max(0.35f, 1.90f * _bounding_diag_m));
+        } else if (wide_full_scene) {
+            const size_t min_wall_inliers = std::max<size_t>(1800, pts.size() / 5);
+            accept_peel = (inl_pts.size() >= min_wall_inliers) &&
+                          (inl_qdiag > std::max(0.55f, 2.80f * _bounding_diag_m));
         }
         if (!accept_peel) break;
 
@@ -725,21 +784,31 @@ void CADSceneSegmenter::clusterAndMergeTarget(const std::vector<cv::Vec3f>& fg_p
         if (_floor_standing_mode) {
             cl.score = static_cast<double>(cl.points.size()) / (cl.centroid[2] + 1.8 * radial_offset + 0.35);
         } else {
-            double c_diag = cv::norm(bmax - bmin);
+            float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f, obb_diag = 0.0f;
+            computePcaObbExtents(cl.points, e0, e1, e2, obb_diag);
+            const double c_diag = (obb_diag > 0.01f) ? static_cast<double>(obb_diag) : cv::norm(bmax - bmin);
             double size_match = 1.0 / (std::abs(c_diag - static_cast<double>(_bounding_diag_m)) + 0.025);
             if (c_diag > 1.45 * _bounding_diag_m || c_diag < 0.35 * _bounding_diag_m) size_match *= 0.15;
             if (c_diag > 1.90 * _bounding_diag_m) size_match *= 0.20;
             double pt_support = std::sqrt(static_cast<double>(std::min<size_t>(cl.points.size(), 4000)));
             double rad_w = has_roi_hint ? 0.8 : 1.3;
             double shape_factor = 1.0;
-            if (_expected_width_m > 0.015f && _expected_height_m > 0.015f &&
-                c_diag <= 1.85 * static_cast<double>(_bounding_diag_m)) {
-                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f;
-                computePcaSpread(cl.points, s0, s1, s2);
-                const float min_dim = std::min(_expected_width_m, _expected_length_m);
-                const float mid_dim = std::max(_expected_width_m, _expected_length_m);
-                if (s1 < 0.14f * min_dim || (s2 < 0.0014f && s1 < 0.28f * mid_dim)) {
-                    shape_factor = 0.04; // Suppress 1D plane-peel remnant strips
+            if (e0 > 0.01f) {
+                float cad_dims[3] = { _expected_length_m, _expected_width_m, _expected_height_m };
+                std::sort(cad_dims, cad_dims + 3, std::greater<float>());
+                if (e2 < 0.010f || (cad_dims[2] > 0.02f && e2 < 0.22f * cad_dims[2])) {
+                    shape_factor *= 0.05; // Phạt mạnh cụm phẳng/mỏng (mặt bàn, màn hình, bàn phím)
+                }
+                if (cad_dims[0] > 0.02f && cad_dims[1] > 0.02f) {
+                    const double err0 = std::abs(e0 - cad_dims[0]) / std::max(0.02f, cad_dims[0]);
+                    const double err1 = std::abs(e1 - cad_dims[1]) / std::max(0.02f, cad_dims[1]);
+                    const double err2 = (cad_dims[2] > 0.02f)
+                                            ? (std::abs(e2 - cad_dims[2]) / std::max(0.02f, cad_dims[2]))
+                                            : 0.0;
+                    shape_factor *= 1.0 / (1.0 + 1.2 * err0 + 1.5 * err1 + 0.8 * err2);
+                    if (e1 > 1.55f * cad_dims[1] || e0 > 1.55f * cad_dims[0]) {
+                        shape_factor *= 0.25;
+                    }
                 }
             }
             cl.score = (pt_support * size_match * shape_factor) / (cl.centroid[2] + rad_w * radial_offset + 0.35);

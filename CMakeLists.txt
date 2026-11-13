@@ -212,3 +212,22 @@ target_link_libraries(test_mujoco_sim_source PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++.so.1
     ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++abi.so.1
 )
+
+add_executable(eval_bag_pose
+    src/eval_bag_pose.cpp
+    src/RGBDSource.cpp
+)
+target_include_directories(eval_bag_pose PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${Open3D_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(eval_bag_pose PRIVATE
+    tmcad_pose_core
+    Qt5::Widgets
+    Open3D::Open3D
+    realsense2::realsense2
+    ${OpenCV_LIBS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++.so.1
+    ${CMAKE_CURRENT_SOURCE_DIR}/libs/open3d_cxx/lib/libc++abi.so.1
+)
