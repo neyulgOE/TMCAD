@@ -23,7 +23,23 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from deep_learning.model_hierarchy import CADHierarchyCorrespondenceModel
-from deep_learning.dataset_hierarchy import fps_sampling_np
+try:
+    from deep_learning.dataset_hierarchy import fps_sampling_np
+except ImportError:
+    def fps_sampling_np(pts: np.ndarray, num_samples: int) -> np.ndarray:
+        n = len(pts)
+        if n <= num_samples:
+            return np.arange(n, dtype=np.int64)
+        selected = np.zeros(num_samples, dtype=np.int64)
+        dists = np.full(n, np.inf, dtype=np.float32)
+        farthest = 0
+        for i in range(num_samples):
+            selected[i] = farthest
+            diff = pts - pts[farthest]
+            d = np.einsum("ij,ij->i", diff, diff)
+            dists = np.minimum(dists, d)
+            farthest = int(np.argmax(dists))
+        return selected
 
 
 class CADBlackBoxONNXModule(nn.Module):

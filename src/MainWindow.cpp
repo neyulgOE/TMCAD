@@ -6953,6 +6953,7 @@ void MainWindow::onStartMuJoCoSimulation() {
                       * Eigen::AngleAxisd(cfg.rollDeg * M_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
     Eigen::Vector3d t(0.0, 0.0, cfg.distanceMeters);
     activeMuJoCoSim_->setTargetPose(R, t);
+    activeMuJoCoSim_->setCameraHeightAboveFloor(cfg.camHeightMeters);
 
     // Thiết lập vật cản (Lon nấm)
     activeMuJoCoSim_->setOccluderEnabled(cfg.occluderEnabled);

@@ -22,16 +22,16 @@ int main(int argc, char** argv) {
     DatasetGenConfig cfg;
     cfg.numSamples = numSamples;
     cfg.outputDir = outputDir;
-    cfg.minDistanceMeters = isTable ? 0.9 : 0.45;
-    cfg.maxDistanceMeters = isTable ? 2.5 : 1.2;
+    cfg.minDistanceMeters = isTable ? 0.75 : 0.45;
+    cfg.maxDistanceMeters = isTable ? 2.20 : 1.20;
 
     // Calibrated AMR Aligned RGB-D intrinsics (registered_pair=atomic_rgbd)
     cfg.intrinsics = CameraIntrinsics{640, 480, 608.215, 608.128, 341.473, 228.438};
 
     cfg.amrMode = isTable;
-    cfg.amrMinCameraHeightMeters = 0.15; // 15cm - 40cm above floor (covers real AMR camera at 23cm)
-    cfg.amrMaxCameraHeightMeters = 0.40;
-    cfg.amrPitchRangeDeg = 10.0;        // [-10 deg, +10 deg] pitch
+    cfg.amrMinCameraHeightMeters = 0.18; // 18cm - 115cm above floor (covers AMR + Tripod/MuJoCo)
+    cfg.amrMaxCameraHeightMeters = 1.15;
+    cfg.amrPitchRangeDeg = 12.0;        // [-12 deg, +12 deg] pitch perturbation around object center
     cfg.full360Rotation = true;         // 360 deg yaw around object
 
     if (cleanMode) {

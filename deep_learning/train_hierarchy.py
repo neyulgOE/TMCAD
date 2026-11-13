@@ -62,25 +62,68 @@ def main():
     print(f"============================================================")
 
     # 1. Datasets & DataLoaders
+    norm_ds = os.path.normpath(args.dataset_dir)
+    dataset_root = os.path.dirname(norm_ds) if os.path.basename(norm_ds) == args.cad_name else norm_ds
+
     train_dataset = CADHierarchyDataset(
-        dataset_dir=args.dataset_dir,
-        cad_dir=args.cad_dir,
+        dataset_root=dataset_root,
+        cad_data_dir=args.cad_dir,
         cad_name=args.cad_name,
         split="train",
-        num_cad_samples=args.num_cad_samples,
-        num_obs_samples=args.num_obs_samples,
-        patch_k=32
+        num_obs_points=args.num_obs_samples,
+        enable_sim2real_noise=True,
     )
 
     val_dataset = CADHierarchyDataset(
-        dataset_dir=args.dataset_dir,
-        cad_dir=args.cad_dir,
+        dataset_root=dataset_root,
+        cad_data_dir=args.cad_dir,
         cad_name=args.cad_name,
         split="val",
-        num_cad_samples=args.num_cad_samples,
-        num_obs_samples=args.num_obs_samples,
-        patch_k=32
+        num_obs_points=args.num_obs_samples,
+        enable_sim2real_noise=False,
     )
+
+    import numpy as np
+    patch_npz_path = os.path.join(args.cad_dir, f"{args.cad_name}_patches.npz")
+    patch_npz = np.load(patch_npz_path)
+    patch_rel_np = patch_npz["patch_rel_pos"].astype(np.float32) if "patch_rel_pos" in patch_npz else None
+    patch_hops_np = patch_npz["patch_hops"].astype(np.float32) if "patch_hops" in patch_npz else None
+    key_indices_np = np.arange(args.num_cad_samples, dtype=np.int64)
+    key_path = os.path.join(args.cad_dir, f"{args.cad_name}_key_triangles_512.npy")
+    if os.path.exists(key_path):
+        key_indices_np = np.load(key_path).astype(np.int64)
+    if patch_hops_np is not None and len(patch_hops_np) > args.num_cad_samples:
+        if os.path.exists(key_path):
+            patch_hops_np = patch_hops_np[key_indices_np]
+        else:
+            patch_hops_np = patch_hops_np[np.linspace(0, len(patch_hops_np) - 1, args.num_cad_samples, dtype=np.int64)]
+    patch_rel_const = torch.from_numpy(patch_rel_np).to(device) if patch_rel_np is not None else None
+    patch_hops_const = torch.from_numpy(patch_hops_np).to(device) if patch_hops_np is not None else None
+
+    def prepare_batch(batch):
+        obs_cam = batch["obs_points_norm"].to(device, non_blocking=True)
+        patch_feat = batch["patch_features"].to(device, non_blocking=True)
+        patch_centers = batch["patch_centers"].to(device, non_blocking=True)
+        B = obs_cam.shape[0]
+        if patch_rel_const is not None:
+            patch_rel = patch_rel_const.unsqueeze(0).expand(B, -1, -1, -1)
+        else:
+            patch_rel = patch_feat[..., 0:3] - patch_centers.unsqueeze(2)
+        if patch_hops_const is not None:
+            patch_hops = patch_hops_const.unsqueeze(0).expand(B, -1, -1)
+        else:
+            patch_hops = torch.zeros(patch_feat.shape[:3], device=device, dtype=patch_feat.dtype)
+
+        gt_cad = batch["gt_cad_points"].to(device, non_blocking=True)
+        sym_mats = batch["symmetry_matrices"].to(device, non_blocking=True)
+        K_sym = sym_mats.shape[1]
+        pos_list = []
+        for s_idx in range(K_sym):
+            rot_cad = torch.bmm(gt_cad, sym_mats[:, s_idx].transpose(1, 2))
+            dists = torch.cdist(rot_cad, patch_centers)
+            pos_list.append(dists.argmin(dim=-1))
+        targets = torch.stack(pos_list, dim=-1)
+        return obs_cam, patch_feat, patch_rel, patch_hops, targets
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               num_workers=4, pin_memory=True, drop_last=True)
@@ -110,11 +153,7 @@ def main():
         num_train_batches = len(train_loader)
 
         for batch in train_loader:
-            obs_cam = batch["obs_cam_pts"].to(device, non_blocking=True)
-            patch_feat = batch["cad_patch_features"].to(device, non_blocking=True)
-            patch_rel = batch["cad_patch_rel_pos"].to(device, non_blocking=True)
-            patch_hops = batch["cad_patch_hops"].to(device, non_blocking=True)
-            targets = batch["positive_targets"].to(device, non_blocking=True)
+            obs_cam, patch_feat, patch_rel, patch_hops, targets = prepare_batch(batch)
 
             optimizer.zero_grad()
             sim, _, _ = model(obs_cam, patch_feat, patch_rel, patch_hops)
@@ -142,11 +181,7 @@ def main():
 
         with torch.no_grad():
             for batch in val_loader:
-                obs_cam = batch["obs_cam_pts"].to(device, non_blocking=True)
-                patch_feat = batch["cad_patch_features"].to(device, non_blocking=True)
-                patch_rel = batch["cad_patch_rel_pos"].to(device, non_blocking=True)
-                patch_hops = batch["cad_patch_hops"].to(device, non_blocking=True)
-                targets = batch["positive_targets"].to(device, non_blocking=True)
+                obs_cam, patch_feat, patch_rel, patch_hops, targets = prepare_batch(batch)
 
                 sim, _, _ = model(obs_cam, patch_feat, patch_rel, patch_hops)
                 val_loss = criterion(sim, targets)
@@ -179,8 +214,8 @@ def main():
                 "num_cad_samples": args.num_cad_samples,
                 "descriptor_dim": args.descriptor_dim,
                 "temperature": args.temperature,
-                "symmetry_type": train_dataset.symmetry_type,
-                "cad_key_indices": train_dataset.cad_key_indices
+                "symmetry_type": getattr(train_dataset, "symmetry_type", "auto"),
+                "cad_key_indices": getattr(train_dataset, "cad_key_indices", key_indices_np)
             }, best_model_path)
             print(f"  --> Best model saved to {best_model_path} (Val Recall@1: {best_val_recall:.2f}%)")
             sys.stdout.flush()

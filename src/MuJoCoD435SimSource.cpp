@@ -57,6 +57,7 @@ struct MuJoCoD435SimSource::Impl {
     Eigen::Matrix3d targetR = Eigen::Matrix3d::Identity();
     Eigen::Vector3d targetT = Eigen::Vector3d(0.0, 0.0, 0.0); // Offset trên mặt bàn (m)
     double currentDistanceMeters = 0.58;
+    double currentCamHeightMeters = 0.95; // Độ cao camera so với mặt sàn (m)
 
     // Occluder State (Lon nấm hoặc vật cản)
     bool occluderEnabled = false; // Tắt mặc định, chỉ bật khi người dùng muốn test che khuất
@@ -529,16 +530,16 @@ struct MuJoCoD435SimSource::Impl {
             m->body_quat[4 * targetBodyId + 3] = q.z();
         }
 
-        // 2. Cập nhật vị trí camera_rig theo cự ly quan sát currentDistanceMeters
+        // 2. Cập nhật vị trí camera_rig theo cự ly quan sát & độ cao camera so với mặt sàn
         int camRigId = mj_name2id(m, mjOBJ_BODY, "camera_rig");
         if (camRigId >= 0) {
-            double dist = currentDistanceMeters > 0.25 ? currentDistanceMeters : 0.58;
-            double pitchRad = 22.0 * M_PI / 180.0;
-            double camY = -dist * std::cos(pitchRad);
-            double camZ = centerZ + dist * std::sin(pitchRad);
+            double dist = std::max(0.35, currentDistanceMeters);
+            double camZ = std::clamp(currentCamHeightMeters, 0.12, 1.80);
+            double dz = camZ - centerZ;
+            double horizDist = std::sqrt(std::max(0.09, dist * dist - dz * dz));
 
             m->body_pos[3 * camRigId + 0] = 0.0;
-            m->body_pos[3 * camRigId + 1] = camY;
+            m->body_pos[3 * camRigId + 1] = -horizDist;
             m->body_pos[3 * camRigId + 2] = camZ;
         }
 
@@ -762,6 +763,17 @@ void MuJoCoD435SimSource::setTargetPose(const Eigen::Matrix3d& R, const Eigen::V
     if (impl_->mujocoInitialized) {
         impl_->updateKinematics();
     }
+}
+
+void MuJoCoD435SimSource::setCameraHeightAboveFloor(double heightMeters) {
+    impl_->currentCamHeightMeters = std::clamp(heightMeters, 0.12, 1.80);
+    if (impl_->mujocoInitialized) {
+        impl_->updateKinematics();
+    }
+}
+
+double MuJoCoD435SimSource::cameraHeightAboveFloor() const {
+    return impl_->currentCamHeightMeters;
 }
 
 void MuJoCoD435SimSource::getGroundTruthPose(Eigen::Matrix3d& outR, Eigen::Vector3d& outt) const {

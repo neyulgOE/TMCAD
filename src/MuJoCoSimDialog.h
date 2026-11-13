@@ -15,6 +15,7 @@ struct MuJoCoSimConfig {
     std::string texPath;
     Eigen::Vector3d cadScale = Eigen::Vector3d(0.001, 0.001, 0.001); // Mặc định mm sang mét
     double distanceMeters = 0.68;
+    double camHeightMeters = 0.42; // Độ cao camera so với mặt sàn (m)
     double yawDeg = 20.0;
     double pitchDeg = 15.0;
     double rollDeg = 0.0;
@@ -65,6 +66,8 @@ private:
     QComboBox* profileCombo_ = nullptr;
     QSlider* distSlider_ = nullptr;
     QLabel* distLabel_ = nullptr;
+    QSlider* camHeightSlider_ = nullptr;
+    QLabel* camHeightLabel_ = nullptr;
     QSlider* yawSlider_ = nullptr;
     QLabel* yawLabel_ = nullptr;
     QSlider* pitchSlider_ = nullptr;

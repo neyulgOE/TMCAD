@@ -35,10 +35,10 @@ struct DatasetGenConfig {
 
     // --- AMR Constrained Mode ---
     bool amrMode = true; // Use floor-constrained WCS
-    double amrMinCameraHeightMeters = 0.1; // 10cm - 40cm uniform random height above floor
-    double amrMaxCameraHeightMeters = 0.4;
+    double amrMinCameraHeightMeters = 0.18; // 18cm - 115cm covers AMR + tripod/MuJoCo heights
+    double amrMaxCameraHeightMeters = 1.15;
     double amrCameraHeightMeters = 0.25;   // Fallback nominal height
-    double amrPitchRangeDeg = 10.0;        // Camera tilts up/down [-10 deg, +10 deg]
+    double amrPitchRangeDeg = 12.0;        // Camera tilts up/down [-12 deg, +12 deg]
     // Roll is fixed to 0 in AMR mode.
     // Distance uses [minDistanceMeters, maxDistanceMeters] on the floor (0.8m - 3.0m).
     // Yaw (azimuth) sweeps 360 degrees around the object.

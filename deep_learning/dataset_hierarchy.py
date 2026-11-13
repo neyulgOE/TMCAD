@@ -114,8 +114,17 @@ class CADHierarchyDataset(Dataset):
         # Tier 3: LocalPatchBundle (M, K=32, 13)
         if "patch_features" in patch_npz:
             self.patch_features = patch_npz["patch_features"].astype(np.float32)
-        elif "patch_triangle_indices" in patch_npz:
-            p_idx = patch_npz["patch_triangle_indices"].astype(np.int64)
+        elif "patch_triangle_indices" in patch_npz or "patch_indices" in patch_npz:
+            idx_key = "patch_triangle_indices" if "patch_triangle_indices" in patch_npz else "patch_indices"
+            p_idx = patch_npz[idx_key].astype(np.int64)
+            key_path = os.path.join(self.cad_data_dir, f"{self.cad_name}_key_triangles_512.npy")
+            if len(p_idx) > 512:
+                if os.path.exists(key_path):
+                    key_idx = np.load(key_path).astype(np.int64)
+                    p_idx = p_idx[key_idx]
+                else:
+                    step = np.linspace(0, len(p_idx) - 1, 512, dtype=np.int64)
+                    p_idx = p_idx[step]
             self.patch_features = self.tri_features[p_idx]
         else:
             raise KeyError("Tệp _patches.npz không chứa 'patch_features' hoặc 'patch_triangle_indices'.")
@@ -281,7 +290,8 @@ class CADHierarchyDataset(Dataset):
 
         if os.path.exists(corr_path):
             df = pd.read_csv(corr_path)
-            pts_cam = df[["obs_x", "obs_y", "obs_z"]].values.astype(np.float32)
+            obs_cols = ["obs_x", "obs_y", "obs_z"] if "obs_x" in df.columns else ["cam_x", "cam_y", "cam_z"]
+            pts_cam = df[obs_cols].values.astype(np.float32)
             if "cad_x" in df.columns:
                 cad_pts = df[["cad_x", "cad_y", "cad_z"]].values.astype(np.float32)
             else:

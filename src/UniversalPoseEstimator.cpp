@@ -975,9 +975,10 @@ bool UniversalPoseEstimator::isInTargetWorkspace(const cv::Vec3d& t) const
 bool UniversalPoseEstimator::isCandidateRotationValid(const cv::Matx33d& R_candidate) const
 {
     if (_is_floor_standing) {
-        if (R_candidate(1, 2) > -0.50 ||
-            std::abs(R_candidate(0, 2)) > 0.35 ||
-            std::abs(R_candidate(2, 2)) > 0.75) {
+        // Hỗ trợ camera đặt từ thấp (0.15m) tới cao (1.50m, góc chúc tới ~48 độ):
+        if (R_candidate(1, 2) > -0.40 ||
+            std::abs(R_candidate(0, 2)) > 0.45 ||
+            std::abs(R_candidate(2, 2)) > 0.85) {
             return false;
         }
     }
@@ -1396,20 +1397,26 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
 
     // 6. Floor upright gravity lock ONLY for FLOOR_STANDING archetypes (tables, racks, pallets)
     if (best_pose.valid && _is_floor_standing && valid_floor) {
-        cv::Vec3d z_axis(n_fl[0], n_fl[1], n_fl[2]);
-        if (n_fl[1] < -0.82 && n_fl[2] >= 0.05 && n_fl[2] <= 0.35) {
-            z_axis = cv::Vec3d(n_fl[0] * 0.5, n_fl[1], n_fl[2]);
-        }
+        cv::Vec3d z_axis = n_fl;
         z_axis *= (1.0 / std::max(1e-6, cv::norm(z_axis)));
         cv::Vec3d y_axis(best_pose.R(0, 1), best_pose.R(1, 1), best_pose.R(2, 1));
         y_axis -= z_axis * z_axis.dot(y_axis);
         if (cv::norm(y_axis) > 1e-6) {
             y_axis *= (1.0 / cv::norm(y_axis));
             cv::Vec3d x_axis = y_axis.cross(z_axis);
+            x_axis *= (1.0 / std::max(1e-6, cv::norm(x_axis)));
+
+            cv::Vec3d cad_center(
+                0.5 * (_cad_min[0] + _cad_max[0]),
+                0.5 * (_cad_min[1] + _cad_max[1]),
+                0.5 * (_cad_min[2] + _cad_max[2]));
+            cv::Vec3d world_center = best_pose.R * cad_center + best_pose.t;
+
             best_pose.R = cv::Matx33d(
                 x_axis[0], y_axis[0], z_axis[0],
                 x_axis[1], y_axis[1], z_axis[1],
                 x_axis[2], y_axis[2], z_axis[2]);
+            best_pose.t = world_center - best_pose.R * cad_center;
         }
     }
 

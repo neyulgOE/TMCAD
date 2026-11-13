@@ -119,12 +119,13 @@ int SyntheticDatasetGenerator::generate(const CADAsset& cadAsset, const DatasetG
             // Camera height is defined relative to the physical floor (bottom of CAD model)
             // rather than CAD centroid origin (0,0,0):
             const double floorZ = metricMesh->GetMinBound().z();
+            const double objCenterZ = 0.5 * (metricMesh->GetMinBound().z() + metricMesh->GetMaxBound().z());
             double camZ = floorZ + heightDist(rng);
 
-            // Camera looking parallel to the ground (same height)
-            // so Pitch = 0 means perfectly horizontal.
+            // Look toward object vertical center so high tripod/MuJoCo views (0.5m-1.15m)
+            // still frame the floor-standing object naturally, while low AMR views stay near-horizontal.
             Eigen::Vector3d camPos(camX, camY, camZ);
-            Eigen::Vector3d lookTarget(0.0, 0.0, camZ);
+            Eigen::Vector3d lookTarget(0.0, 0.0, objCenterZ);
             Eigen::Vector3d forward = (lookTarget - camPos).normalized();
             Eigen::Vector3d upWorld(0, 0, 1);
             Eigen::Vector3d right = forward.cross(upWorld).normalized();

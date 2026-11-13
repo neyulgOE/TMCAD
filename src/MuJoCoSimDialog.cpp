@@ -135,7 +135,7 @@ void MuJoCoSimDialog::setupUi() {
     // Khoảng cách camera
     poseLayout->addWidget(new QLabel(tr("Khoảng cách Camera (Z):"), this), 0, 0);
     distSlider_ = new QSlider(Qt::Horizontal, this);
-    distSlider_->setRange(40, 100); // 0.40m - 1.00m
+    distSlider_->setRange(40, 250); // 0.40m - 2.50m
     distSlider_->setValue(58);      // 0.58m chuẩn cự ly RealSense D435
     connect(distSlider_, &QSlider::valueChanged, this, &MuJoCoSimDialog::onDistanceChanged);
     poseLayout->addWidget(distSlider_, 0, 1);
@@ -144,43 +144,57 @@ void MuJoCoSimDialog::setupUi() {
     distLabel_->setStyleSheet("font-weight: bold; color: #4fc3f7;");
     poseLayout->addWidget(distLabel_, 0, 2);
 
+    // Độ cao camera so với mặt sàn
+    poseLayout->addWidget(new QLabel(tr("Độ cao Camera (Z_cam):"), this), 1, 0);
+    camHeightSlider_ = new QSlider(Qt::Horizontal, this);
+    camHeightSlider_->setRange(15, 150); // 0.15m - 1.50m
+    camHeightSlider_->setValue(42);
+    connect(camHeightSlider_, &QSlider::valueChanged, this, [this](int val) {
+        camHeightLabel_->setText(QString::number(val / 100.0, 'f', 2) + " m");
+    });
+    poseLayout->addWidget(camHeightSlider_, 1, 1);
+    camHeightLabel_ = new QLabel("0.42 m", this);
+    camHeightLabel_->setMinimumWidth(50);
+    camHeightLabel_->setStyleSheet("font-weight: bold; color: #80cbc4;");
+    poseLayout->addWidget(camHeightLabel_, 1, 2);
+
     // Góc xoay Yaw (Xoay quanh trục thẳng đứng trên mặt bàn)
-    poseLayout->addWidget(new QLabel(tr("Góc xoay ngang (Yaw):"), this), 1, 0);
+    poseLayout->addWidget(new QLabel(tr("Góc xoay ngang (Yaw):"), this), 2, 0);
     yawSlider_ = new QSlider(Qt::Horizontal, this);
     yawSlider_->setRange(-180, 180);
     yawSlider_->setValue(0);
     connect(yawSlider_, &QSlider::valueChanged, this, [this](int v) {
         yawLabel_->setText(QString("%1°").arg(v));
     });
-    poseLayout->addWidget(yawSlider_, 1, 1);
+    poseLayout->addWidget(yawSlider_, 2, 1);
     yawLabel_ = new QLabel("0°", this);
     yawLabel_->setStyleSheet("font-weight: bold;");
-    poseLayout->addWidget(yawLabel_, 1, 2);
+    poseLayout->addWidget(yawLabel_, 2, 2);
 
     // Góc nghiêng Pitch (Nghiêng trên mặt bàn)
-    poseLayout->addWidget(new QLabel(tr("Góc nghiêng dọc (Pitch):"), this), 2, 0);
+    poseLayout->addWidget(new QLabel(tr("Góc nghiêng dọc (Pitch):"), this), 3, 0);
     pitchSlider_ = new QSlider(Qt::Horizontal, this);
     pitchSlider_->setRange(-60, 60);
     pitchSlider_->setValue(0);
     connect(pitchSlider_, &QSlider::valueChanged, this, [this](int v) {
         pitchLabel_->setText(QString("%1°").arg(v));
     });
-    poseLayout->addWidget(pitchSlider_, 2, 1);
+    poseLayout->addWidget(pitchSlider_, 3, 1);
     pitchLabel_ = new QLabel("0°", this);
     pitchLabel_->setStyleSheet("font-weight: bold;");
-    poseLayout->addWidget(pitchLabel_, 2, 2);
+    poseLayout->addWidget(pitchLabel_, 3, 2);
 
     // Vật cản che khuất (Lon nấm đè lên)
     occluderCheck_ = new QCheckBox(tr("Kích hoạt Lon Nấm đè lên để test che khuất (Occlusion Test)"), this);
     occluderCheck_->setChecked(false);
-    poseLayout->addWidget(occluderCheck_, 3, 0, 1, 3);
+    poseLayout->addWidget(occluderCheck_, 4, 0, 1, 3);
 
-    poseLayout->addWidget(new QLabel(tr("Mức độ che khuất:"), this), 4, 0);
+    poseLayout->addWidget(new QLabel(tr("Mức độ che khuất:"), this), 5, 0);
     occlusionSlider_ = new QSlider(Qt::Horizontal, this);
     occlusionSlider_->setRange(0, 75);
     occlusionSlider_->setValue(35);
     connect(occlusionSlider_, &QSlider::valueChanged, this, &MuJoCoSimDialog::onOcclusionChanged);
-    poseLayout->addWidget(occlusionSlider_, 4, 1);
+    poseLayout->addWidget(occlusionSlider_, 5, 1);
     occlusionLabel_ = new QLabel("35%", this);
     occlusionLabel_->setStyleSheet("font-weight: bold; color: #ffb74d;");
     poseLayout->addWidget(occlusionLabel_, 4, 2);
@@ -283,6 +297,15 @@ void MuJoCoSimDialog::autoDetectTexture(const QString& cadPath) {
         texPathEdit_->setText(baseNoExt + ".jpg");
     } else {
         texPathEdit_->clear();
+    }
+
+    const QString upperName = cadPath.toUpper();
+    const bool isLargeFloorObj = upperName.contains("TABLE") || upperName.contains("PALLET") || upperName.contains("RACK");
+    if (distSlider_) {
+        distSlider_->setValue(isLargeFloorObj ? 135 : 58);
+    }
+    if (camHeightSlider_) {
+        camHeightSlider_->setValue(isLargeFloorObj ? 42 : 95);
     }
 }
 
@@ -418,6 +441,7 @@ void MuJoCoSimDialog::onStartClicked() {
         resultConfig_.cadScale = Eigen::Vector3d(s, s, s);
     }
     resultConfig_.distanceMeters = static_cast<double>(distSlider_->value()) / 100.0;
+    resultConfig_.camHeightMeters = camHeightSlider_ ? static_cast<double>(camHeightSlider_->value()) / 100.0 : 0.42;
     resultConfig_.yawDeg = yawSlider_->value();
     resultConfig_.pitchDeg = pitchSlider_->value();
     resultConfig_.occluderEnabled = occluderCheck_->isChecked();

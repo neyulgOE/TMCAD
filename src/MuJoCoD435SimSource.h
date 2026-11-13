@@ -26,8 +26,10 @@ public:
     bool applyHardwareProfile(const CameraHardwareProfile& profile, int profileId = -1);
     bool setCustomResolution(int targetW, int targetH);
 
-    // Điều khiển tư thế đối tượng mục tiêu (Target CAD: BBQ Sauce, etc.)
+    // Điều khiển tư thế đối tượng mục tiêu & độ cao camera so với sàn
     void setTargetPose(const Eigen::Matrix3d& R, const Eigen::Vector3d& t);
+    void setCameraHeightAboveFloor(double heightMeters);
+    double cameraHeightAboveFloor() const;
     void getGroundTruthPose(Eigen::Matrix3d& outR, Eigen::Vector3d& outt) const;
     void getGroundTruthBBox3D(std::vector<Eigen::Vector3d>& corners) const;
 
