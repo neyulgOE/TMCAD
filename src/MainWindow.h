@@ -443,6 +443,7 @@ private:
     std::atomic<bool> asyncWorkerBusy_{false};
     int muJoCoTickCounter_{0};
     CameraIntrinsics lastAsyncIntr_;
+    tmcad::ObjectPose lastMuJoCoPose_;
     QPushButton* replaceCadBtn_ = nullptr;
     QPushButton* resetSessionBtn_ = nullptr;
     void onMuJoCoSimTick();

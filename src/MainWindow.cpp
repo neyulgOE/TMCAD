@@ -6921,6 +6921,9 @@ void MainWindow::onStartMuJoCoSimulation() {
         }
     }
     if (!alreadyInScene && QFile::exists(QString::fromStdString(cfg.cadPath))) {
+        viewport_->makeCurrent();
+        scene_->clearAllAndResetCache();
+        viewport_->doneCurrent();
         scene_->addFile(cfg.cadPath);
         if (objectList_->count() > 0) {
             objectList_->setCurrentRow(objectList_->count() - 1);
@@ -7007,6 +7010,7 @@ void MainWindow::onStartMuJoCoSimulation() {
     muJoCoTickCounter_ = 0;
     isMuJoCoInferencing_ = false;
     asyncWorkerBusy_.store(false);
+    lastMuJoCoPose_ = tmcad::ObjectPose{};
     muJoCoSimTimer_->start(16); // ~60 FPS render
 
     pipelineLog(QString("🎮 [MUJOCO DUAL VIEW] Đã khởi chạy mô phỏng tương tác 2 bên song song:"));
@@ -7033,34 +7037,34 @@ void MainWindow::onMuJoCoSimTick() {
         asyncMuJoCoPoseFuture_.valid() &&
         asyncMuJoCoPoseFuture_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
 
-        tmcad::ObjectPose pose = asyncMuJoCoPoseFuture_.get();
+        lastMuJoCoPose_ = asyncMuJoCoPoseFuture_.get();
         asyncWorkerBusy_.store(false);
 
         if (liveCameraStreamWidget_ && liveCppEstimator_) {
-            if (pose.valid) {
+            if (lastMuJoCoPose_.valid) {
                 QString telemetry = QString("Pose6DoF | %1 | t=(%2, %3, %4)m | Yaw=%5° | RMSE=%6mm")
-                    .arg(QString::fromStdString(pose.model_name))
-                    .arg(pose.t[0], 0, 'f', 2)
-                    .arg(pose.t[1], 0, 'f', 2)
-                    .arg(pose.t[2], 0, 'f', 2)
-                    .arg(pose.yaw_deg, 0, 'f', 1)
-                    .arg(pose.rmse_m * 1000.0, 0, 'f', 1);
+                    .arg(QString::fromStdString(lastMuJoCoPose_.model_name))
+                    .arg(lastMuJoCoPose_.t[0], 0, 'f', 2)
+                    .arg(lastMuJoCoPose_.t[1], 0, 'f', 2)
+                    .arg(lastMuJoCoPose_.t[2], 0, 'f', 2)
+                    .arg(lastMuJoCoPose_.yaw_deg, 0, 'f', 1)
+                    .arg(lastMuJoCoPose_.rmse_m * 1000.0, 0, 'f', 1);
                 liveCameraStreamWidget_->setUniversalPoseOverlays(
-                    {pose}, *liveCppEstimator_, lastAsyncIntr_, telemetry, "MuJoCo_Live_D435if");
+                    {lastMuJoCoPose_}, *liveCppEstimator_, lastAsyncIntr_, telemetry, "MuJoCo_Live_D435if");
             } else {
                 liveCameraStreamWidget_->clearOverlayDetection();
             }
         }
 
-        if (pose.valid) {
+        if (lastMuJoCoPose_.valid) {
             statusBar()->showMessage(
                 QString("🎯 [MuJoCo Live 6DoF] %1 | X:%2m Y:%3m Z:%4m | Yaw:%5° | RMSE:%6mm")
-                .arg(QString::fromStdString(pose.model_name))
-                .arg(pose.t[0], 0, 'f', 2)
-                .arg(pose.t[1], 0, 'f', 2)
-                .arg(pose.t[2], 0, 'f', 2)
-                .arg(pose.yaw_deg, 0, 'f', 1)
-                .arg(pose.rmse_m * 1000.0, 0, 'f', 1));
+                .arg(QString::fromStdString(lastMuJoCoPose_.model_name))
+                .arg(lastMuJoCoPose_.t[0], 0, 'f', 2)
+                .arg(lastMuJoCoPose_.t[1], 0, 'f', 2)
+                .arg(lastMuJoCoPose_.t[2], 0, 'f', 2)
+                .arg(lastMuJoCoPose_.yaw_deg, 0, 'f', 1)
+                .arg(lastMuJoCoPose_.rmse_m * 1000.0, 0, 'f', 1));
         }
     }
 
@@ -7091,6 +7095,18 @@ void MainWindow::onMuJoCoSimTick() {
         Eigen::Vector3d gtt;
         activeMuJoCoSim_->getGroundTruthPose(gtR, gtt);
         liveCameraStreamWidget_->displayStaticRGBDFrame(qColor.copy(), qDepth.copy(), static_cast<float>(gtt.z()));
+
+        if (lastMuJoCoPose_.valid && liveCppEstimator_) {
+            QString telemetry = QString("Pose6DoF | %1 | t=(%2, %3, %4)m | Yaw=%5° | RMSE=%6mm")
+                .arg(QString::fromStdString(lastMuJoCoPose_.model_name))
+                .arg(lastMuJoCoPose_.t[0], 0, 'f', 2)
+                .arg(lastMuJoCoPose_.t[1], 0, 'f', 2)
+                .arg(lastMuJoCoPose_.t[2], 0, 'f', 2)
+                .arg(lastMuJoCoPose_.yaw_deg, 0, 'f', 1)
+                .arg(lastMuJoCoPose_.rmse_m * 1000.0, 0, 'f', 1);
+            liveCameraStreamWidget_->setUniversalPoseOverlays(
+                {lastMuJoCoPose_}, *liveCppEstimator_, intr, telemetry, "MuJoCo_Live_D435if");
+        }
     }
 
     std::string desiredOnnx = selectedOnnxPath().toStdString();
@@ -7131,6 +7147,7 @@ void MainWindow::stopMuJoCoSimulation() {
     }
     asyncWorkerBusy_.store(false);
     isMuJoCoInferencing_.store(false);
+    lastMuJoCoPose_ = tmcad::ObjectPose{};
     if (activeMuJoCoSim_) {
         activeMuJoCoSim_->closeInteractiveWindow();
         activeMuJoCoSim_->close();

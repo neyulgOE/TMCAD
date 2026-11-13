@@ -153,7 +153,7 @@ struct MuJoCoD435SimSource::Impl {
         if (impl->mod_ctrl) {
             // Giữ Ctrl + Cuộn chuột: Điều chỉnh cự ly camera quan sát (gần / xa)
             impl->currentDistanceMeters -= yoffset * 0.03;
-            impl->currentDistanceMeters = std::clamp(impl->currentDistanceMeters, 0.35, 1.20);
+            impl->currentDistanceMeters = std::clamp(impl->currentDistanceMeters, 0.35, 3.00);
             impl->updateKinematics();
         } else {
             // Cuộn chuột bình thường: Phóng to/thu nhỏ góc nhìn camera
@@ -174,7 +174,7 @@ struct MuJoCoD435SimSource::Impl {
             } else if (key == GLFW_KEY_R) {
                 impl->targetR = Eigen::Matrix3d::Identity();
                 impl->targetT = Eigen::Vector3d::Zero();
-                impl->currentDistanceMeters = 0.58;
+                impl->currentDistanceMeters = impl->isFloorStandingLargeObject() ? 1.35 : 0.58;
                 impl->updateKinematics();
             } else if (key == GLFW_KEY_ESCAPE) {
                 glfwSetWindowShouldClose(window, GLFW_TRUE);
@@ -362,10 +362,20 @@ struct MuJoCoD435SimSource::Impl {
         return false;
     }
 
+    bool isFloorStandingLargeObject() const {
+        if (targetSize.norm() > 0.55) return true;
+        std::string upper = cadObjPath;
+        std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+        return (upper.find("TABLE") != std::string::npos ||
+                upper.find("PALLET") != std::string::npos ||
+                upper.find("RACK") != std::string::npos);
+    }
+
     std::string generateMJCF(double fovYDeg) {
         std::stringstream ss;
-        double tableHeight = 0.75;
-        // Đặt vật thể sao cho đáy hình học (targetMinBound.z) tiếp xúc chuẩn trên mặt bàn (tableHeight)
+        const bool largeFloorObj = isFloorStandingLargeObject();
+        double tableHeight = largeFloorObj ? 0.0 : 0.75;
+        // Đặt vật thể sao cho đáy hình học (targetMinBound.z) tiếp xúc chuẩn trên mặt bàn/sàn (tableHeight)
         double baseZ = tableHeight - targetMinBound.z();
         double centerZ = baseZ + 0.5 * (targetMinBound.z() + targetMaxBound.z());
 
@@ -412,16 +422,18 @@ struct MuJoCoD435SimSource::Impl {
            << "    <light directional='true' pos='0.2 -1.0 2.4' dir='-0.1 0.6 -1' diffuse='0.9 0.9 0.9' specular='0.3 0.3 0.3'/>\n"
            << "    <light directional='true' pos='-1.0 0.2 2.0' dir='0.6 -0.2 -0.8' diffuse='0.7 0.7 0.7'/>\n"
            << "    <light directional='true' pos='0.8 0.6 2.0' dir='-0.4 -0.4 -0.8' diffuse='0.6 0.6 0.6'/>\n"
-           << "    <light directional='true' pos='0.0 -0.8 1.1' dir='0.0 0.8 -0.3' diffuse='0.6 0.6 0.6'/>\n"
-           << "    <!-- BÀN LÀM VIỆC CÔNG NGHIỆP: Mặt bàn cao 0.75m, kích thước 1.0m x 0.7m -->\n"
-           << "    <body name='worktable' pos='0 0 0'>\n"
-           << "      <geom name='table_top' type='box' size='0.50 0.35 0.02' pos='0 0 0.73' material='table_mat'/>\n"
-           << "      <geom name='leg1' type='cylinder' size='0.022 0.355' pos=' 0.45  0.30 0.355' material='metal_mat'/>\n"
-           << "      <geom name='leg2' type='cylinder' size='0.022 0.355' pos='-0.45  0.30 0.355' material='metal_mat'/>\n"
-           << "      <geom name='leg3' type='cylinder' size='0.022 0.355' pos=' 0.45 -0.30 0.355' material='metal_mat'/>\n"
-           << "      <geom name='leg4' type='cylinder' size='0.022 0.355' pos='-0.45 -0.30 0.355' material='metal_mat'/>\n"
-           << "    </body>\n"
-           << "    <!-- VẬT THỂ CAD: ĐỨNG THẲNG TỰ NHIÊN TRÊN MẶT BÀN -->\n"
+           << "    <light directional='true' pos='0.0 -0.8 1.1' dir='0.0 0.8 -0.3' diffuse='0.6 0.6 0.6'/>\n";
+        if (!largeFloorObj) {
+            ss << "    <!-- BÀN LÀM VIỆC CÔNG NGHIỆP: Mặt bàn cao 0.75m, kích thước 1.0m x 0.7m -->\n"
+               << "    <body name='worktable' pos='0 0 0'>\n"
+               << "      <geom name='table_top' type='box' size='0.50 0.35 0.02' pos='0 0 0.73' material='table_mat'/>\n"
+               << "      <geom name='leg1' type='cylinder' size='0.022 0.355' pos=' 0.45  0.30 0.355' material='metal_mat'/>\n"
+               << "      <geom name='leg2' type='cylinder' size='0.022 0.355' pos='-0.45  0.30 0.355' material='metal_mat'/>\n"
+               << "      <geom name='leg3' type='cylinder' size='0.022 0.355' pos=' 0.45 -0.30 0.355' material='metal_mat'/>\n"
+               << "      <geom name='leg4' type='cylinder' size='0.022 0.355' pos='-0.45 -0.30 0.355' material='metal_mat'/>\n"
+               << "    </body>\n";
+        }
+        ss << "    <!-- VẬT THỂ CAD: ĐỨNG THẲNG TỰ NHIÊN TRÊN MẶT BÀN / SÀN -->\n"
            << "    <body name='target_body' pos='0 0 " << baseZ << "' quat='1 0 0 0'>\n";
 
         if (!cadObjPath.empty()) {
@@ -494,7 +506,8 @@ struct MuJoCoD435SimSource::Impl {
     void updateKinematics() {
         if (!m || !d) return;
 
-        double tableHeight = 0.75;
+        const bool largeFloorObj = isFloorStandingLargeObject();
+        double tableHeight = largeFloorObj ? 0.0 : 0.75;
         double baseZ = tableHeight - targetMinBound.z();
         double centerZ = baseZ + 0.5 * (targetMinBound.z() + targetMaxBound.z());
 
@@ -686,6 +699,10 @@ bool MuJoCoD435SimSource::applyHardwareProfile(const CameraHardwareProfile& prof
     impl_->currentWidth = selected->width;
     impl_->currentHeight = selected->height;
 
+    if (impl_->isFloorStandingLargeObject() && impl_->currentDistanceMeters < 1.0) {
+        impl_->currentDistanceMeters = 1.35;
+    }
+
     if (impl_->opened || impl_->isInteractive) {
         const bool wasInteractive = impl_->isInteractive;
         int winX = 100, winY = 100;
@@ -710,6 +727,10 @@ bool MuJoCoD435SimSource::setCustomResolution(int targetW, int targetH) {
     impl_->currentHeight = targetH;
     impl_->activeProfileId = -1; // Chế độ tùy biến
 
+    if (impl_->isFloorStandingLargeObject() && impl_->currentDistanceMeters < 1.0) {
+        impl_->currentDistanceMeters = 1.35;
+    }
+
     if (impl_->opened || impl_->isInteractive) {
         const bool wasInteractive = impl_->isInteractive;
         int winX = 100, winY = 100;
@@ -730,8 +751,8 @@ bool MuJoCoD435SimSource::setCustomResolution(int targetW, int targetH) {
 void MuJoCoD435SimSource::setTargetPose(const Eigen::Matrix3d& R, const Eigen::Vector3d& t) {
     impl_->targetR = R;
     if (t.z() > 0.2) {
-        impl_->currentDistanceMeters = t.z();
-        impl_->targetT.z() = 0.0; // Đặt vật thể đứng ngay ngắn trên mặt bàn
+        impl_->currentDistanceMeters = (impl_->isFloorStandingLargeObject() && t.z() < 1.0) ? 1.35 : t.z();
+        impl_->targetT.z() = 0.0; // Đặt vật thể đứng ngay ngắn trên mặt bàn / sàn
     } else {
         impl_->targetT.z() = t.z();
     }
@@ -954,6 +975,10 @@ bool MuJoCoD435SimSource::loadTargetMesh(const std::string& objPath,
             impl_->targetMaxBound = Eigen::Vector3d(maxX, maxY, maxZ).cwiseProduct(impl_->cadScale);
             impl_->targetSize = impl_->targetMaxBound - impl_->targetMinBound;
         }
+    }
+
+    if (impl_->isFloorStandingLargeObject() && impl_->currentDistanceMeters < 1.0) {
+        impl_->currentDistanceMeters = 1.35;
     }
 
     if (impl_->opened || impl_->isInteractive) {
