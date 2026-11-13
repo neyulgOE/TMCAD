@@ -167,34 +167,79 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
 
 double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
                                         cv::Vec3d& t,
+                                        const cv::Vec3d& cad_min,
+                                        const cv::Vec3d& cad_max,
+                                        const cv::Vec4d& floor_plane,
+                                        bool has_floor,
                                         const std::vector<cv::Vec3f>& mesh_pts,
                                         const cv::Mat& dt_canny,
                                         double fx, double fy, double cx, double cy)
 {
     double best_cost = computeRgbSilhouetteChamferCost(R, t, mesh_pts, dt_canny, fx, fy, cx, cy);
-    if (dt_canny.empty() || mesh_pts.empty() || best_cost <= 5.5) return best_cost;
+    if (dt_canny.empty() || mesh_pts.empty()) return best_cost;
 
+    // Tạo thêm ứng viên R_up / R_up_flip (vật thể đứng thẳng trên mặt bàn dọc theo pháp tuyến sàn/bàn)
+    // để khôi phục hướng đứng khi thân vật thể bị đen Depth chỉ còn điểm ở chân đế làm ICP bị đổ ngang.
+    cv::Vec3d up_cam(0.0, -0.96, 0.28);
+    const cv::Vec3d fn(floor_plane[0], floor_plane[1], floor_plane[2]);
+    if (has_floor && cv::norm(fn) > 1e-6) {
+        up_cam = fn * (1.0 / cv::norm(fn));
+        if (up_cam[1] > 0.0) up_cam = -up_cam;
+    }
+
+    const cv::Vec3d span = cad_max - cad_min;
+    int long_ax = 2;
+    if (span[0] >= span[1] && span[0] >= span[2]) long_ax = 0;
+    else if (span[1] >= span[0] && span[1] >= span[2]) long_ax = 1;
+    const int ax1 = (long_ax + 1) % 3;
+    const int ax2 = (long_ax + 2) % 3;
+
+    const cv::Vec3d ref_x(1.0, 0.0, 0.0);
+    cv::Vec3d s1 = ref_x - up_cam * up_cam.dot(ref_x);
+    s1 *= (1.0 / std::max(1e-9, cv::norm(s1)));
+    cv::Vec3d s2 = up_cam.cross(s1);
+    s2 *= (1.0 / std::max(1e-9, cv::norm(s2)));
+
+    cv::Matx33d R_up = cv::Matx33d::zeros();
+    for (int r = 0; r < 3; ++r) {
+        R_up(r, long_ax) = -up_cam[r];
+        R_up(r, ax1) = s1[r];
+        R_up(r, ax2) = s2[r];
+    }
+    if (cv::determinant(R_up) < 0.0) {
+        for (int r = 0; r < 3; ++r) R_up(r, ax2) = -R_up(r, ax2);
+    }
+    cv::Matx33d R_up_flip = R_up;
+    for (int r = 0; r < 3; ++r) {
+        R_up_flip(r, long_ax) = -R_up(r, long_ax);
+        R_up_flip(r, ax1) = -R_up(r, ax1);
+    }
+
+    const std::vector<cv::Matx33d> R_cands = {R, R_up, R_up_flip};
     const cv::Vec3d base_t = t;
+    cv::Matx33d best_R = R;
     cv::Vec3d best_t = t;
 
-    // Coarse 2D-offset search around support base (handles depth blackout on glossy bottles/parts)
-    for (double dy = -0.16; dy <= 0.081; dy += 0.03) {
-        for (double dx = -0.12; dx <= 0.121; dx += 0.03) {
-            const cv::Vec3d t_try(base_t[0] + dx, base_t[1] + dy, base_t[2]);
-            const double c = computeRgbSilhouetteChamferCost(R, t_try, mesh_pts, dt_canny, fx, fy, cx, cy);
-            if (c < best_cost) {
-                best_cost = c;
-                best_t = t_try;
+    for (const auto& R_try : R_cands) {
+        for (double dy = -0.18; dy <= 0.061; dy += 0.03) {
+            for (double dx = -0.10; dx <= 0.101; dx += 0.025) {
+                const cv::Vec3d t_try(base_t[0] + dx, base_t[1] + dy, base_t[2]);
+                const double c = computeRgbSilhouetteChamferCost(R_try, t_try, mesh_pts, dt_canny, fx, fy, cx, cy);
+                if (c < best_cost) {
+                    best_cost = c;
+                    best_R = R_try;
+                    best_t = t_try;
+                }
             }
         }
     }
 
-    // Fine 1cm refinement
+    // Tinh chỉnh mịn 8mm quanh vị trí và hướng tốt nhất
     const cv::Vec3d mid_t = best_t;
-    for (double dy = -0.02; dy <= 0.021; dy += 0.01) {
-        for (double dx = -0.02; dx <= 0.021; dx += 0.01) {
+    for (double dy = -0.024; dy <= 0.025; dy += 0.008) {
+        for (double dx = -0.024; dx <= 0.025; dx += 0.008) {
             const cv::Vec3d t_try(mid_t[0] + dx, mid_t[1] + dy, mid_t[2]);
-            const double c = computeRgbSilhouetteChamferCost(R, t_try, mesh_pts, dt_canny, fx, fy, cx, cy);
+            const double c = computeRgbSilhouetteChamferCost(best_R, t_try, mesh_pts, dt_canny, fx, fy, cx, cy);
             if (c < best_cost) {
                 best_cost = c;
                 best_t = t_try;
@@ -202,6 +247,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
         }
     }
 
+    R = best_R;
     t = best_t;
     return best_cost;
 }
@@ -2528,8 +2574,14 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
 
             double sil_cost = 0.0;
             if (!dt_canny.empty()) {
-                sil_cost = refineTranslationOnRgbSilhouette(cand.R, cand.t, _mesh_pts, dt_canny, sil_fx, sil_fy, sil_cx, sil_cy);
+                sil_cost = refineTranslationOnRgbSilhouette(
+                    cand.R, cand.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
+                    _mesh_pts, dt_canny, sil_fx, sil_fy, sil_cx, sil_cy);
                 cand.t_glass = cand.t;
+                const cv::Vec3d euler = rotationMatrixToEulerDeg(cand.R, false);
+                cand.roll_deg = euler[0];
+                cand.pitch_deg = euler[1];
+                cand.yaw_deg = euler[2];
                 cand.bbox_2d = projectCadBoundingBox(cand.R, cand.t, intr, depth_z16.cols, depth_z16.rows, &cand.corners_2d);
             }
 
@@ -2540,9 +2592,9 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                     best_strict_rank = rank;
                     pose = std::move(strict_cand);
                 }
-            } else if (dt_canny.empty() || sil_cost <= 10.5) {
+            } else if (dt_canny.empty() || sil_cost <= 6.5) {
                 rescorePoseUnclipped(cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
-                double rank = static_cast<double>(cand.confidence) - 2.0 * std::max(0.0, cand.rmse_m - 0.015) - 0.05 * sil_cost;
+                double rank = static_cast<double>(cand.confidence) - 2.0 * std::max(0.0, cand.rmse_m - 0.015) - 0.06 * sil_cost;
                 if (rank > best_fb_rank) {
                     best_fb_rank = rank;
                     best_fb_pose = std::move(cand);
@@ -2651,20 +2703,31 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
 
             double sil_cost = 0.0;
             if (!dt_canny.empty()) {
-                sil_cost = refineTranslationOnRgbSilhouette(inst_pose.R, inst_pose.t, _mesh_pts, dt_canny, sil_fx, sil_fy, sil_cx, sil_cy);
+                sil_cost = refineTranslationOnRgbSilhouette(
+                    inst_pose.R, inst_pose.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
+                    _mesh_pts, dt_canny, sil_fx, sil_fy, sil_cx, sil_cy);
                 inst_pose.t_glass = inst_pose.t;
+                const cv::Vec3d euler = rotationMatrixToEulerDeg(inst_pose.R, false);
+                inst_pose.roll_deg = euler[0];
+                inst_pose.pitch_deg = euler[1];
+                inst_pose.yaw_deg = euler[2];
                 inst_pose.bbox_2d = projectCadBoundingBox(inst_pose.R, inst_pose.t, intr, depth_z16.cols, depth_z16.rows, &inst_pose.corners_2d);
             }
 
             ObjectPose strict_pose = inst_pose;
             if (rescorePoseUnclipped(strict_pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true)) {
                 results.push_back(std::move(strict_pose));
-            } else if (dt_canny.empty() || sil_cost <= 10.5) {
+            } else if (dt_canny.empty() || sil_cost <= 6.5) {
                 rescorePoseUnclipped(inst_pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
+                // Phạt nhẹ theo sil_cost để ứng viên khớp viền RGB nhất đứng đầu khi rơi vào fallback
+                inst_pose.confidence = std::clamp(
+                    static_cast<float>(static_cast<double>(inst_pose.confidence) - 0.04 * sil_cost),
+                    0.05f, 0.99f);
                 relaxed_pool.push_back(std::move(inst_pose));
             }
         }
-        if (results.empty() && !relaxed_pool.empty()) {
+        const bool used_relaxed_fallback = (results.empty() && !relaxed_pool.empty());
+        if (used_relaxed_fallback) {
             results = std::move(relaxed_pool);
         }
 
@@ -2674,6 +2737,9 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
                 const double rb = static_cast<double>(b.confidence) - 2.0 * std::max(0.0, b.rmse_m - 0.015);
                 return ra > rb;
             });
+            if (used_relaxed_fallback && results.size() > 1) {
+                results.resize(1);
+            }
 
             // 3D NMS to merge duplicate spherical proposals on the same physical object instance
             const double nms_min_sep = std::max(0.045, 0.35 * _real_bounding_diag_m);

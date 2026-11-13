@@ -1034,7 +1034,7 @@ void CADSceneSegmenter::clusterAndMergeTarget(const std::vector<cv::Vec3f>& fg_p
                 }
             }
         } else {
-            const float free_max_z = std::clamp(5.0f * _bounding_diag_m + 0.35f, 0.95f, _max_depth_m);
+            const float free_max_z = std::clamp(3.8f * _bounding_diag_m + 0.15f, 0.75f, _max_depth_m);
             // Keep object-sized standalone clusters first
             for (const auto& cl : raw_clusters) {
                 const float c_diag = static_cast<float>(cv::norm(cl.bbox_max - cl.bbox_min));
