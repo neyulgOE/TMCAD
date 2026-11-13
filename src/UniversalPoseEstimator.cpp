@@ -85,6 +85,127 @@ void computeVisibleCadSubset(const cv::Matx33d& R,
     }
 }
 
+cv::Mat buildRgbCannyDistanceTransform(const cv::Mat& rgb)
+{
+    if (rgb.empty()) return cv::Mat();
+    cv::Mat gray, edges, inv_edges, dt;
+    if (rgb.channels() == 3) {
+        cv::cvtColor(rgb, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = rgb;
+    }
+    cv::GaussianBlur(gray, gray, cv::Size(3, 3), 0.8);
+    cv::Canny(gray, edges, 45, 130);
+    cv::bitwise_not(edges, inv_edges);
+    cv::distanceTransform(inv_edges, dt, cv::DIST_L2, 3);
+    return dt;
+}
+
+double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
+                                       const cv::Vec3d& t,
+                                       const std::vector<cv::Vec3f>& mesh_pts,
+                                       const cv::Mat& dt_canny,
+                                       double fx, double fy, double cx, double cy)
+{
+    if (mesh_pts.empty() || dt_canny.empty()) return 50.0;
+
+    const int w = dt_canny.cols;
+    const int h = dt_canny.rows;
+
+    constexpr int kBins = 24;
+    int row_min_u[kBins], row_max_u[kBins], row_v[kBins];
+    for (int b = 0; b < kBins; ++b) {
+        row_min_u[b] = 100000;
+        row_max_u[b] = -100000;
+        row_v[b] = -1;
+    }
+
+    int min_v = 100000, max_v = -100000;
+    int min_u_all = 100000, max_u_all = -100000;
+    const size_t step = std::max<size_t>(1, mesh_pts.size() / 600);
+
+    std::vector<cv::Point> proj_pts;
+    proj_pts.reserve(mesh_pts.size() / step + 1);
+
+    for (size_t i = 0; i < mesh_pts.size(); i += step) {
+        const cv::Vec3d pc = R * cv::Vec3d(mesh_pts[i]) + t;
+        if (pc[2] <= 0.12) continue;
+        const int u = static_cast<int>(std::round(fx * pc[0] / pc[2] + cx));
+        const int v = static_cast<int>(std::round(fy * pc[1] / pc[2] + cy));
+        if (u < 2 || u >= w - 2 || v < 2 || v >= h - 2) return 50.0;
+        proj_pts.emplace_back(u, v);
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        if (u < min_u_all) min_u_all = u;
+        if (u > max_u_all) max_u_all = u;
+    }
+
+    if (proj_pts.size() < 20 || max_v - min_v < 12 || max_u_all - min_u_all < 10) return 50.0;
+
+    const double inv_span_v = static_cast<double>(kBins - 1) / std::max(1, max_v - min_v);
+    for (const auto& pt : proj_pts) {
+        const int b = std::clamp(static_cast<int>((pt.y - min_v) * inv_span_v), 0, kBins - 1);
+        if (pt.x < row_min_u[b]) row_min_u[b] = pt.x;
+        if (pt.x > row_max_u[b]) row_max_u[b] = pt.x;
+        row_v[b] = pt.y;
+    }
+
+    double sum_dt = 0.0;
+    int cnt = 0;
+    for (int b = 0; b < kBins; ++b) {
+        if (row_v[b] < 0) continue;
+        const int v = row_v[b];
+        const int u_l = row_min_u[b];
+        const int u_r = row_max_u[b];
+        sum_dt += std::min(30.0f, dt_canny.at<float>(v, u_l));
+        sum_dt += std::min(30.0f, dt_canny.at<float>(v, u_r));
+        cnt += 2;
+    }
+
+    return (cnt >= 8) ? (sum_dt / cnt) : 50.0;
+}
+
+double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
+                                        cv::Vec3d& t,
+                                        const std::vector<cv::Vec3f>& mesh_pts,
+                                        const cv::Mat& dt_canny,
+                                        double fx, double fy, double cx, double cy)
+{
+    double best_cost = computeRgbSilhouetteChamferCost(R, t, mesh_pts, dt_canny, fx, fy, cx, cy);
+    if (dt_canny.empty() || mesh_pts.empty() || best_cost <= 5.5) return best_cost;
+
+    const cv::Vec3d base_t = t;
+    cv::Vec3d best_t = t;
+
+    // Coarse 2D-offset search around support base (handles depth blackout on glossy bottles/parts)
+    for (double dy = -0.16; dy <= 0.081; dy += 0.03) {
+        for (double dx = -0.12; dx <= 0.121; dx += 0.03) {
+            const cv::Vec3d t_try(base_t[0] + dx, base_t[1] + dy, base_t[2]);
+            const double c = computeRgbSilhouetteChamferCost(R, t_try, mesh_pts, dt_canny, fx, fy, cx, cy);
+            if (c < best_cost) {
+                best_cost = c;
+                best_t = t_try;
+            }
+        }
+    }
+
+    // Fine 1cm refinement
+    const cv::Vec3d mid_t = best_t;
+    for (double dy = -0.02; dy <= 0.021; dy += 0.01) {
+        for (double dx = -0.02; dx <= 0.021; dx += 0.01) {
+            const cv::Vec3d t_try(mid_t[0] + dx, mid_t[1] + dy, mid_t[2]);
+            const double c = computeRgbSilhouetteChamferCost(R, t_try, mesh_pts, dt_canny, fx, fy, cx, cy);
+            if (c < best_cost) {
+                best_cost = c;
+                best_t = t_try;
+            }
+        }
+    }
+
+    t = best_t;
+    return best_cost;
+}
+
 struct BidirectionalConsensus {
     double fwd_kernel{0.0};
     double bwd_kernel{0.0};
@@ -1925,7 +2046,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         std::sort(cand_pool.begin(), cand_pool.end(),
                   [](const RankedSeed& a, const RankedSeed& b) { return a.pre > b.pre; });
 
-        const size_t take_top = std::min<size_t>(16, cand_pool.size());
+        const size_t take_top = std::min<size_t>(6, cand_pool.size());
         for (size_t k = 0; k < take_top; ++k) {
             seeds.push_back(PoseSeed{cand_pool[k].R, cand_pool[k].t, 0.0});
         }
@@ -2384,11 +2505,17 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
     }
 
     double ai_ms = 0.0;
+    const cv::Mat dt_canny = (!_is_floor_standing && !rgb.empty()) ? buildRgbCannyDistanceTransform(rgb) : cv::Mat();
+    const double sil_fx = (intr.fx > 100.0) ? intr.fx : 600.0;
+    const double sil_fy = (intr.fy > 100.0) ? intr.fy : sil_fx;
+    const double sil_cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * depth_z16.cols);
+    const double sil_cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * depth_z16.rows);
+
     if (!_is_floor_standing && seg_res.multi_clusters.size() > 1) {
         double best_strict_rank = -1e9;
         double best_fb_rank = -1e9;
         ObjectPose best_fb_pose;
-        const size_t n_try = std::min<size_t>(seg_res.multi_clusters.size(), 32);
+        const size_t n_try = std::min<size_t>(seg_res.multi_clusters.size(), 6);
         for (size_t i = 0; i < n_try; ++i) {
             const auto& cl = seg_res.multi_clusters[i];
             if (cl.points.size() < 20) continue;
@@ -2398,16 +2525,24 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                                                     seg_res.floor_pitch_deg, rgb, intr, depth_z16.cols, depth_z16.rows, &c_ai);
             ai_ms += c_ai;
             if (!cand.valid) continue;
+
+            double sil_cost = 0.0;
+            if (!dt_canny.empty()) {
+                sil_cost = refineTranslationOnRgbSilhouette(cand.R, cand.t, _mesh_pts, dt_canny, sil_fx, sil_fy, sil_cx, sil_cy);
+                cand.t_glass = cand.t;
+                cand.bbox_2d = projectCadBoundingBox(cand.R, cand.t, intr, depth_z16.cols, depth_z16.rows, &cand.corners_2d);
+            }
+
             ObjectPose strict_cand = cand;
             if (rescorePoseUnclipped(strict_cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true)) {
-                double rank = static_cast<double>(strict_cand.confidence) - 2.0 * std::max(0.0, strict_cand.rmse_m - 0.015);
+                double rank = static_cast<double>(strict_cand.confidence) - 2.0 * std::max(0.0, strict_cand.rmse_m - 0.015) - 0.04 * sil_cost;
                 if (rank > best_strict_rank) {
                     best_strict_rank = rank;
                     pose = std::move(strict_cand);
                 }
-            } else {
+            } else if (dt_canny.empty() || sil_cost <= 10.5) {
                 rescorePoseUnclipped(cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
-                double rank = static_cast<double>(cand.confidence) - 2.0 * std::max(0.0, cand.rmse_m - 0.015);
+                double rank = static_cast<double>(cand.confidence) - 2.0 * std::max(0.0, cand.rmse_m - 0.015) - 0.05 * sil_cost;
                 if (rank > best_fb_rank) {
                     best_fb_rank = rank;
                     best_fb_pose = std::move(cand);
@@ -2490,7 +2625,13 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
             results.push_back(std::move(single));
         }
     } else {
-        const size_t n_try = std::min<size_t>(seg_res.multi_clusters.size(), 36);
+        const cv::Mat dt_canny = (!_is_floor_standing && !rgb.empty()) ? buildRgbCannyDistanceTransform(rgb) : cv::Mat();
+        const double sil_fx = (intr.fx > 100.0) ? intr.fx : 600.0;
+        const double sil_fy = (intr.fy > 100.0) ? intr.fy : sil_fx;
+        const double sil_cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * depth_z16.cols);
+        const double sil_cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * depth_z16.rows);
+
+        const size_t n_try = std::min<size_t>(seg_res.multi_clusters.size(), 6);
         std::vector<ObjectPose> relaxed_pool;
         relaxed_pool.reserve(n_try);
         for (size_t i = 0; i < n_try; ++i) {
@@ -2508,10 +2649,17 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
             total_ai_ms += ai_ms;
             if (!inst_pose.valid) continue;
 
+            double sil_cost = 0.0;
+            if (!dt_canny.empty()) {
+                sil_cost = refineTranslationOnRgbSilhouette(inst_pose.R, inst_pose.t, _mesh_pts, dt_canny, sil_fx, sil_fy, sil_cx, sil_cy);
+                inst_pose.t_glass = inst_pose.t;
+                inst_pose.bbox_2d = projectCadBoundingBox(inst_pose.R, inst_pose.t, intr, depth_z16.cols, depth_z16.rows, &inst_pose.corners_2d);
+            }
+
             ObjectPose strict_pose = inst_pose;
             if (rescorePoseUnclipped(strict_pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true)) {
                 results.push_back(std::move(strict_pose));
-            } else {
+            } else if (dt_canny.empty() || sil_cost <= 10.5) {
                 rescorePoseUnclipped(inst_pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
                 relaxed_pool.push_back(std::move(inst_pose));
             }
