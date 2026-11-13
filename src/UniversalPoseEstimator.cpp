@@ -1969,6 +1969,46 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         return;
     }
 
+    // Chuẩn hóa góc tự xoay (Spin Stabilization) cho vật thể đối xứng trụ (như chai Chin-su):
+    // Giữ nguyên hướng trục dọc của chai, khóa mặt bên luôn hướng ổn định về camera để hộp 3D không quay tít.
+    {
+        const cv::Vec3d cad_span = _cad_max - _cad_min;
+        int long_ax = 2;
+        if (cad_span[0] >= cad_span[1] && cad_span[0] >= cad_span[2]) long_ax = 0;
+        else if (cad_span[1] >= cad_span[0] && cad_span[1] >= cad_span[2]) long_ax = 1;
+
+        const int s_ax1 = (long_ax + 1) % 3;
+        const int s_ax2 = (long_ax + 2) % 3;
+        const double ratio_cross = std::max(cad_span[s_ax1], cad_span[s_ax2]) /
+                                   std::max(1e-4, std::min(cad_span[s_ax1], cad_span[s_ax2]));
+
+        if (!_is_floor_standing && ratio_cross < 1.35) {
+            cv::Vec3d axis_long(R_final(0, long_ax), R_final(1, long_ax), R_final(2, long_ax));
+            axis_long *= (1.0 / std::max(1e-9, cv::norm(axis_long)));
+
+            cv::Vec3d cam_back(0.0, 0.0, -1.0);
+            if (std::abs(axis_long.dot(cam_back)) > 0.92) cam_back = cv::Vec3d(1.0, 0.0, 0.0);
+
+            cv::Vec3d axis_s1 = cam_back - axis_long * axis_long.dot(cam_back);
+            axis_s1 *= (1.0 / std::max(1e-9, cv::norm(axis_s1)));
+            cv::Vec3d axis_s2 = axis_long.cross(axis_s1);
+            axis_s2 *= (1.0 / std::max(1e-9, cv::norm(axis_s2)));
+
+            cv::Matx33d R_stab = cv::Matx33d::zeros();
+            for (int r = 0; r < 3; ++r) {
+                R_stab(r, long_ax) = axis_long[r];
+                R_stab(r, s_ax1) = axis_s1[r];
+                R_stab(r, s_ax2) = axis_s2[r];
+            }
+            if (cv::determinant(R_stab) < 0.0) {
+                for (int r = 0; r < 3; ++r) R_stab(r, s_ax2) = -R_stab(r, s_ax2);
+            }
+            const cv::Vec3d world_mid = R_final * cad_mid + t_final;
+            R_final = R_stab;
+            t_final = world_mid - R_final * cad_mid;
+        }
+    }
+
     pose.R = R_final;
     pose.t = t_final;
     pose.t_glass = t_final;
@@ -2106,6 +2146,74 @@ ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::V
 
     const std::vector<cv::Vec3f>& icp_cloud = dense_pts.empty() ? sampled_pts : dense_pts;
     refineMultiScaleMeshICP(icp_cloud, pose, intr);
+
+    // Kiểm tra phân cực Đầu nắp vs Đáy chai bằng biên dạng cạnh 2D trên ảnh RGB
+    // khi vật thể có dạng đối xứng trụ (tỷ lệ thiết diện < 1.35) và phần cổ/nắp có thể bị mất Depth.
+    if (!_is_floor_standing && !rgb.empty() && !_mesh_pts.empty()) {
+        const cv::Vec3d cad_span = _cad_max - _cad_min;
+        int long_ax = 2;
+        if (cad_span[0] >= cad_span[1] && cad_span[0] >= cad_span[2]) long_ax = 0;
+        else if (cad_span[1] >= cad_span[0] && cad_span[1] >= cad_span[2]) long_ax = 1;
+        const int s_ax1 = (long_ax + 1) % 3;
+        const int s_ax2 = (long_ax + 2) % 3;
+        const double ratio_cross = std::max(cad_span[s_ax1], cad_span[s_ax2]) /
+                                   std::max(1e-4, std::min(cad_span[s_ax1], cad_span[s_ax2]));
+        if (ratio_cross < 1.35) {
+            cv::Mat gray, edges, inv_edges, dt;
+            if (rgb.channels() == 3) cv::cvtColor(rgb, gray, cv::COLOR_BGR2GRAY);
+            else gray = rgb;
+            cv::Canny(gray, edges, 40, 120);
+            cv::bitwise_not(edges, inv_edges);
+            cv::distanceTransform(inv_edges, dt, cv::DIST_L2, 3);
+
+            const double fx = (intr.fx > 100.0) ? intr.fx : 600.0;
+            const double fy = (intr.fy > 100.0) ? intr.fy : fx;
+            const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * img_w);
+            const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * img_h);
+
+            cv::Matx33d R_flip_local = cv::Matx33d::eye();
+            R_flip_local(long_ax, long_ax) = -1.0;
+            R_flip_local(s_ax2, s_ax2) = -1.0;
+            const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
+            const cv::Vec3d world_mid = pose.R * cad_mid + pose.t;
+            const cv::Matx33d R_flip = pose.R * R_flip_local;
+            const cv::Vec3d t_flip = world_mid - R_flip * cad_mid;
+
+            auto eval2DEdgeDist = [&](const cv::Matx33d& R_test, const cv::Vec3d& t_test) -> double {
+                std::vector<cv::Vec3d> vis_pts, vis_norms;
+                const size_t vis_stride = std::max<size_t>(1, _mesh_pts.size() / 400);
+                computeVisibleCadSubset(R_test, t_test, _mesh_pts, _mesh_normals,
+                                        fx, fy, cx, cy, img_w, img_h, vis_stride, vis_pts, vis_norms);
+                if (vis_pts.empty()) return 1e6;
+                double sum_dt = 0.0;
+                int cnt = 0;
+                for (const auto& vp : vis_pts) {
+                    const cv::Vec3d p_cam = R_test * vp + t_test;
+                    if (p_cam[2] <= 0.05) continue;
+                    const int u = static_cast<int>(std::round(p_cam[0] * fx / p_cam[2] + cx));
+                    const int v = static_cast<int>(std::round(p_cam[1] * fy / p_cam[2] + cy));
+                    if (u >= 0 && u < dt.cols && v >= 0 && v < dt.rows) {
+                        sum_dt += std::min(12.0, static_cast<double>(dt.at<float>(v, u)));
+                        ++cnt;
+                    }
+                }
+                return (cnt >= 10) ? (sum_dt / cnt) : 1e6;
+            };
+
+            const double err_cur = eval2DEdgeDist(pose.R, pose.t);
+            const double err_flip = eval2DEdgeDist(R_flip, t_flip);
+            if (err_flip + 0.35 < err_cur) {
+                pose.R = R_flip;
+                pose.t = t_flip;
+                pose.t_glass = t_flip;
+                const cv::Vec3d euler = rotationMatrixToEulerDeg(pose.R, false);
+                pose.roll_deg = euler[0];
+                pose.pitch_deg = euler[1];
+                pose.yaw_deg = euler[2];
+            }
+        }
+    }
+
     if (_is_floor_standing || icp_cloud.size() < 250) {
         refinePoseUniversalCrease2D3D(pose, rgb, intr);
     }

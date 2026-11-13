@@ -411,11 +411,30 @@ void CADSceneSegmenter::extractDepthPoints(const cv::Mat& depth_z16,
     const int stride = ((has_roi && roi_area < 75000) || (!_floor_standing_mode && _bounding_diag_m < 0.35f && w <= 848)) ? 1 : 2;
     out_pts.reserve(static_cast<size_t>((x1 - x0) / stride + 1) * static_cast<size_t>((y1 - y0) / stride + 1));
 
+    const int max_jump_raw = static_cast<int>(std::round(0.018f / std::max(1e-6f, scale)));
     for (int v = y0; v < y1; v += stride) {
         const uint16_t* row_ptr = depth_z16.ptr<uint16_t>(v);
+        const uint16_t* row_up = (v >= 2) ? depth_z16.ptr<uint16_t>(v - 2) : row_ptr;
+        const uint16_t* row_dn = (v + 2 < h) ? depth_z16.ptr<uint16_t>(v + 2) : row_ptr;
         for (int u = x0; u < x1; u += stride) {
             uint16_t d_raw = row_ptr[u];
             if (d_raw == 0) continue;
+
+            // Khử "Flying Pixels" ở mép vật thể nhựa bóng / trụ tròn (như chai Chin-su)
+            if (!_floor_standing_mode && u >= 2 && u + 2 < w) {
+                const uint16_t d_l = row_ptr[u - 2];
+                const uint16_t d_r = row_ptr[u + 2];
+                const uint16_t d_u = row_up[u];
+                const uint16_t d_d = row_dn[u];
+                if (d_l == 0 || d_r == 0 || d_u == 0 || d_d == 0) continue;
+                if (std::abs(static_cast<int>(d_raw) - static_cast<int>(d_l)) > max_jump_raw ||
+                    std::abs(static_cast<int>(d_raw) - static_cast<int>(d_r)) > max_jump_raw ||
+                    std::abs(static_cast<int>(d_raw) - static_cast<int>(d_u)) > max_jump_raw ||
+                    std::abs(static_cast<int>(d_raw) - static_cast<int>(d_d)) > max_jump_raw) {
+                    continue;
+                }
+            }
+
             float z = d_raw * scale;
             if (z < _min_depth_m || z > _max_depth_m) continue;
 
