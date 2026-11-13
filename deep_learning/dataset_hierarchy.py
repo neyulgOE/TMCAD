@@ -27,6 +27,7 @@ class CADHierarchyDataset(Dataset):
         cad_name: str,
         split: str = "train",
         num_obs_points: int = 1024,
+        num_cad_samples: int = 512,
         enable_sim2real_noise: bool = True,
         max_occlusion_ratio: float = 0.32,
     ):
@@ -36,6 +37,7 @@ class CADHierarchyDataset(Dataset):
         self.cad_name = cad_name
         self.split = split
         self.num_obs_points = num_obs_points
+        self.num_cad_samples = int(num_cad_samples)
         self.is_train = split == "train"
         self.enable_sim2real_noise = enable_sim2real_noise and self.is_train
         self.max_occlusion_ratio = float(np.clip(max_occlusion_ratio, 0.0, 0.45))
@@ -111,34 +113,40 @@ class CADHierarchyDataset(Dataset):
                 np.add.at(self.tri_sharpness, edges[:, 0], dihedral_weight)
                 np.add.at(self.tri_sharpness, edges[:, 1], dihedral_weight)
 
-        # Tier 3: LocalPatchBundle (M, K=32, 13)
+        # Tier 3: LocalPatchBundle (M_key, K=32, 13)
+        M_total = len(self.tri_features)
+        key_path = os.path.join(self.cad_data_dir, f"{self.cad_name}_key_triangles_{self.num_cad_samples}.npy")
+        if os.path.exists(key_path):
+            key_idx = np.load(key_path).astype(np.int64)
+            key_idx = np.clip(key_idx, 0, M_total - 1)
+        elif M_total >= self.num_cad_samples:
+            key_idx = np.linspace(0, M_total - 1, self.num_cad_samples, dtype=np.int64)
+        else:
+            rng = np.random.default_rng(1337)
+            key_idx = rng.choice(M_total, size=self.num_cad_samples, replace=True).astype(np.int64)
+
+        self.cad_key_indices = key_idx
+
         if "patch_features" in patch_npz:
-            self.patch_features = patch_npz["patch_features"].astype(np.float32)
+            pf = patch_npz["patch_features"].astype(np.float32)
+            self.patch_features = pf[key_idx] if len(pf) != len(key_idx) else pf
         elif "patch_triangle_indices" in patch_npz or "patch_indices" in patch_npz:
             idx_key = "patch_triangle_indices" if "patch_triangle_indices" in patch_npz else "patch_indices"
             p_idx = patch_npz[idx_key].astype(np.int64)
-            key_path = os.path.join(self.cad_data_dir, f"{self.cad_name}_key_triangles_512.npy")
-            if len(p_idx) > 512:
-                if os.path.exists(key_path):
-                    key_idx = np.load(key_path).astype(np.int64)
-                    p_idx = p_idx[key_idx]
-                else:
-                    step = np.linspace(0, len(p_idx) - 1, 512, dtype=np.int64)
-                    p_idx = p_idx[step]
+            if len(p_idx) != len(key_idx):
+                p_idx = p_idx[key_idx]
             self.patch_features = self.tri_features[p_idx]
         else:
             raise KeyError("Tệp _patches.npz không chứa 'patch_features' hoặc 'patch_triangle_indices'.")
 
-        self.patch_centers = (
-            patch_npz["patch_centers"].astype(np.float32)
-            if "patch_centers" in patch_npz
-            else self.patch_features[:, 0, 0:3]
-        )
-        self.patch_normals = (
-            patch_npz["patch_normals"].astype(np.float32)
-            if "patch_normals" in patch_npz
-            else self.patch_features[:, 0, 3:6]
-        )
+        self.patch_centers = self.patch_features[:, 0, 0:3]
+        self.patch_normals = self.patch_features[:, 0, 3:6]
+
+        if "patch_hops" in patch_npz:
+            ph = patch_npz["patch_hops"].astype(np.float32)
+            self.patch_hops = ph[key_idx] if len(ph) != len(key_idx) else ph
+        else:
+            self.patch_hops = np.zeros(self.patch_features.shape[:2], dtype=np.float32)
 
         # Nhóm đối xứng (Phase 0)
         self.symmetry_matrices = [np.eye(3, dtype=np.float32)]

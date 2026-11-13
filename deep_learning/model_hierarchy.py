@@ -85,6 +85,13 @@ class CADPatchEncoder(nn.Module):
         hops_norm = (patch_hops.unsqueeze(-1).float()) / float(self.patch_k)
 
         # x: (B, N_cad, K, 17)
+        min_m = min(patch_features.shape[1], patch_rel_pos.shape[1], hops_norm.shape[1])
+        if patch_features.shape[1] != min_m or patch_rel_pos.shape[1] != min_m or hops_norm.shape[1] != min_m:
+            patch_features = patch_features[:, :min_m, :, :]
+            patch_rel_pos = patch_rel_pos[:, :min_m, :, :]
+            hops_norm = hops_norm[:, :min_m, :, :]
+            N_cad = min_m
+
         x = torch.cat([patch_features, patch_rel_pos, hops_norm], dim=-1)
         x = x.view(B * N_cad * K, -1)
 

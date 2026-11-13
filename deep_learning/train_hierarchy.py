@@ -71,6 +71,7 @@ def main():
         cad_name=args.cad_name,
         split="train",
         num_obs_points=args.num_obs_samples,
+        num_cad_samples=args.num_cad_samples,
         enable_sim2real_noise=True,
     )
 
@@ -80,39 +81,20 @@ def main():
         cad_name=args.cad_name,
         split="val",
         num_obs_points=args.num_obs_samples,
+        num_cad_samples=args.num_cad_samples,
         enable_sim2real_noise=False,
     )
 
-    import numpy as np
-    patch_npz_path = os.path.join(args.cad_dir, f"{args.cad_name}_patches.npz")
-    patch_npz = np.load(patch_npz_path)
-    patch_rel_np = patch_npz["patch_rel_pos"].astype(np.float32) if "patch_rel_pos" in patch_npz else None
-    patch_hops_np = patch_npz["patch_hops"].astype(np.float32) if "patch_hops" in patch_npz else None
-    key_indices_np = np.arange(args.num_cad_samples, dtype=np.int64)
-    key_path = os.path.join(args.cad_dir, f"{args.cad_name}_key_triangles_512.npy")
-    if os.path.exists(key_path):
-        key_indices_np = np.load(key_path).astype(np.int64)
-    if patch_hops_np is not None and len(patch_hops_np) > args.num_cad_samples:
-        if os.path.exists(key_path):
-            patch_hops_np = patch_hops_np[key_indices_np]
-        else:
-            patch_hops_np = patch_hops_np[np.linspace(0, len(patch_hops_np) - 1, args.num_cad_samples, dtype=np.int64)]
-    patch_rel_const = torch.from_numpy(patch_rel_np).to(device) if patch_rel_np is not None else None
-    patch_hops_const = torch.from_numpy(patch_hops_np).to(device) if patch_hops_np is not None else None
+    key_indices_np = train_dataset.cad_key_indices
+    patch_hops_const = torch.from_numpy(train_dataset.patch_hops).to(device)
 
     def prepare_batch(batch):
         obs_cam = batch["obs_points_norm"].to(device, non_blocking=True)
         patch_feat = batch["patch_features"].to(device, non_blocking=True)
         patch_centers = batch["patch_centers"].to(device, non_blocking=True)
         B = obs_cam.shape[0]
-        if patch_rel_const is not None:
-            patch_rel = patch_rel_const.unsqueeze(0).expand(B, -1, -1, -1)
-        else:
-            patch_rel = patch_feat[..., 0:3] - patch_centers.unsqueeze(2)
-        if patch_hops_const is not None:
-            patch_hops = patch_hops_const.unsqueeze(0).expand(B, -1, -1)
-        else:
-            patch_hops = torch.zeros(patch_feat.shape[:3], device=device, dtype=patch_feat.dtype)
+        patch_rel = patch_feat[..., 0:3] - patch_centers.unsqueeze(2)
+        patch_hops = patch_hops_const.unsqueeze(0).expand(B, -1, -1)
 
         gt_cad = batch["gt_cad_points"].to(device, non_blocking=True)
         sym_mats = batch["symmetry_matrices"].to(device, non_blocking=True)
