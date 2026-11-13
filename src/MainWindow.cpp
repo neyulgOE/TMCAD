@@ -3265,6 +3265,10 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
         const QString reqCanon = QFileInfo(onnxPath).canonicalFilePath();
         const QString curCanon = QFileInfo(QString::fromStdString(universalPoseEstimator_->loadedOnnxPath())).canonicalFilePath();
         if (!universalPoseEstimator_->isInitialized() || reqCanon != curCanon) {
+            hasLastAcceptedPose_ = false;
+            temporalHitStreak_ = 0;
+            temporalMissStreak_ = 0;
+            autoTrackRoi_ = cv::Rect();
             if (!universalPoseEstimator_->loadModelOnnx(onnxPath.toStdString())) {
                 if (uxToolbar_) uxToolbar_->resetDiagnostics();
                 pipelineLog(QString("  [ERROR] Không thể nạp model Black-Box ONNX: %1").arg(onnxPath));
@@ -3314,8 +3318,70 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
                             .arg(roiHint.x).arg(roiHint.y).arg(roiHint.width).arg(roiHint.height));
         }
 
-        const std::vector<tmcad::ObjectPose> poses =
-            universalPoseEstimator_->estimateMultiObjects(bgrMat, depthMat, estIntr, roiHint);
+        const bool useContinuousTemporal = (isLiveMode || isBagAutoStepping_) && !interactiveRoiRerun;
+        const bool usedAutoRoi = (roiHint.empty() && useContinuousTemporal && !multiMode &&
+                                  hasLastAcceptedPose_ && !autoTrackRoi_.empty());
+        const cv::Rect effectiveRoi = usedAutoRoi ? autoTrackRoi_ : roiHint;
+
+        std::vector<tmcad::ObjectPose> poses =
+            universalPoseEstimator_->estimateMultiObjects(bgrMat, depthMat, estIntr, effectiveRoi);
+        if (usedAutoRoi && poses.empty()) {
+            poses = universalPoseEstimator_->estimateMultiObjects(bgrMat, depthMat, estIntr, cv::Rect());
+        }
+
+        const double cadDiagM = universalPoseEstimator_->realBoundingDiagM();
+        const bool isFloorStanding = universalPoseEstimator_->isFloorStanding();
+        poses.erase(std::remove_if(poses.begin(), poses.end(), [&](const tmcad::ObjectPose& p) {
+            return !tmcad::DetectionAcceptancePolicy::isAccepted(p, cadDiagM, isFloorStanding);
+        }), poses.end());
+
+        auto updateAutoRoiFromPose = [&](const tmcad::ObjectPose& p) {
+            const cv::Rect2f& b = p.bbox_2d;
+            if (b.width <= 4.0f || b.height <= 4.0f) return;
+            const int pad = std::max(40, static_cast<int>(std::round(0.45f * std::max(b.width, b.height))));
+            const int rx = std::max(0, static_cast<int>(std::floor(b.x)) - pad);
+            const int ry = std::max(0, static_cast<int>(std::floor(b.y)) - pad);
+            const int rx2 = std::min(w, static_cast<int>(std::ceil(b.x + b.width)) + pad);
+            const int ry2 = std::min(h, static_cast<int>(std::ceil(b.y + b.height)) + pad);
+            if (rx2 - rx >= 64 && ry2 - ry >= 64) {
+                autoTrackRoi_ = cv::Rect(rx, ry, rx2 - rx, ry2 - ry);
+            }
+        };
+
+        if (useContinuousTemporal && !multiMode) {
+            if (!poses.empty() && hasLastAcceptedPose_ && temporalMissStreak_ < 3) {
+                const double jump_m = cv::norm(poses.front().t - lastAcceptedPose_.t);
+                const double max_jump_m = std::max(0.20, 1.5 * cadDiagM);
+                if (jump_m > max_jump_m && poses.front().confidence < 0.85f) {
+                    poses.clear();
+                }
+            }
+
+            if (!poses.empty()) {
+                temporalHitStreak_ = std::min(3, temporalHitStreak_ + 1);
+                temporalMissStreak_ = 0;
+                lastAcceptedPose_ = poses.front();
+                hasLastAcceptedPose_ = true;
+                updateAutoRoiFromPose(lastAcceptedPose_);
+                // Yêu cầu xác nhận 2 frame liên tiếp (hoặc confidence rất cao >= 0.85) trước khi hiển thị
+                if (temporalHitStreak_ < 2 && poses.front().confidence < 0.85f) {
+                    poses.clear();
+                }
+            } else {
+                ++temporalMissStreak_;
+                if (hasLastAcceptedPose_ && temporalMissStreak_ <= 2) {
+                    poses.push_back(lastAcceptedPose_);
+                } else {
+                    hasLastAcceptedPose_ = false;
+                    temporalHitStreak_ = 0;
+                    autoTrackRoi_ = cv::Rect();
+                }
+            }
+        } else if (!poses.empty()) {
+            lastAcceptedPose_ = poses.front();
+            hasLastAcceptedPose_ = true;
+            updateAutoRoiFromPose(lastAcceptedPose_);
+        }
 
         const int validDepthPts = universalPoseEstimator_->lastValidDepthPts();
         const bool floorLocked = universalPoseEstimator_->lastFloorLocked();

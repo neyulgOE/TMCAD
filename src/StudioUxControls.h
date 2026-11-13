@@ -23,7 +23,7 @@ struct OverlayRenderFlags {
     bool show_cad_wireframe{true};
     bool show_axes_and_hud{true};
     bool show_segmented_cloud{false};
-    bool multi_instance_mode{true};
+    bool multi_instance_mode{false};
 };
 
 class StudioUxToolbar : public QWidget {
@@ -260,7 +260,7 @@ public:
         int fit_pct = qBound(0, static_cast<int>(confidence * 100.0f), 100);
         if (num_instances <= 0) {
             setPillStyle(_pill_fit, "#991b1b", "#fee2e2", "🔴 Searching Target...");
-        } else if (fit_pct >= 55) {
+        } else if (fit_pct >= 65 && rmse_mm <= 16.0) {
             setPillStyle(_pill_fit, "#065f46", "#d1fae5",
                          QString("🎯 Fit: %1% | RMSE: %2 mm").arg(fit_pct).arg(rmse_mm, 0, 'f', 1));
         } else {
@@ -316,7 +316,7 @@ private:
             "QPushButton:hover { background: #37474f; }");
 
         _chk_multi = new QCheckBox("Multi-Object Scene", this);
-        _chk_multi->setChecked(true);
+        _chk_multi->setChecked(false);
         _chk_multi->setToolTip("Phát hiện nhiều vật thể đồng thời trong 1 khung hình (FREE_6DOF)");
 
         _btn_one_click = new QPushButton("⚡ 1-Click Auto-Build (CAD → ONNX)", this);

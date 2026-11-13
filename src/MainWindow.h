@@ -495,8 +495,13 @@ private:
     QProcess* autoBuildProcess_ = nullptr;
     QProgressDialog* autoBuildProgressDlg_ = nullptr;
     std::atomic<bool> autoBuildCanceled_{false};
-    bool lastMultiInstanceFlag_ = true;
+    bool lastMultiInstanceFlag_ = false;
     bool isInteractiveRoiUpdating_ = false;
+    bool hasLastAcceptedPose_ = false;
+    tmcad::ObjectPose lastAcceptedPose_;
+    int temporalHitStreak_ = 0;
+    int temporalMissStreak_ = 0;
+    cv::Rect autoTrackRoi_;
 
     RGBDFrame lastStaticFrame_;
     CameraIntrinsics lastStaticIntrinsics_;

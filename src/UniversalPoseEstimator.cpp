@@ -2941,6 +2941,10 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
             const bool strong_rgb_sil = (!dt_canny.empty() && sil_cost <= 4.8);
             if (rescorePoseUnclipped(strict_cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true) || strong_rgb_sil) {
                 if (strong_rgb_sil) {
+                    strict_cand.rgb_sil_strong = true;
+                    if (strict_cand.method == "pca_fallback_seed") {
+                        strict_cand.method = "rgb_sil_refined";
+                    }
                     strict_cand.confidence = std::clamp(strict_cand.confidence + 0.25f, 0.05f, 0.99f);
                 }
                 double rank = static_cast<double>(strict_cand.confidence) - 2.0 * std::max(0.0, strict_cand.rmse_m - 0.015) - 0.04 * sil_cost;
@@ -2957,7 +2961,8 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                 }
             }
         }
-        if (!pose.valid && best_fb_pose.valid) {
+        if (!pose.valid && best_fb_pose.valid &&
+            DetectionAcceptancePolicy::isAccepted(best_fb_pose, _real_bounding_diag_m, _is_floor_standing)) {
             pose = std::move(best_fb_pose);
         }
         if (pose.valid) {
@@ -2976,6 +2981,10 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
             seg_res.foreground_points.size() > static_cast<size_t>(pose.valid_depth_pts * 1.18)) {
             rescorePoseUnclipped(pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
         }
+    }
+
+    if (pose.valid && !DetectionAcceptancePolicy::isAccepted(pose, _real_bounding_diag_m, _is_floor_standing)) {
+        pose.valid = false;
     }
 
     auto t_end = std::chrono::steady_clock::now();
@@ -3018,7 +3027,16 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
     }
 
     double total_ai_ms = 0.0;
-    if (_is_floor_standing || !_multi_instance_enabled || seg_res.multi_clusters.size() <= 1) {
+    if (!_multi_instance_enabled) {
+        ObjectPose single = estimate(rgb, depth_z16, intr, roi_hint);
+        if (single.valid &&
+            DetectionAcceptancePolicy::isAccepted(single, _real_bounding_diag_m, _is_floor_standing)) {
+            results.push_back(std::move(single));
+        }
+        return results;
+    }
+
+    if (_is_floor_standing || seg_res.multi_clusters.size() <= 1) {
         ObjectPose single = estimateSingleCluster(seg_res.object_points,
                                                   seg_res.dense_object_points,
                                                   seg_res.floor_plane,
@@ -3030,7 +3048,9 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
                 seg_res.foreground_points.size() > static_cast<size_t>(single.valid_depth_pts * 1.18)) {
                 rescorePoseUnclipped(single, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
             }
-            results.push_back(std::move(single));
+            if (DetectionAcceptancePolicy::isAccepted(single, _real_bounding_diag_m, _is_floor_standing)) {
+                results.push_back(std::move(single));
+            }
         }
     } else {
         const RgbEdgeMaps dt_canny = (!_is_floor_standing && !rgb.empty()) ? buildRgbCannyDistanceTransform(rgb) : RgbEdgeMaps{};
@@ -3040,8 +3060,6 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
         const double sil_cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * depth_z16.rows);
 
         const size_t n_try = std::min<size_t>(seg_res.multi_clusters.size(), 12);
-        std::vector<ObjectPose> relaxed_pool;
-        relaxed_pool.reserve(n_try);
         for (size_t i = 0; i < n_try; ++i) {
             const auto& cl = seg_res.multi_clusters[i];
             if (cl.points.size() < 20) continue;
@@ -3074,21 +3092,16 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
             const bool strong_rgb_sil = (!dt_canny.empty() && sil_cost <= 4.8);
             if (rescorePoseUnclipped(strict_pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true) || strong_rgb_sil) {
                 if (strong_rgb_sil) {
+                    strict_pose.rgb_sil_strong = true;
+                    if (strict_pose.method == "pca_fallback_seed") {
+                        strict_pose.method = "rgb_sil_refined";
+                    }
                     strict_pose.confidence = std::clamp(strict_pose.confidence + 0.25f, 0.05f, 0.99f);
                 }
-                results.push_back(std::move(strict_pose));
-            } else if (dt_canny.empty() || sil_cost <= 6.5) {
-                rescorePoseUnclipped(inst_pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
-                // Phạt nhẹ theo sil_cost để ứng viên khớp viền RGB nhất đứng đầu khi rơi vào fallback
-                inst_pose.confidence = std::clamp(
-                    static_cast<float>(static_cast<double>(inst_pose.confidence) - 0.04 * sil_cost),
-                    0.05f, 0.99f);
-                relaxed_pool.push_back(std::move(inst_pose));
+                if (DetectionAcceptancePolicy::isAccepted(strict_pose, _real_bounding_diag_m, _is_floor_standing)) {
+                    results.push_back(std::move(strict_pose));
+                }
             }
-        }
-        const bool used_relaxed_fallback = (results.empty() && !relaxed_pool.empty());
-        if (used_relaxed_fallback) {
-            results = std::move(relaxed_pool);
         }
 
         if (!results.empty()) {
@@ -3097,9 +3110,6 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
                 const double rb = static_cast<double>(b.confidence) - 2.0 * std::max(0.0, b.rmse_m - 0.015);
                 return ra > rb;
             });
-            if (used_relaxed_fallback && results.size() > 1) {
-                results.resize(1);
-            }
 
             // 3D NMS to merge duplicate spherical proposals on the same physical object instance
             const double nms_min_sep = std::max(0.045, 0.35 * _real_bounding_diag_m);

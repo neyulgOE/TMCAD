@@ -35,6 +35,7 @@ struct ObjectPose {
     bool floor_locked{false};
     double floor_pitch_deg{0.0};
     bool sparse_depth_fallback{false};
+    bool rgb_sil_strong{false};
 
     cv::Matx33d R = cv::Matx33d::eye();
     cv::Vec3d t{0.0, 0.0, 0.0};
@@ -50,6 +51,18 @@ struct ObjectPose {
     std::vector<cv::Point2f> corners_2d;
     std::vector<cv::Point2f> face_corners_2d;
     std::vector<cv::Vec3f> segmented_points;
+};
+
+struct DetectionAcceptancePolicy {
+    static bool isAccepted(const ObjectPose& pose, double cad_diag, bool is_floor_standing) {
+        if (!pose.valid) return false;
+        if (pose.method == "pca_fallback_seed") return false;
+        if (pose.confidence < 0.65f) return false;
+        const double max_rmse = std::clamp(0.072 * std::max(0.05, cad_diag), 0.012, 0.025);
+        if (pose.rmse_m > max_rmse) return false;
+        if (!is_floor_standing && !pose.rgb_sil_strong && pose.inlier_ratio < 0.50) return false;
+        return true;
+    }
 };
 
 class UniversalPoseEstimator {
