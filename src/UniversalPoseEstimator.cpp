@@ -952,6 +952,196 @@ bool UniversalPoseEstimator::initialize(const std::string& onnx_or_model_dir)
     return false;
 }
 
+static void filterCleanCadFeatureEdges(std::vector<FeatureEdge3D>& edges,
+                                       const cv::Vec3d& cad_min,
+                                       const cv::Vec3d& cad_max,
+                                       bool is_floor_standing)
+{
+    if (edges.size() <= 4) return;
+    const double model_diag = std::max(0.05, cv::norm(cad_max - cad_min));
+    const float perp_tol = static_cast<float>(std::clamp(0.004 * model_diag, 0.0015, 0.006));
+    const float gap_tol = static_cast<float>(std::clamp(0.012 * model_diag, 0.004, 0.020));
+    const float min_keep = static_cast<float>(std::clamp(0.018 * model_diag, 0.005, 0.030));
+
+    // 1. Collinear Line Welding (gộp các đoạn thẳng đồng tuyến bị cắt vụn bởi lưới STL)
+    std::vector<FeatureEdge3D> segs = std::move(edges);
+    std::sort(segs.begin(), segs.end(), [](const FeatureEdge3D& a, const FeatureEdge3D& b) {
+        return a.length_m > b.length_m;
+    });
+
+    std::vector<bool> merged(segs.size(), false);
+    std::vector<FeatureEdge3D> welded;
+    welded.reserve(segs.size());
+
+    const float main_min_len = is_floor_standing
+        ? std::max(min_keep, static_cast<float>(model_diag * 0.065))
+        : min_keep;
+    const float foot_min_len = std::max(min_keep, static_cast<float>(model_diag * 0.028));
+    const float foot_zone_z = static_cast<float>(cad_min[2] + (cad_max[2] - cad_min[2]) * 0.14);
+
+    for (size_t i = 0; i < segs.size(); ++i) {
+        if (merged[i]) continue;
+        merged[i] = true;
+
+        cv::Vec3f a = segs[i].p0;
+        cv::Vec3f b = segs[i].p1;
+        cv::Vec3f dir = b - a;
+        float len = static_cast<float>(cv::norm(dir));
+        if (len < 1e-4f) continue;
+        dir *= (1.0f / len);
+
+        bool grew = true;
+        while (grew) {
+            grew = false;
+            for (size_t j = i + 1; j < segs.size(); ++j) {
+                if (merged[j]) continue;
+                cv::Vec3f dj = segs[j].p1 - segs[j].p0;
+                const float lj = segs[j].length_m;
+                if (lj < 1e-4f) continue;
+                dj *= (1.0f / lj);
+                if (std::abs(dir.dot(dj)) < 0.996f) continue;
+
+                const cv::Vec3f diff = segs[j].p0 - a;
+                const cv::Vec3f perp = diff - dir * diff.dot(dir);
+                if (cv::norm(perp) > perp_tol) continue;
+
+                float tj0 = (segs[j].p0 - a).dot(dir);
+                float tj1 = (segs[j].p1 - a).dot(dir);
+                if (tj0 > tj1) std::swap(tj0, tj1);
+
+                if (tj1 >= -gap_tol && tj0 <= len + gap_tol) {
+                    const float new_min = std::min(0.0f, tj0);
+                    const float new_max = std::max(len, tj1);
+                    b = a + dir * new_max;
+                    a = a + dir * new_min;
+                    len = new_max - new_min;
+                    merged[j] = true;
+                    grew = true;
+                }
+            }
+        }
+
+        const bool is_foot_edge = is_floor_standing && (std::min(a[2], b[2]) <= foot_zone_z);
+        const float req_len = is_foot_edge ? foot_min_len : main_min_len;
+        if (len >= req_len) {
+            welded.push_back(FeatureEdge3D{a, b, segs[i].n0, segs[i].n1, len});
+        }
+    }
+
+    if (!is_floor_standing) {
+        edges = std::move(welded);
+        return;
+    }
+
+    // 2. 2D Cross-Section Corner Hull (khử rãnh T-slot và giữ 4 cạnh biên ngoài cho kết cấu đứng sàn)
+    std::sort(welded.begin(), welded.end(), [](const FeatureEdge3D& e1, const FeatureEdge3D& e2) {
+        return e1.length_m > e2.length_m;
+    });
+
+    std::vector<bool> grouped(welded.size(), false);
+    std::vector<FeatureEdge3D> clean_edges;
+    clean_edges.reserve(welded.size());
+    const float beam_cluster_radius = static_cast<float>(model_diag * 0.050);
+    const float dup_perp_tol = static_cast<float>(std::clamp(0.006 * model_diag, 0.002, 0.010));
+    const float corner_pad = static_cast<float>(0.003 * model_diag);
+
+    for (size_t i = 0; i < welded.size(); ++i) {
+        if (grouped[i]) continue;
+        grouped[i] = true;
+
+        const auto& seed = welded[i];
+        cv::Vec3f dir = seed.p1 - seed.p0;
+        dir *= (1.0f / std::max(1e-5f, seed.length_m));
+        if (dir[0] + dir[1] + dir[2] < 0.0f) dir = -dir;
+
+        const cv::Vec3f origin = 0.5f * (seed.p0 + seed.p1);
+        std::vector<size_t> cluster = {i};
+
+        for (size_t j = i + 1; j < welded.size(); ++j) {
+            if (grouped[j]) continue;
+            cv::Vec3f dj = welded[j].p1 - welded[j].p0;
+            dj *= (1.0f / std::max(1e-5f, welded[j].length_m));
+            if (std::abs(dir.dot(dj)) < 0.992f) continue;
+
+            const cv::Vec3f mid_j = 0.5f * (welded[j].p0 + welded[j].p1);
+            const cv::Vec3f diff = mid_j - origin;
+            const float axial = std::abs(diff.dot(dir));
+            const cv::Vec3f perp = diff - dir * diff.dot(dir);
+
+            if (cv::norm(perp) <= beam_cluster_radius &&
+                axial <= 0.60f * (seed.length_m + welded[j].length_m)) {
+                grouped[j] = true;
+                cluster.push_back(j);
+            }
+        }
+
+        if (cluster.size() <= 2) {
+            for (size_t idx : cluster) clean_edges.push_back(welded[idx]);
+            continue;
+        }
+
+        const cv::Vec3f ref_up = (std::abs(dir[2]) < 0.85f) ? cv::Vec3f(0, 0, 1) : cv::Vec3f(1, 0, 0);
+        cv::Vec3f u_axis = dir.cross(ref_up);
+        u_axis *= (1.0f / std::max(1e-6f, static_cast<float>(cv::norm(u_axis))));
+        cv::Vec3f v_axis = dir.cross(u_axis);
+        v_axis *= (1.0f / std::max(1e-6f, static_cast<float>(cv::norm(v_axis))));
+
+        float u_min = 1e9f, u_max = -1e9f, v_min = 1e9f, v_max = -1e9f;
+        std::vector<cv::Vec2f> uv_coords(cluster.size());
+        for (size_t c = 0; c < cluster.size(); ++c) {
+            const auto& e = welded[cluster[c]];
+            const cv::Vec3f mid = 0.5f * (e.p0 + e.p1) - origin;
+            const float u = mid.dot(u_axis);
+            const float v = mid.dot(v_axis);
+            uv_coords[c] = cv::Vec2f(u, v);
+            u_min = std::min(u_min, u);
+            u_max = std::max(u_max, u);
+            v_min = std::min(v_min, v);
+            v_max = std::max(v_max, v);
+        }
+
+        const float span_u = u_max - u_min;
+        const float span_v = v_max - v_min;
+        const cv::Vec2f corners_2d[4] = {
+            cv::Vec2f(u_min, v_min), cv::Vec2f(u_max, v_min),
+            cv::Vec2f(u_max, v_max), cv::Vec2f(u_min, v_max)
+        };
+
+        std::vector<size_t> selected_in_cluster;
+        for (int cor = 0; cor < 4; ++cor) {
+            int best_c = -1;
+            float best_score = 1e9f;
+            for (size_t c = 0; c < cluster.size(); ++c) {
+                const float dist_corner = static_cast<float>(cv::norm(uv_coords[c] - corners_2d[cor]));
+                if (dist_corner > 0.32f * std::max(span_u, span_v) + corner_pad) continue;
+                const float score = dist_corner - 0.015f * welded[cluster[c]].length_m;
+                if (score < best_score) {
+                    best_score = score;
+                    best_c = static_cast<int>(c);
+                }
+            }
+            if (best_c >= 0) {
+                const size_t chosen_idx = cluster[best_c];
+                bool dup = false;
+                for (size_t prev_idx : selected_in_cluster) {
+                    if (prev_idx == chosen_idx) { dup = true; break; }
+                    const cv::Vec3f d_mid = 0.5f * (welded[chosen_idx].p0 + welded[chosen_idx].p1) -
+                                            0.5f * (welded[prev_idx].p0 + welded[prev_idx].p1);
+                    const cv::Vec3f perp = d_mid - dir * d_mid.dot(dir);
+                    if (cv::norm(perp) < dup_perp_tol) { dup = true; break; }
+                }
+                if (!dup) selected_in_cluster.push_back(chosen_idx);
+            }
+        }
+
+        for (size_t idx : selected_in_cluster) {
+            clean_edges.push_back(welded[idx]);
+        }
+    }
+
+    edges = std::move(clean_edges);
+}
+
 bool UniversalPoseEstimator::loadModelOnnx(const std::string& onnx_path)
 {
     if (!fileExists(onnx_path)) return false;
@@ -1032,6 +1222,8 @@ bool UniversalPoseEstimator::loadModelOnnx(const std::string& onnx_path)
                     }
                 }
             }
+
+            filterCleanCadFeatureEdges(_cad_feature_edges, _cad_min, _cad_max, _is_floor_standing);
 
             _initialized = true;
             std::cout << "[UniversalPoseEstimator] Ready with Black-Box ONNX (" << _model_name
@@ -3025,6 +3217,18 @@ void UniversalPoseEstimator::drawOverlay(cv::Mat& img,
         cv::Point2f a = proj_f(e.p0[0], e.p0[1], e.p0[2]);
         cv::Point2f b = proj_f(e.p1[0], e.p1[1], e.p1[2]);
         cv::line(img, to_pt(a), to_pt(b), CYAN, 2, cv::LINE_AA);
+    }
+
+    // 1b. Draw floor-standing foot contact ellipses from ONNX _cad_foot_centers (no hardcoded insets)
+    if (_is_floor_standing && !_cad_foot_centers.empty()) {
+        for (const auto& fc : _cad_foot_centers) {
+            const cv::Vec3d p_cam = pose.R * cv::Vec3d(fc[0], fc[1], fc[2]) + pose.t;
+            if (p_cam[2] <= 0.10) continue;
+            const cv::Point2f bp = proj_f(fc[0], fc[1], fc[2]);
+            const int rx = std::clamp(static_cast<int>(std::round(0.020 * fx / p_cam[2])), 5, 18);
+            const int ry = std::max(3, rx * 2 / 5);
+            cv::ellipse(img, to_pt(bp), cv::Size(rx, ry), 0, 0, 360, GREEN, 1, cv::LINE_AA);
+        }
     }
 
     // 2. Draw 8-corner 3D Oriented Bounding Box
