@@ -5634,16 +5634,26 @@ void MainWindow::runOneClickAutoPipeline(const QString& cadFilePath) {
         return;
     }
 
-    // Bước 0.5: Tự động sinh Dataset Ray-Cast nếu chưa có dữ liệu huấn luyện
+    // Bước 0.5: Tự động sinh Dataset Ray-Cast nếu chưa có dữ liệu huấn luyện (hoặc bộ cũ < 2000 mẫu)
+    const int autoSamples = 2000;
     QString datasetDir = resolveDatasetDir(cadName);
     QDir dDir(datasetDir);
+    int existingCount = 0;
+    if (!datasetDir.isEmpty() && dDir.exists()) {
+        existingCount = dDir.entryList(QStringList() << "sample_*", QDir::Dirs | QDir::NoDotAndDotDot).count();
+    }
     bool hasDataset = !datasetDir.isEmpty() && dDir.exists() &&
-                      (dDir.exists("train.txt") || !dDir.entryList(QStringList() << "sample_*", QDir::Dirs).isEmpty());
+                      (dDir.exists("train.txt") || existingCount > 0) &&
+                      existingCount >= autoSamples;
 
     if (!hasDataset) {
+        if (!datasetDir.isEmpty() && dDir.exists() && existingCount > 0 && existingCount < autoSamples) {
+            pipelineLog(QString("  [AUTO-DATASET] Dataset cũ chỉ có %1/%2 mẫu -> Xóa để sinh mới đủ %2 mẫu...")
+                            .arg(existingCount).arg(autoSamples));
+            dDir.removeRecursively();
+        }
         datasetDir = projDir.absoluteFilePath("dataset/" + cadName);
         QDir().mkpath(datasetDir);
-        const int autoSamples = 240;
 
         DatasetGenConfig cfg;
         cfg.outputDir = datasetDir.toStdString();

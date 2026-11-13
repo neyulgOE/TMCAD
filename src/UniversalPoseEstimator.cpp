@@ -1803,8 +1803,10 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
     seeds.push_back(PoseSeed{R_cand0 * Ry180, computeVisibleSurfaceOffset(R_cand0 * Ry180, c_fg, cad_mid, _mesh_pts, _mesh_normals), 0.0});
     seeds.push_back(PoseSeed{R_cand0 * Rz180, computeVisibleSurfaceOffset(R_cand0 * Rz180, c_fg, cad_mid, _mesh_pts, _mesh_normals), -0.008});
 
-    // 3. PCA Principal-Axis Hypotheses (recovers from ~90 deg coarse RANSAC minima)
-    if (score_cand0.fwd_fit < 0.84 || score_cand0.bwd_kernel < 0.72 || pose.method == "pca_fallback_seed") {
+    // 3. Pure 3D Free-Space SO(3) Multi-Hypothesis Search (Zero Table/Floor Dependency!)
+    // Hoạt động cho vật thể ở BẤT KỲ tư thế nào trong không gian 3D (cầm trên tay, treo, nghiêng, hoặc trên bàn)
+    // bằng cách kiểm tra toàn bộ 24 phép quay nhóm khối SO(3) (6 mặt x 4 góc 90 độ) + 36 góc xoay quanh 3 trục của R_cand0.
+    if (score_cand0.fwd_fit < 0.92 || score_cand0.bwd_kernel < 0.85 || pose.method == "pca_fallback_seed") {
         cv::Matx33d cov = cv::Matx33d::zeros();
         for (const auto& p : fg_pts) {
             const cv::Vec3d d = p - c_fg;
@@ -1814,76 +1816,78 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         cv::eigen(cv::Mat(cov), eig_vals, eig_vecs);
         cv::Vec3d v0(eig_vecs.at<double>(0, 0), eig_vecs.at<double>(0, 1), eig_vecs.at<double>(0, 2));
         cv::Vec3d v1(eig_vecs.at<double>(1, 0), eig_vecs.at<double>(1, 1), eig_vecs.at<double>(1, 2));
-        cv::Vec3d v2(eig_vecs.at<double>(2, 0), eig_vecs.at<double>(2, 1), eig_vecs.at<double>(2, 2));
         v0 *= (1.0 / std::max(1e-9, cv::norm(v0)));
         v1 -= v0 * v0.dot(v1);
         v1 *= (1.0 / std::max(1e-9, cv::norm(v1)));
-        v2 = v0.cross(v1);
+        cv::Vec3d v2 = v0.cross(v1);
 
-        const cv::Vec3d cad_ext = _cad_max - _cad_min;
-        int ax[3] = {0, 1, 2};
-        std::sort(ax, ax + 3, [&](int a, int b) { return cad_ext[a] > cad_ext[b]; });
-        cv::Matx33d R_cad_pca = cv::Matx33d::zeros();
-        R_cad_pca(ax[0], 0) = 1.0;
-        R_cad_pca(ax[1], 1) = 1.0;
-        cv::Vec3d ca0(R_cad_pca(0, 0), R_cad_pca(1, 0), R_cad_pca(2, 0));
-        cv::Vec3d ca1(R_cad_pca(0, 1), R_cad_pca(1, 1), R_cad_pca(2, 1));
-        cv::Vec3d ca2 = ca0.cross(ca1);
-        R_cad_pca(0, 2) = ca2[0]; R_cad_pca(1, 2) = ca2[1]; R_cad_pca(2, 2) = ca2[2];
-        const cv::Matx33d R_cad_pca_t = R_cad_pca.t();
+        const cv::Matx33d R_obs_pca(
+            v0[0], v1[0], v2[0],
+            v0[1], v1[1], v2[1],
+            v0[2], v1[2], v2[2]);
 
-        struct RankedSeed { double pre; cv::Matx33d R; cv::Vec3d t; };
-        std::vector<RankedSeed> pca_pool;
-        for (double s0 : {-1.0, 1.0}) {
-            for (double s1 : {-1.0, 1.0}) {
-                // Pair A: (s0*v0, s1*v1) and Pair B: (s0*v0, s1*v2) to cover 90-deg roll around principal axis
-                for (int mode = 0; mode < 2; ++mode) {
-                    cv::Vec3d a0 = s0 * v0;
-                    cv::Vec3d a1 = s1 * (mode == 0 ? v1 : v2);
-                    cv::Vec3d a2 = a0.cross(a1);
-                    cv::Matx33d R_obs_b(a0[0], a1[0], a2[0],
-                                        a0[1], a1[1], a2[1],
-                                        a0[2], a1[2], a2[2]);
-                    cv::Matx33d R_p = R_obs_b * R_cad_pca_t;
-                    cv::Vec3d t_p = computeVisibleSurfaceOffset(R_p, c_fg, cad_mid, _mesh_pts, _mesh_normals);
-                    auto sc_p = evaluateBidirectionalConsensus(R_p, t_p, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true);
-                    pca_pool.push_back(RankedSeed{sc_p.score, R_p, t_p});
+        // Tạo 24 ma trận hoán vị có dấu thuộc nhóm quay SO(3) (det = +1)
+        // Bao phủ mọi trường hợp hoán vị trục (v0 <-> v1 <-> v2) khi vật thể xoay làm đổi tỷ lệ khung nhìn 2.5D.
+        std::vector<cv::Matx33d> so3_cube_group;
+        so3_cube_group.reserve(24);
+        const int perms[6][3] = {
+            {0, 1, 2}, {0, 2, 1}, {1, 0, 2},
+            {1, 2, 0}, {2, 0, 1}, {2, 1, 0}
+        };
+        for (int p = 0; p < 6; ++p) {
+            for (int sx : {-1, 1}) {
+                for (int sy : {-1, 1}) {
+                    for (int sz : {-1, 1}) {
+                        cv::Matx33d P = cv::Matx33d::zeros();
+                        P(0, perms[p][0]) = sx;
+                        P(1, perms[p][1]) = sy;
+                        P(2, perms[p][2]) = sz;
+                        if (cv::determinant(P) > 0.5) {
+                            so3_cube_group.push_back(P);
+                        }
+                    }
                 }
             }
         }
-        std::sort(pca_pool.begin(), pca_pool.end(), [](const RankedSeed& a, const RankedSeed& b) {
-            return a.pre > b.pre;
-        });
-        const size_t take_pca = std::min<size_t>(3, pca_pool.size());
-        for (size_t k = 0; k < take_pca; ++k) {
-            seeds.push_back(PoseSeed{pca_pool[k].R, pca_pool[k].t, 0.0});
-        }
-    }
 
-    // 3b. Turntable / SO(3) Azimuthal Multi-Angle Search (12 angles x 30 deg = 360 deg)
-    // Đảm bảo khi xoay chi tiết máy có hình học đặc biệt (như engine_block) ở bất kỳ góc Yaw nào,
-    // bộ giải luôn tìm trúng góc xoay thực tế trước khi chạy Point-to-Plane ICP!
-    if (score_cand0.fwd_fit < 0.88 || score_cand0.bwd_kernel < 0.78) {
-        struct AngleSeed { double pre; cv::Matx33d R; cv::Vec3d t; };
-        std::vector<AngleSeed> rot_pool;
-        rot_pool.reserve(11);
-        for (int deg = 30; deg < 360; deg += 30) {
-            double rad = static_cast<double>(deg) * kPi / 180.0;
-            double cs = std::cos(rad), sn = std::sin(rad);
-            // Xoay quanh trục Z cục bộ của CAD
-            cv::Matx33d Rz_step(cs, -sn, 0.0,
-                                sn,  cs, 0.0,
-                                0.0, 0.0, 1.0);
-            cv::Matx33d R_try = R_cand0 * Rz_step;
+        struct RankedSeed { double pre; cv::Matx33d R; cv::Vec3d t; };
+        std::vector<RankedSeed> cand_pool;
+        cand_pool.reserve(60);
+
+        // (A) Quét toàn bộ 24 hướng SO(3) trên hệ trục PCA của đám mây điểm vật thể
+        for (const auto& G : so3_cube_group) {
+            cv::Matx33d R_try = R_obs_pca * G;
             cv::Vec3d t_try = computeVisibleSurfaceOffset(R_try, c_fg, cad_mid, _mesh_pts, _mesh_normals);
-            auto sc_try = evaluateBidirectionalConsensus(R_try, t_try, diag, _mesh_pts, _mesh_normals,
-                                                         fg_pts, fx, fy, cx, cy, img_w, img_h, true);
-            rot_pool.push_back(AngleSeed{sc_try.score, R_try, t_try});
+            auto sc = evaluateBidirectionalConsensus(
+                R_try, t_try, diag, _mesh_pts, _mesh_normals,
+                fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+            cand_pool.push_back(RankedSeed{sc.score, R_try, t_try});
         }
-        std::sort(rot_pool.begin(), rot_pool.end(),
-                  [](const AngleSeed& a, const AngleSeed& b) { return a.pre > b.pre; });
-        for (size_t k = 0; k < std::min<size_t>(4, rot_pool.size()); ++k) {
-            seeds.push_back(PoseSeed{rot_pool[k].R, rot_pool[k].t, 0.0});
+
+        // (B) Quét thêm các góc xoay mịn (mỗi 30 độ) quanh cả 3 trục X, Y, Z của R_cand0 (từ AI ONNX)
+        for (int deg = 30; deg < 360; deg += 30) {
+            const double rad = static_cast<double>(deg) * kPi / 180.0;
+            const double cs = std::cos(rad), sn = std::sin(rad);
+            const cv::Matx33d Rz(cs, -sn, 0.0,  sn, cs, 0.0,  0.0, 0.0, 1.0);
+            const cv::Matx33d Ry(cs, 0.0,  sn, 0.0, 1.0, 0.0, -sn, 0.0,  cs);
+            const cv::Matx33d Rx(1.0, 0.0, 0.0, 0.0, cs, -sn, 0.0,  sn,  cs);
+
+            for (const auto& R_step : {Rz, Ry, Rx}) {
+                cv::Matx33d R_try = R_cand0 * R_step;
+                cv::Vec3d t_try = computeVisibleSurfaceOffset(R_try, c_fg, cad_mid, _mesh_pts, _mesh_normals);
+                auto sc = evaluateBidirectionalConsensus(
+                    R_try, t_try, diag, _mesh_pts, _mesh_normals,
+                    fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+                cand_pool.push_back(RankedSeed{sc.score, R_try, t_try});
+            }
+        }
+
+        std::sort(cand_pool.begin(), cand_pool.end(),
+                  [](const RankedSeed& a, const RankedSeed& b) { return a.pre > b.pre; });
+
+        const size_t take_top = std::min<size_t>(7, cand_pool.size());
+        for (size_t k = 0; k < take_top; ++k) {
+            seeds.push_back(PoseSeed{cand_pool[k].R, cand_pool[k].t, 0.0});
         }
     }
 
@@ -2062,7 +2066,9 @@ ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::V
 
     const std::vector<cv::Vec3f>& icp_cloud = dense_pts.empty() ? sampled_pts : dense_pts;
     refineMultiScaleMeshICP(icp_cloud, pose, intr);
-    refinePoseUniversalCrease2D3D(pose, rgb, intr);
+    if (_is_floor_standing || icp_cloud.size() < 250) {
+        refinePoseUniversalCrease2D3D(pose, rgb, intr);
+    }
     pose.bbox_2d = projectCadBoundingBox(pose.R, pose.t, intr, img_w, img_h, &pose.corners_2d);
 
     pose.cluster_points_count = static_cast<int>(icp_cloud.size());
