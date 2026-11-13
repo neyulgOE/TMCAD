@@ -1318,12 +1318,12 @@ void MainWindow::buildUi() {
         "QPushButton:hover { background: #37474f; color: white; }");
     connect(estimatePoseFileBtn_, &QPushButton::clicked, this, &MainWindow::onEstimatePoseFromFile);
 
-    estimatePoseSyntheticBtn_ = new QPushButton("🎲 Test Mô Phỏng 3D", step2Box);
+    estimatePoseSyntheticBtn_ = new QPushButton("🎮 Camera Ảo 3D (Live)", step2Box);
     estimatePoseSyntheticBtn_->setFixedHeight(30);
     estimatePoseSyntheticBtn_->setCursor(Qt::PointingHandCursor);
     estimatePoseSyntheticBtn_->setStyleSheet(
-        "QPushButton { background: #263238; color: #cfd8dc; font-weight: bold; border-radius: 4px; font-size: 11px; }"
-        "QPushButton:hover { background: #37474f; color: white; }");
+        "QPushButton { background: #1e3a5f; color: #e2e8f0; font-weight: bold; border-radius: 4px; font-size: 11px; }"
+        "QPushButton:hover { background: #2962ff; color: white; }");
     connect(estimatePoseSyntheticBtn_, &QPushButton::clicked, this, &MainWindow::onStartMuJoCoSimulation);
 
     testRow->addWidget(estimatePoseFileBtn_, 1);
@@ -1360,11 +1360,12 @@ void MainWindow::buildUi() {
         simCamLayout->addLayout(row);
     };
 
-    addSimSliderRow("Cao Cam (Z):", 12, 180, 42, liveCamHeightSlider_, liveCamHeightVal_, "0.42m");
+    addSimSliderRow("Cao Cam (Z):", 12, 185, 42, liveCamHeightSlider_, liveCamHeightVal_, "0.42m");
     addSimSliderRow("Cự ly (Dist):", 35, 280, 135, liveCamDistSlider_, liveCamDistVal_, "1.35m");
     addSimSliderRow("Quanh vật:", -180, 180, 0, liveCamAzimuthSlider_, liveCamAzimuthVal_, "0°");
     addSimSliderRow("Dịch ngang X:", -80, 80, 0, liveCamPanXSlider_, liveCamPanXVal_, "0.00m");
     addSimSliderRow("Xoay vật Yaw:", -180, 180, 0, liveObjYawSlider_, liveObjYawVal_, "0°");
+    addSimSliderRow("Che khuất:", 0, 50, 0, liveSimOcclusionSlider_, liveSimOcclusionVal_, "0%");
 
     auto applyLiveCamOrbit = [this]() {
         const double h = liveCamHeightSlider_->value() / 100.0;
@@ -1387,11 +1388,19 @@ void MainWindow::buildUi() {
     connect(liveObjYawSlider_, &QSlider::valueChanged, this, [this](int val) {
         liveObjYawVal_->setText(QString("%1°").arg(val));
         if (activeMuJoCoSim_) {
-            Eigen::Matrix3d R_cur;
-            Eigen::Vector3d t_cur;
-            activeMuJoCoSim_->getGroundTruthPose(R_cur, t_cur);
             Eigen::Matrix3d R_new = Eigen::AngleAxisd(val * M_PI / 180.0, Eigen::Vector3d::UnitZ()).toRotationMatrix();
             activeMuJoCoSim_->setTargetPose(R_new, Eigen::Vector3d(0.0, 0.0, liveCamDistSlider_->value() / 100.0));
+        }
+    });
+
+    connect(liveSimOcclusionSlider_, &QSlider::valueChanged, this, [this](int val) {
+        liveSimOcclusionVal_->setText(QString("%1%").arg(val));
+        if (activeMuJoCoSim_) {
+            activeMuJoCoSim_->setOccluderEnabled(val > 0);
+            if (val > 0) {
+                double shiftX = 0.06 - (val / 100.0) * 0.06;
+                activeMuJoCoSim_->setOccluderPose(Eigen::Vector3d(shiftX, 0.015, (liveCamDistSlider_->value() / 100.0) - 0.06));
+            }
         }
     });
 
@@ -1421,6 +1430,7 @@ void MainWindow::buildUi() {
         liveCamAzimuthSlider_->setValue(0);
         liveCamPanXSlider_->setValue(0);
         liveObjYawSlider_->setValue(0);
+        liveSimOcclusionSlider_->setValue(0);
         if (activeMuJoCoSim_) {
             activeMuJoCoSim_->setTargetPose(Eigen::Matrix3d::Identity(),
                                             Eigen::Vector3d(0.0, 0.0, liveCamDistSlider_->value() / 100.0));
@@ -7012,12 +7022,78 @@ void MainWindow::onStartMuJoCoSimulation() {
         }
     }
 
-    MuJoCoSimDialog dlg(currentCamProfile_, selectedOnnxPath(), activeCadPath, this);
-    if (dlg.exec() != QDialog::Accepted) {
+    // Tự động tìm file CAD Canonical khớp với model .onnx đang chọn (không bật popup MuJoCoSimDialog rời)
+    MuJoCoSimConfig cfg;
+    cfg.profileId = currentCamProfileId_;
+    cfg.cadPath = activeCadPath.toStdString();
+
+    const QString onnxPath = selectedOnnxPath();
+    if (!onnxPath.isEmpty()) {
+        const QString baseName = QFileInfo(onnxPath).completeBaseName();
+        QDir projDir(QCoreApplication::applicationDirPath());
+        for (int i = 0; i < 4; ++i) {
+            if (QDir(projDir.absoluteFilePath("CAD_DATA")).exists()) break;
+            projDir.cdUp();
+        }
+        const QStringList cands = {
+            projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + "_mesh.ply"),
+            projDir.absoluteFilePath("CAD_DATA/" + baseName + "_mesh.ply"),
+            projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".obj"),
+            projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".stl"),
+            projDir.absoluteFilePath("CAD_DATA/" + baseName + "/" + baseName + ".STL"),
+            projDir.absoluteFilePath("CAD_DATA/" + baseName + ".obj"),
+            projDir.absoluteFilePath("CAD_DATA/" + baseName + ".stl"),
+            projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".obj"),
+            projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".stl"),
+            projDir.absoluteFilePath("data/hope_sample/cad_models/" + baseName + ".ply")
+        };
+        for (const QString& cand : cands) {
+            if (QFile::exists(cand)) {
+                cfg.cadPath = cand.toStdString();
+                break;
+            }
+        }
+    }
+
+    if (cfg.cadPath.empty() || !QFile::exists(QString::fromStdString(cfg.cadPath))) {
+        QMessageBox::warning(this, "Camera Ảo 3D",
+            "Chưa tìm thấy file CAD khớp với model .onnx hiện tại.\n"
+            "Hãy nạp file CAD hoặc chọn model .onnx có thư mục CAD_DATA/<tên_model>/ tương ứng.");
         return;
     }
 
-    MuJoCoSimConfig cfg = dlg.getSimulationConfig();
+    const QString cadQ = QString::fromStdString(cfg.cadPath);
+    const QFileInfo cadFi(cadQ);
+    const QString cadDir = cadFi.absolutePath();
+    const QString cadBase = cadFi.completeBaseName();
+    const QStringList texCands = {
+        cadDir + "/" + cadBase + ".png",
+        cadDir + "/" + cadBase + ".jpg",
+        cadDir + "/materials/textures/texture.png",
+        cadDir + "/texture.png"
+    };
+    for (const QString& tc : texCands) {
+        if (QFile::exists(tc)) {
+            cfg.texPath = tc.toStdString();
+            break;
+        }
+    }
+    const bool isPreScaledMeters = cadQ.endsWith("_mesh.ply", Qt::CaseInsensitive) ||
+                                   cadQ.endsWith(".obj", Qt::CaseInsensitive) ||
+                                   cadQ.contains("hope_sample", Qt::CaseInsensitive);
+    const double sVal = isPreScaledMeters ? 1.0 : 0.001;
+    cfg.cadScale = Eigen::Vector3d(sVal, sVal, sVal);
+
+    const bool isLargeFloorObj = cadBase.contains("TABLE", Qt::CaseInsensitive) ||
+                                 cadBase.contains("PALLET", Qt::CaseInsensitive) ||
+                                 cadBase.contains("RACK", Qt::CaseInsensitive);
+    cfg.camHeightMeters = isLargeFloorObj ? 0.42 : 0.95;
+    cfg.distanceMeters = isLargeFloorObj ? 1.35 : 0.68;
+    cfg.yawDeg = 0.0;
+    cfg.pitchDeg = 0.0;
+    cfg.rollDeg = 0.0;
+    cfg.occluderEnabled = false;
+    cfg.occlusionPercent = 0.0;
 
     // Nếu trong scene_ chưa có file CAD này, tự động nạp vào viewport 3D để quan sát đồng bộ
     bool alreadyInScene = false;
@@ -7081,20 +7157,7 @@ void MainWindow::onStartMuJoCoSimulation() {
         }
     }
 
-    // ── THIẾT LẬP MỞ 2 BÊN SONG SONG (SIDE-BY-SIDE DUAL VIEW) ──
-    QScreen* screen = QGuiApplication::primaryScreen();
-    QRect availGeom = screen ? screen->availableGeometry() : QRect(0, 0, 1920, 1080);
-    int halfW = availGeom.width() / 2;
-    int fullH = availGeom.height();
-
-    // 1. Căn cửa sổ TMCAD sang NỬA TRÁI màn hình
-    this->setGeometry(availGeom.x(), availGeom.y(), halfW, fullH);
-
-    // 2. Mở Cửa sổ 3D MuJoCo Interactive ở NỬA PHẢI màn hình
-    int rightX = availGeom.x() + halfW;
-    int rightY = availGeom.y();
-    activeMuJoCoSim_->openInteractiveWindow(halfW, fullH, rightX, rightY);
-
+    // Chạy MuJoCo ở chế độ Headless Offscreen bơm trực tiếp 60 FPS vào 3 ô Camera Stream trên App (không mở cửa sổ rời)
     if (liveCameraStreamWidget_) {
         if (toggleCamViewAct_) {
             QSignalBlocker blocker(toggleCamViewAct_);
@@ -7127,37 +7190,40 @@ void MainWindow::onStartMuJoCoSimulation() {
         QSignalBlocker b3(liveCamAzimuthSlider_);
         QSignalBlocker b4(liveCamPanXSlider_);
         QSignalBlocker b5(liveObjYawSlider_);
+        QSignalBlocker b6(liveSimOcclusionSlider_);
         liveCamHeightSlider_->setValue(static_cast<int>(std::round(cfg.camHeightMeters * 100.0)));
         liveCamDistSlider_->setValue(static_cast<int>(std::round(cfg.distanceMeters * 100.0)));
         liveCamAzimuthSlider_->setValue(0);
         liveCamPanXSlider_->setValue(0);
         liveObjYawSlider_->setValue(static_cast<int>(std::round(cfg.yawDeg)));
+        liveSimOcclusionSlider_->setValue(0);
         liveCamHeightVal_->setText(QString("%1m").arg(cfg.camHeightMeters, 0, 'f', 2));
         liveCamDistVal_->setText(QString("%1m").arg(cfg.distanceMeters, 0, 'f', 2));
         liveCamAzimuthVal_->setText("0°");
         liveCamPanXVal_->setText("0.00m");
         liveObjYawVal_->setText(QString("%1°").arg(static_cast<int>(std::round(cfg.yawDeg))));
+        liveSimOcclusionVal_->setText("0%");
         liveSimCamBox_->setVisible(true);
     }
 
-    pipelineLog(QString("🎮 [MUJOCO DUAL VIEW] Đã khởi chạy mô phỏng tương tác 2 bên song song:"));
-    pipelineLog(QString("   📍 Bên Trái: TMCAD Camera Stream HUD + Bảng điều khiển Camera Live (không cần tắt bật lại)"));
-    pipelineLog(QString("   📍 Bên Phải: Cửa sổ MuJoCo 3D (W/S: Độ cao Cam | A/D: Xoay quanh vật | Q/E: Gần/Xa | Ctrl+Shift+Chuột: Kéo Cam | Ctrl+Chuột: Kéo CAD | R: Reset)"));
-    statusBar()->showMessage("Mô phỏng MuJoCo 3D Interactive đang chạy (60 FPS render / Async AI)...", 8000);
+    pipelineLog(QString("🎮 [MUJOCO LIVE SIM] Đã khởi chạy Camera Ảo 3D trực tiếp trong App (CAD: %1)")
+                    .arg(QFileInfo(QString::fromStdString(cfg.cadPath)).fileName()));
+    statusBar()->showMessage("Camera Ảo MuJoCo đang chạy trực tiếp (60 FPS Headless Offscreen / Async AI)...", 8000);
 }
 
 void MainWindow::onMuJoCoSimTick() {
-    if (!activeMuJoCoSim_ || !activeMuJoCoSim_->isInteractiveWindowOpen()) {
+    if (!activeMuJoCoSim_ || !activeMuJoCoSim_->isOpen()) {
         stopMuJoCoSimulation();
         return;
     }
 
-    // 1. Luôn cập nhật xoay chuột & vẽ cửa sổ 3D MuJoCo ngay lập tức (Mượt 60 FPS)
-    if (!activeMuJoCoSim_->pollInteractiveEvents()) {
-        stopMuJoCoSimulation();
-        return;
+    if (activeMuJoCoSim_->isInteractiveWindowOpen()) {
+        if (!activeMuJoCoSim_->pollInteractiveEvents()) {
+            stopMuJoCoSimulation();
+            return;
+        }
+        syncLiveSimCamSliders();
     }
-    syncLiveSimCamSliders();
     ++muJoCoTickCounter_;
 
     // 2. Nếu luồng AI ngầm vừa tính xong kết quả của frame trước -> Cập nhật HUD ngay (0ms block)

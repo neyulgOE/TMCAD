@@ -975,10 +975,10 @@ bool UniversalPoseEstimator::isInTargetWorkspace(const cv::Vec3d& t) const
 bool UniversalPoseEstimator::isCandidateRotationValid(const cv::Matx33d& R_candidate) const
 {
     if (_is_floor_standing) {
-        // Hỗ trợ camera đặt từ thấp (0.15m) tới cao (1.50m, góc chúc tới ~48 độ):
-        if (R_candidate(1, 2) > -0.40 ||
-            std::abs(R_candidate(0, 2)) > 0.45 ||
-            std::abs(R_candidate(2, 2)) > 0.85) {
+        // Hỗ trợ camera đặt từ thấp (0.12m) tới cao (1.85m, góc chúc tới ~78 độ):
+        if (R_candidate(1, 2) > -0.18 ||
+            std::abs(R_candidate(0, 2)) > 0.55 ||
+            std::abs(R_candidate(2, 2)) > 0.98) {
             return false;
         }
     }

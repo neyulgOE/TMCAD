@@ -575,13 +575,12 @@ struct MuJoCoD435SimSource::Impl {
             m->body_quat[4 * targetBodyId + 3] = q.z();
         }
 
-        // 2. Cập nhật vị trí camera_rig theo quỹ đạo 3D (Khoảng cách, Độ cao Z, Azimuth, Pan X)
+        // 2. Cập nhật vị trí camera_rig theo quỹ đạo 3D (Cự ly ngang, Độ cao Z, Azimuth, Pan X)
         int camRigId = mj_name2id(m, mjOBJ_BODY, "camera_rig");
         if (camRigId >= 0) {
-            double dist = std::max(0.35, currentDistanceMeters);
-            double camZ = std::clamp(currentCamHeightMeters, 0.12, 1.80);
-            double dz = camZ - centerZ;
-            double horizDist = std::sqrt(std::max(0.09, dist * dist - dz * dz));
+            double camZ = std::clamp(currentCamHeightMeters, 0.12, 1.85);
+            double minHoriz = largeFloorObj ? 0.85 : 0.35;
+            double horizDist = std::max(minHoriz, currentDistanceMeters);
 
             double azRad = currentCamAzimuthDeg * M_PI / 180.0;
             double camX = targetT.x() + currentCamPanX + horizDist * std::sin(azRad);
@@ -827,7 +826,7 @@ void MuJoCoD435SimSource::setTargetPose(const Eigen::Matrix3d& R, const Eigen::V
 }
 
 void MuJoCoD435SimSource::setCameraHeightAboveFloor(double heightMeters) {
-    impl_->currentCamHeightMeters = std::clamp(heightMeters, 0.12, 1.80);
+    impl_->currentCamHeightMeters = std::clamp(heightMeters, 0.12, 1.85);
     if (impl_->mujocoInitialized) {
         impl_->updateKinematics();
     }
@@ -838,7 +837,7 @@ double MuJoCoD435SimSource::cameraHeightAboveFloor() const {
 }
 
 void MuJoCoD435SimSource::setCameraOrbitPose(double heightMeters, double distanceMeters, double azimuthDeg, double panXMeters) {
-    impl_->currentCamHeightMeters = std::clamp(heightMeters, 0.12, 1.80);
+    impl_->currentCamHeightMeters = std::clamp(heightMeters, 0.12, 1.85);
     impl_->currentDistanceMeters = std::clamp(distanceMeters, 0.35, 3.00);
     impl_->currentCamAzimuthDeg = std::clamp(azimuthDeg, -180.0, 180.0);
     impl_->currentCamPanX = std::clamp(panXMeters, -0.80, 0.80);

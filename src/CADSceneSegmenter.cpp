@@ -464,7 +464,8 @@ bool CADSceneSegmenter::fitSupportPlaneRANSAC(const std::vector<cv::Vec3f>& pts,
             if (norm_n < 1e-6f) continue;
             n /= norm_n;
             if (n[1] > 0.0f) n = -n;
-            if (n[1] > -0.78f) continue;
+            // Hỗ trợ camera đặt cao > 1.36m nhìn chúc xuống tới ~72 độ
+            if (n[1] > -0.30f || std::abs(n[0]) > 0.45f || std::abs(n[2]) > 0.95f) continue;
 
             double d = -(n[0] * p1[0] + n[1] * p1[1] + n[2] * p1[2]);
             size_t count = 0;

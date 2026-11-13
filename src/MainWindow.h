@@ -458,6 +458,8 @@ private:
     QLabel* liveCamPanXVal_ = nullptr;
     QSlider* liveObjYawSlider_ = nullptr;
     QLabel* liveObjYawVal_ = nullptr;
+    QSlider* liveSimOcclusionSlider_ = nullptr;
+    QLabel* liveSimOcclusionVal_ = nullptr;
     void syncLiveSimCamSliders();
     void onMuJoCoSimTick();
     void stopMuJoCoSimulation();
