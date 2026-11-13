@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
         if (use_temporal && !multi_mode) {
             if (!poses.empty() && has_last && miss_streak < 3) {
                 const double jump_m = cv::norm(poses.front().t - last_pose.t);
-                if (jump_m > std::max(0.20, 1.5 * diag_m) && poses.front().confidence < 0.85f) {
+                if (jump_m > std::max(0.20, 1.5 * diag_m)) {
                     poses.clear();
                 }
             }
@@ -161,7 +161,9 @@ int main(int argc, char** argv) {
             } else {
                 ++miss_streak;
                 if (has_last && miss_streak <= 2) {
-                    poses.push_back(last_pose);
+                    tmcad::ObjectPose held = last_pose;
+                    held.method = "TRACKED/HOLD";
+                    poses.push_back(std::move(held));
                 } else {
                     has_last = false;
                     hit_streak = 0;

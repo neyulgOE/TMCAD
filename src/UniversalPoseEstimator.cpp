@@ -249,7 +249,8 @@ double estimateLocalForegroundDepth(const cv::Mat& depth_z16,
                                     const cv::Vec4d& floor_plane,
                                     bool has_floor,
                                     double fx, double fy, double cx, double cy,
-                                    double fallback_z)
+                                    double fallback_z,
+                                    double max_z)
 {
     std::vector<double> valid_zs;
     valid_zs.reserve(128);
@@ -269,7 +270,10 @@ double estimateLocalForegroundDepth(const cv::Mat& depth_z16,
             const uint16_t* row = depth_z16.ptr<uint16_t>(v);
             for (int u = u0; u <= u1; u += step_u) {
                 if (row[u] > 150) { // Điểm có tín hiệu cảm biến (> 0.15m)
-                    valid_zs.push_back(static_cast<double>(row[u]) * 0.001);
+                    const double z_m = static_cast<double>(row[u]) * 0.001;
+                    if (z_m <= max_z) {
+                        valid_zs.push_back(z_m);
+                    }
                 }
             }
         }
@@ -284,7 +288,7 @@ double estimateLocalForegroundDepth(const cv::Mat& depth_z16,
         const double denom = floor_plane[0] * ray_x + floor_plane[1] * ray_y + floor_plane[2];
         if (std::abs(denom) > 1e-4) {
             const double zp = -floor_plane[3] / denom;
-            if (zp > 0.15 && zp < 3.0) {
+            if (zp > 0.15 && zp <= max_z) {
                 z_plane = zp;
             }
         }
@@ -313,7 +317,8 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
                                         const std::vector<cv::Vec3f>& mesh_pts,
                                         const RgbEdgeMaps& edge_maps,
                                         const cv::Mat& depth_z16,
-                                        double fx, double fy, double cx, double cy)
+                                        double fx, double fy, double cx, double cy,
+                                        double max_z)
 {
     double best_cost = computeRgbSilhouetteChamferCost(R, t, mesh_pts, edge_maps, fx, fy, cx, cy);
     if (edge_maps.empty() || mesh_pts.empty()) return best_cost;
@@ -367,12 +372,12 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
             return t_probe;
         }
         double z_dyn = estimateLocalForegroundDepth(
-            depth_z16, u_min, u_max, v_top, v_bot, floor_plane, has_floor, fx, fy, cx, cy, z0);
+            depth_z16, u_min, u_max, v_top, v_bot, floor_plane, has_floor, fx, fy, cx, cy, z0, max_z);
         cv::Vec3d t_dyn(t_probe[0] * (z_dyn / z0), t_probe[1] * (z_dyn / z0), z_dyn);
         if (std::abs(z_dyn - z0) > 0.04 &&
             projectCadBounds2D(R_cand, t_dyn, cad_min, cad_max, fx, fy, cx, cy, u_min, u_max, v_top, v_bot)) {
             const double z_refined = estimateLocalForegroundDepth(
-                depth_z16, u_min, u_max, v_top, v_bot, floor_plane, has_floor, fx, fy, cx, cy, z_dyn);
+                depth_z16, u_min, u_max, v_top, v_bot, floor_plane, has_floor, fx, fy, cx, cy, z_dyn, max_z);
             t_dyn = cv::Vec3d(t_probe[0] * (z_refined / z0), t_probe[1] * (z_refined / z0), z_refined);
         }
         return t_dyn;
@@ -2926,15 +2931,17 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
 
             double sil_cost = 0.0;
             if (!dt_canny.empty()) {
+                const double max_ws_z = std::clamp(_real_bounding_diag_m * 8.0, 1.80, 3.20);
                 sil_cost = refineTranslationOnRgbSilhouette(
                     cand.R, cand.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
-                    _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy);
+                    _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
                 cand.t_glass = cand.t;
                 const cv::Vec3d euler = rotationMatrixToEulerDeg(cand.R, false);
                 cand.roll_deg = euler[0];
                 cand.pitch_deg = euler[1];
                 cand.yaw_deg = euler[2];
                 cand.bbox_2d = projectCadBoundingBox(cand.R, cand.t, intr, depth_z16.cols, depth_z16.rows, &cand.corners_2d);
+                if (!isInTargetWorkspace(cand.t)) continue;
             }
 
             ObjectPose strict_cand = cand;
@@ -3077,15 +3084,17 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
 
             double sil_cost = 0.0;
             if (!dt_canny.empty()) {
+                const double max_ws_z = std::clamp(_real_bounding_diag_m * 8.0, 1.80, 3.20);
                 sil_cost = refineTranslationOnRgbSilhouette(
                     inst_pose.R, inst_pose.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
-                    _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy);
+                    _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
                 inst_pose.t_glass = inst_pose.t;
                 const cv::Vec3d euler = rotationMatrixToEulerDeg(inst_pose.R, false);
                 inst_pose.roll_deg = euler[0];
                 inst_pose.pitch_deg = euler[1];
                 inst_pose.yaw_deg = euler[2];
                 inst_pose.bbox_2d = projectCadBoundingBox(inst_pose.R, inst_pose.t, intr, depth_z16.cols, depth_z16.rows, &inst_pose.corners_2d);
+                if (!isInTargetWorkspace(inst_pose.t)) continue;
             }
 
             ObjectPose strict_pose = inst_pose;

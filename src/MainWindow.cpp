@@ -3352,7 +3352,7 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
             if (!poses.empty() && hasLastAcceptedPose_ && temporalMissStreak_ < 3) {
                 const double jump_m = cv::norm(poses.front().t - lastAcceptedPose_.t);
                 const double max_jump_m = std::max(0.20, 1.5 * cadDiagM);
-                if (jump_m > max_jump_m && poses.front().confidence < 0.85f) {
+                if (jump_m > max_jump_m) {
                     poses.clear();
                 }
             }
@@ -3370,7 +3370,9 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
             } else {
                 ++temporalMissStreak_;
                 if (hasLastAcceptedPose_ && temporalMissStreak_ <= 2) {
-                    poses.push_back(lastAcceptedPose_);
+                    tmcad::ObjectPose held = lastAcceptedPose_;
+                    held.method = "TRACKED/HOLD";
+                    poses.push_back(std::move(held));
                 } else {
                     hasLastAcceptedPose_ = false;
                     temporalHitStreak_ = 0;

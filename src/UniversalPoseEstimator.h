@@ -54,9 +54,29 @@ struct ObjectPose {
 };
 
 struct DetectionAcceptancePolicy {
+    static bool isInWorkspace(const cv::Vec3d& t, double cad_diag, bool is_floor_standing) {
+        if (!std::isfinite(t[0]) || !std::isfinite(t[1]) || !std::isfinite(t[2])) return false;
+        if (is_floor_standing) {
+            return (t[0] >= -1.35 && t[0] <= 1.35) &&
+                   (t[1] >= -0.95 && t[1] <= 0.65) &&
+                   (t[2] >= 0.45 && t[2] <= 2.95);
+        }
+        const double max_z = std::clamp(std::max(0.05, cad_diag) * 8.0, 1.80, 3.20);
+        return (std::abs(t[0]) <= 1.50) &&
+               (std::abs(t[1]) <= 1.20) &&
+               (t[2] >= 0.15 && t[2] <= max_z);
+    }
+
     static bool isAccepted(const ObjectPose& pose, double cad_diag, bool is_floor_standing) {
         if (!pose.valid) return false;
         if (pose.method == "pca_fallback_seed") return false;
+        if (!isInWorkspace(pose.t, cad_diag, is_floor_standing)) return false;
+        if (pose.bbox_2d.width > 0.0f && pose.bbox_2d.height > 0.0f) {
+            if (std::max(pose.bbox_2d.width, pose.bbox_2d.height) < 24.0f ||
+                std::min(pose.bbox_2d.width, pose.bbox_2d.height) < 12.0f) {
+                return false;
+            }
+        }
         if (pose.confidence < 0.65f) return false;
         const double max_rmse = std::clamp(0.072 * std::max(0.05, cad_diag), 0.012, 0.025);
         if (pose.rmse_m > max_rmse) return false;
