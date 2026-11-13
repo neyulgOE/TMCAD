@@ -1035,6 +1035,52 @@ void CADSceneSegmenter::clusterAndMergeTarget(const std::vector<cv::Vec3f>& fg_p
             }
         } else {
             const float free_max_z = std::clamp(3.8f * _bounding_diag_m + 0.15f, 0.75f, _max_depth_m);
+
+            // Hàn nối các mảnh của cùng 1 vật thể bị "hố đen Depth" (specular dropout ở giữa thân) cắt rời
+            // Ví dụ: cụm nắp/cổ ở trên và cụm chân đế ở dưới có cùng độ sâu Z và thẳng hàng theo X.
+            if (raw_clusters.size() >= 2) {
+                std::vector<bool> merged_flag(raw_clusters.size(), false);
+                std::vector<SegmentedCluster> bridged_clusters;
+                bridged_clusters.reserve(raw_clusters.size());
+                for (size_t i = 0; i < raw_clusters.size(); ++i) {
+                    if (merged_flag[i]) continue;
+                    const float diag_i = static_cast<float>(cv::norm(raw_clusters[i].bbox_max - raw_clusters[i].bbox_min));
+                    std::vector<cv::Vec3f> combined = raw_clusters[i].points;
+                    const cv::Vec3f c_i = raw_clusters[i].centroid;
+
+                    if (diag_i <= 1.25f * _bounding_diag_m && c_i[2] <= free_max_z) {
+                        for (size_t j = i + 1; j < raw_clusters.size(); ++j) {
+                            if (merged_flag[j]) continue;
+                            const float diag_j = static_cast<float>(cv::norm(raw_clusters[j].bbox_max - raw_clusters[j].bbox_min));
+                            if (diag_j > 1.25f * _bounding_diag_m) continue;
+                            const cv::Vec3f c_j = raw_clusters[j].centroid;
+                            const float dx = std::abs(c_i[0] - c_j[0]);
+                            const float dz = std::abs(c_i[2] - c_j[2]);
+                            const float dist_3d = static_cast<float>(cv::norm(c_i - c_j));
+
+                            if (dz <= 0.045f && dx <= 0.45f * _bounding_diag_m &&
+                                dist_3d >= 0.18f * _bounding_diag_m && dist_3d <= 1.10f * _bounding_diag_m) {
+                                combined.insert(combined.end(),
+                                                raw_clusters[j].points.begin(),
+                                                raw_clusters[j].points.end());
+                                std::mt19937 rng_fill(1337 + static_cast<unsigned>(i * 31 + j));
+                                std::uniform_int_distribution<size_t> pick_a(0, raw_clusters[i].points.size() - 1);
+                                std::uniform_int_distribution<size_t> pick_b(0, raw_clusters[j].points.size() - 1);
+                                for (int k = 0; k < 120; ++k) {
+                                    const float alpha = static_cast<float>(k + 1) / 121.0f;
+                                    const cv::Vec3f pa = raw_clusters[i].points[pick_a(rng_fill)];
+                                    const cv::Vec3f pb = raw_clusters[j].points[pick_b(rng_fill)];
+                                    combined.push_back(pa * (1.0f - alpha) + pb * alpha);
+                                }
+                                merged_flag[j] = true;
+                            }
+                        }
+                    }
+                    bridged_clusters.push_back(computeClusterStats(std::move(combined)));
+                }
+                raw_clusters = std::move(bridged_clusters);
+            }
+
             // Keep object-sized standalone clusters first
             for (const auto& cl : raw_clusters) {
                 const float c_diag = static_cast<float>(cv::norm(cl.bbox_max - cl.bbox_min));
