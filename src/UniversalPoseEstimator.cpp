@@ -172,8 +172,9 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
         row_v[b] = pt.y;
     }
 
-    double sum_vert = 0.0;
-    int cnt_vert = 0;
+    double sum_left = 0.0;
+    double sum_right = 0.0;
+    int cnt_side = 0;
     int first_b = -1, last_b = -1;
     for (int b = 0; b < kBins; ++b) {
         if (row_v[b] < 0) continue;
@@ -182,11 +183,11 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
         const int v = row_v[b];
         const int u_l = row_min_u[b];
         const int u_r = row_max_u[b];
-        sum_vert += std::min(30.0f, edge_maps.dt_vert.at<float>(v, u_l));
-        sum_vert += std::min(30.0f, edge_maps.dt_vert.at<float>(v, u_r));
-        cnt_vert += 2;
+        sum_left += std::min(30.0f, edge_maps.dt_vert.at<float>(v, u_l));
+        sum_right += std::min(30.0f, edge_maps.dt_vert.at<float>(v, u_r));
+        ++cnt_side;
     }
-    if (cnt_vert < 8) return 50.0;
+    if (cnt_side < 4) return 50.0;
 
     double sum_horiz = 0.0;
     int cnt_horiz = 0;
@@ -198,9 +199,13 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
         ++cnt_horiz;
     }
 
-    const double mean_vert = sum_vert / cnt_vert;
+    const double mean_left = sum_left / cnt_side;
+    const double mean_right = sum_right / cnt_side;
+    const double mean_vert = 0.5 * (mean_left + mean_right);
+    const double bilat_max = std::max(mean_left, mean_right);
     const double mean_horiz = (cnt_horiz > 0) ? (sum_horiz / cnt_horiz) : mean_vert;
-    return 0.78 * mean_vert + 0.22 * mean_horiz;
+    // Bắt buộc khớp đối xứng cả 2 sườn trái/phải (ngăn đường kẻ dọc đơn lẻ trên cột tường kéo điểm xuống)
+    return 0.45 * bilat_max + 0.33 * mean_vert + 0.22 * mean_horiz;
 }
 
 bool projectCadBounds2D(const cv::Matx33d& R,
@@ -2856,7 +2861,9 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
                                     empty_behind_frac, ring_jump_frac,
                                     wide_out_frac, wide_convex_ratio, ring_tot);
     const bool concave_crease = (ring_tot >= 40 && (wide_out_frac < 0.14 || wide_convex_ratio < 0.24));
-    if (empty_behind_frac > 0.16 || (ring_tot >= 40 && ring_jump_frac < 0.36) || concave_crease) {
+    const int min_ring_tot = strict_clutter_gate ? 24 : 40;
+    const double min_ring_jump = strict_clutter_gate ? 0.45 : 0.36;
+    if (empty_behind_frac > 0.16 || (ring_tot >= min_ring_tot && ring_jump_frac < min_ring_jump) || concave_crease) {
         if (strict_clutter_gate) return false;
         pose.confidence = std::max(0.05f, pose.confidence * 0.40f);
     }
@@ -2872,6 +2879,224 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
         }
     }
     return true;
+}
+
+std::vector<ObjectPose> UniversalPoseEstimator::proposeDepthHoleSeeds(
+    const cv::Mat& rgb,
+    const cv::Mat& depth_z16,
+    const CameraIntrinsics& intr,
+    const cv::Vec4d& floor_plane,
+    bool has_floor,
+    const cv::Rect& roi_hint) const
+{
+    std::vector<ObjectPose> seeds;
+    if (rgb.empty() || depth_z16.empty() || _is_floor_standing || _mesh_pts.empty()) return seeds;
+
+    const double fx = (intr.fx > 100.0) ? intr.fx : 608.215;
+    const double fy = (intr.fy > 100.0) ? intr.fy : 608.128;
+    const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * rgb.cols);
+    const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * rgb.rows);
+    const double max_ws_z = std::clamp(_real_bounding_diag_m * 8.0, 1.80, 3.20);
+
+    const cv::Vec3d span = _cad_max - _cad_min;
+    int long_ax = 2;
+    if (span[0] >= span[1] && span[0] >= span[2]) long_ax = 0;
+    else if (span[1] >= span[0] && span[1] >= span[2]) long_ax = 1;
+    const int ax1 = (long_ax + 1) % 3;
+    const int ax2 = (long_ax + 2) % 3;
+    const double cad_long = std::max(0.02, span[long_ax]);
+    const double cad_short = std::max(0.02, std::max(span[ax1], span[ax2]));
+    const double stand_aspect = cad_long / cad_short;
+    const double lie_aspect = cad_short / cad_long;
+    const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
+
+    // Luôn quét toàn khung nếu roi_hint đang bị kéo lệch sát mép trái (< 0.20 * W)
+    cv::Rect search_rect(12, 12, std::max(1, rgb.cols - 24), std::max(1, rgb.rows - 24));
+    if (roi_hint.width >= 32 && roi_hint.height >= 32 && roi_hint.x >= static_cast<int>(0.20 * rgb.cols)) {
+        search_rect &= roi_hint;
+    }
+    if (search_rect.width < 32 || search_rect.height < 32) return seeds;
+
+    // 1. Zero-HSV: Tạo mặt nạ hố khuyết Depth (depth == 0) tách theo ranh giới biên Canny RGB
+    cv::Mat gray, canny, edge_dil;
+    if (rgb.channels() == 3) cv::cvtColor(rgb, gray, cv::COLOR_BGR2GRAY);
+    else gray = rgb;
+    cv::GaussianBlur(gray, gray, cv::Size(3, 3), 0.8);
+    cv::Canny(gray, canny, 40, 120);
+    cv::dilate(canny, edge_dil, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+
+    cv::Mat hole_mask = cv::Mat::zeros(depth_z16.size(), CV_8UC1);
+    for (int v = search_rect.y; v < search_rect.br().y; ++v) {
+        const uint16_t* d_row = depth_z16.ptr<uint16_t>(v);
+        const uint8_t* e_row = edge_dil.ptr<uint8_t>(v);
+        uint8_t* h_row = hole_mask.ptr<uint8_t>(v);
+        for (int u = search_rect.x; u < search_rect.br().x; ++u) {
+            if (d_row[u] == 0 && e_row[u] == 0) {
+                h_row[u] = 255;
+            }
+        }
+    }
+    cv::morphologyEx(hole_mask, hole_mask, cv::MORPH_OPEN,
+                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+    cv::morphologyEx(hole_mask, hole_mask, cv::MORPH_CLOSE,
+                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 9)));
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(hole_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    struct ScoredSeed {
+        double score{0.0};
+        ObjectPose pose;
+    };
+    std::vector<ScoredSeed> cands;
+
+    cv::Vec3d up_axis(0.0, -1.0, 0.0);
+    if (has_floor && std::abs(floor_plane[1]) > 0.55) {
+        up_axis = cv::Vec3d(floor_plane[0], floor_plane[1], floor_plane[2]);
+        up_axis *= (1.0 / std::max(1e-9, cv::norm(up_axis)));
+        if (up_axis[1] > 0.0) up_axis = -up_axis;
+    }
+
+    for (const auto& c : contours) {
+        const cv::Rect box = cv::boundingRect(c);
+        if (std::max(box.width, box.height) < 48 || std::min(box.width, box.height) < 18) continue;
+
+        const double aspect = static_cast<double>(box.height) / std::max(1, box.width);
+        const bool match_stand = (aspect >= 0.50 * stand_aspect && aspect <= 2.20 * stand_aspect);
+        const bool match_lie = (aspect >= 0.45 * lie_aspect && aspect <= 2.00 * lie_aspect);
+        if (!match_stand && !match_lie) continue;
+
+        // Tỉ lệ depth == 0 bên trong hộp >= 0.30
+        int zero_cnt = 0, tot_cnt = 0;
+        const int v_in0 = box.y + box.height / 5;
+        const int v_in1 = box.y + 4 * box.height / 5;
+        const int u_in0 = box.x + box.width / 5;
+        const int u_in1 = box.x + 4 * box.width / 5;
+        for (int v = v_in0; v < v_in1; v += 2) {
+            const uint16_t* d_row = depth_z16.ptr<uint16_t>(v);
+            for (int u = u_in0; u < u_in1; u += 2) {
+                ++tot_cnt;
+                if (d_row[u] == 0) ++zero_cnt;
+            }
+        }
+        const double zero_ratio = (tot_cnt > 0) ? (static_cast<double>(zero_cnt) / tot_cnt) : 0.0;
+        if (zero_ratio < 0.30) continue;
+
+        // Kiểm tra biên Canny bao quanh 2 phía đối xứng của hố
+        int left_hits = 0, right_hits = 0, top_hits = 0, bot_hits = 0;
+        for (int v = box.y; v < box.br().y; v += 3) {
+            bool hl = false, hr = false;
+            for (int du = -4; du <= 4; ++du) {
+                const int ul = std::clamp(box.x + du, 0, canny.cols - 1);
+                const int ur = std::clamp(box.br().x + du, 0, canny.cols - 1);
+                if (canny.at<uint8_t>(v, ul) > 0) hl = true;
+                if (canny.at<uint8_t>(v, ur) > 0) hr = true;
+            }
+            if (hl) ++left_hits;
+            if (hr) ++right_hits;
+        }
+        for (int u = box.x; u < box.br().x; u += 3) {
+            bool ht = false, hb = false;
+            for (int dv = -4; dv <= 4; ++dv) {
+                const int vt = std::clamp(box.y + dv, 0, canny.rows - 1);
+                const int vb = std::clamp(box.br().y + dv, 0, canny.rows - 1);
+                if (canny.at<uint8_t>(vt, u) > 0) ht = true;
+                if (canny.at<uint8_t>(vb, u) > 0) hb = true;
+            }
+            if (ht) ++top_hits;
+            if (hb) ++bot_hits;
+        }
+        const bool stand_edges = (left_hits >= 4 && right_hits >= 4);
+        const bool lie_edges = (top_hits >= 4 && bot_hits >= 4);
+        if (!stand_edges && !lie_edges) continue;
+
+        const bool use_stand = match_stand && (stand_edges || !match_lie) && (box.height >= box.width);
+        const double z_pinhole = use_stand
+            ? (fy * cad_long) / static_cast<double>(box.height)
+            : (fx * cad_long) / static_cast<double>(box.width);
+        if (z_pinhole < 0.15 || z_pinhole > max_ws_z) continue;
+
+        // Quét viền nắp/đế trong toàn dải [0.15, max_ws_z] quanh ±30% z_pinhole (lấy phân vị thứ 20)
+        std::vector<double> rim_zs;
+        const int band_u0 = std::max(0, box.x - 4);
+        const int band_u1 = std::min(depth_z16.cols - 1, box.br().x + 4);
+        const int bands[2][2] = {
+            {std::max(0, box.y - 8), std::min(depth_z16.rows - 1, box.y + box.height / 4)},
+            {std::max(0, box.y + 3 * box.height / 4), std::min(depth_z16.rows - 1, box.br().y + 12)}
+        };
+        for (int b = 0; b < 2; ++b) {
+            for (int v = bands[b][0]; v <= bands[b][1]; v += 2) {
+                const uint16_t* d_row = depth_z16.ptr<uint16_t>(v);
+                for (int u = band_u0; u <= band_u1; u += 2) {
+                    const double zm = static_cast<double>(d_row[u]) * 0.001;
+                    if (zm >= 0.15 && zm <= max_ws_z && std::abs(zm - z_pinhole) <= 0.30 * z_pinhole) {
+                        rim_zs.push_back(zm);
+                    }
+                }
+            }
+        }
+        double z_seed = z_pinhole;
+        if (rim_zs.size() >= 6) {
+            std::sort(rim_zs.begin(), rim_zs.end());
+            const double z_rim = rim_zs[rim_zs.size() / 5];
+            z_seed = 0.50 * z_pinhole + 0.50 * z_rim;
+        }
+
+        cv::Vec3d axis_long = up_axis;
+        if (!use_stand) {
+            axis_long = cv::Vec3d(1.0, 0.0, 0.0);
+        }
+        const cv::Vec3d ref_x = (std::abs(axis_long[0]) < 0.85) ? cv::Vec3d(1.0, 0.0, 0.0) : cv::Vec3d(0.0, -1.0, 0.0);
+        cv::Vec3d s1 = ref_x - axis_long * axis_long.dot(ref_x);
+        s1 *= (1.0 / std::max(1e-9, cv::norm(s1)));
+        cv::Vec3d s2 = axis_long.cross(s1);
+        s2 *= (1.0 / std::max(1e-9, cv::norm(s2)));
+
+        cv::Matx33d R_seed = cv::Matx33d::zeros();
+        for (int r = 0; r < 3; ++r) {
+            R_seed(r, long_ax) = -axis_long[r];
+            R_seed(r, ax1) = s1[r];
+            R_seed(r, ax2) = s2[r];
+        }
+        if (cv::determinant(R_seed) < 0.0) {
+            for (int r = 0; r < 3; ++r) R_seed(r, ax2) = -R_seed(r, ax2);
+        }
+
+        const double u_c = box.x + 0.5 * box.width;
+        const double v_c = box.y + 0.5 * box.height;
+        const cv::Vec3d center_3d((u_c - cx) * z_seed / fx, (v_c - cy) * z_seed / fy, z_seed);
+        const cv::Vec3d t_seed = center_3d - R_seed * cad_mid;
+        if (!isInTargetWorkspace(t_seed)) continue;
+
+        ObjectPose sp;
+        sp.valid = true;
+        sp.model_name = _model_name;
+        sp.R = R_seed;
+        sp.t = t_seed;
+        sp.t_glass = t_seed;
+        sp.method = "depth_hole_seed";
+        const cv::Vec3d euler = rotationMatrixToEulerDeg(R_seed, false);
+        sp.roll_deg = euler[0];
+        sp.pitch_deg = euler[1];
+        sp.yaw_deg = euler[2];
+        sp.bbox_2d = projectCadBoundingBox(R_seed, t_seed, intr, rgb.cols, rgb.rows, &sp.corners_2d);
+
+        const double target_asp = use_stand ? stand_aspect : lie_aspect;
+        const double asp_sim = std::exp(-std::abs(aspect - target_asp) * 0.45);
+        const double edge_score = use_stand ? std::min(left_hits, right_hits) : std::min(top_hits, bot_hits);
+        const double sc = static_cast<double>(box.area()) * asp_sim * zero_ratio * std::min(12.0, edge_score);
+        cands.push_back({sc, std::move(sp)});
+    }
+
+    std::sort(cands.begin(), cands.end(), [](const ScoredSeed& a, const ScoredSeed& b) {
+        return a.score > b.score;
+    });
+    const size_t keep = std::min<size_t>(cands.size(), 3);
+    seeds.reserve(keep);
+    for (size_t i = 0; i < keep; ++i) {
+        seeds.push_back(std::move(cands[i].pose));
+    }
+    return seeds;
 }
 
 ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
@@ -2992,6 +3217,48 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
 
     if (pose.valid && !DetectionAcceptancePolicy::isAccepted(pose, _real_bounding_diag_m, _is_floor_standing)) {
         pose.valid = false;
+    }
+
+    if (!pose.valid && !_is_floor_standing && !dt_canny.empty()) {
+        const double max_ws_z = std::clamp(_real_bounding_diag_m * 8.0, 1.80, 3.20);
+        auto hole_seeds = proposeDepthHoleSeeds(rgb, depth_z16, intr, seg_res.floor_plane, seg_res.floor_detected, roi_hint);
+        double best_hole_rank = -1e9;
+        for (auto& seed : hole_seeds) {
+            const double sil_cost = refineTranslationOnRgbSilhouette(
+                seed.R, seed.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
+                _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
+            if (!isInTargetWorkspace(seed.t)) continue;
+
+            seed.t_glass = seed.t;
+            const cv::Vec3d euler = rotationMatrixToEulerDeg(seed.R, false);
+            seed.roll_deg = euler[0];
+            seed.pitch_deg = euler[1];
+            seed.yaw_deg = euler[2];
+            seed.bbox_2d = projectCadBoundingBox(seed.R, seed.t, intr, depth_z16.cols, depth_z16.rows, &seed.corners_2d);
+
+            double empty_behind_frac = 0.0, ring_jump_frac = 1.0, wide_out_frac = 1.0, wide_convex_ratio = 1.0;
+            int ring_tot = 0;
+            computeSilhouetteAndEmptyBehind(seed.R, seed.t, _mesh_pts, depth_z16,
+                                            sil_fx, sil_fy, sil_cx, sil_cy, _real_bounding_diag_m,
+                                            empty_behind_frac, ring_jump_frac,
+                                            wide_out_frac, wide_convex_ratio, ring_tot);
+            if (empty_behind_frac > 0.22 || (ring_tot >= 24 && ring_jump_frac < 0.30)) continue;
+
+            rescorePoseUnclipped(seed, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
+            if (sil_cost <= 5.2) {
+                seed.rgb_sil_strong = true;
+                seed.method = "depth_hole_rgb_refined";
+                seed.confidence = std::max(seed.confidence,
+                                           static_cast<float>(std::clamp(0.92 - 0.05 * sil_cost, 0.66, 0.92)));
+            }
+            if (!DetectionAcceptancePolicy::isAccepted(seed, _real_bounding_diag_m, _is_floor_standing)) continue;
+
+            const double rank = static_cast<double>(seed.confidence) - 0.04 * sil_cost - 0.25 * empty_behind_frac;
+            if (rank > best_hole_rank) {
+                best_hole_rank = rank;
+                pose = std::move(seed);
+            }
+        }
     }
 
     auto t_end = std::chrono::steady_clock::now();

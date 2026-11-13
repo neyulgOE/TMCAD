@@ -240,6 +240,12 @@ private:
     static cv::Vec3d rotationMatrixToEulerDeg(const cv::Matx33d& R, bool fold_c2_yaw = false);
 
 private:
+    std::vector<ObjectPose> proposeDepthHoleSeeds(const cv::Mat& rgb,
+                                                  const cv::Mat& depth_z16,
+                                                  const CameraIntrinsics& intr,
+                                                  const cv::Vec4d& floor_plane,
+                                                  bool has_floor,
+                                                  const cv::Rect& roi_hint) const;
     Ort::Env _ort_env;
     Ort::MemoryInfo _ort_mem_info;
     std::unique_ptr<Ort::Session> _ort_session;
