@@ -3351,10 +3351,10 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
     const int x1 = (pb.width > 8.0f) ? std::min(w, static_cast<int>(std::ceil(pb.x + pb.width)) + pad_x) : w;
     const int y1 = (pb.height > 8.0f) ? std::min(h, static_cast<int>(std::ceil(pb.y + pb.height)) + pad_y) : h;
 
-    const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
-    const cv::Vec3d prev_center = _track_pose.R * cad_mid + _track_pose.t;
-    const double keep_r = 0.65 * diag;
-    const double keep_r2 = keep_r * keep_r;
+    const cv::Matx33d R_inv = _track_pose.R.t();
+    const double obb_pad = std::clamp(0.16 * diag, 0.022, 0.042);
+    const cv::Vec3d obb_min = _cad_min - cv::Vec3d(obb_pad, obb_pad, obb_pad);
+    const cv::Vec3d obb_max = _cad_max + cv::Vec3d(obb_pad, obb_pad, obb_pad);
     const double floor_norm = cv::norm(cv::Vec3d(_track_floor_plane[0], _track_floor_plane[1], _track_floor_plane[2]));
     const bool use_floor_filter = _track_has_floor && (floor_norm > 0.5);
 
@@ -3377,10 +3377,10 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
                 if (std::abs(signed_d) <= 0.018) continue;
                 if (_track_floor_plane[1] < -0.5 && signed_d > 0.018) continue;
             }
-            const double dx = x - prev_center[0];
-            const double dy = y - prev_center[1];
-            const double dz = z - prev_center[2];
-            if (dx * dx + dy * dy + dz * dz <= keep_r2) {
+            const cv::Vec3d pc = R_inv * (cv::Vec3d(x, y, z) - _track_pose.t);
+            if (pc[0] >= obb_min[0] && pc[0] <= obb_max[0] &&
+                pc[1] >= obb_min[1] && pc[1] <= obb_max[1] &&
+                pc[2] >= obb_min[2] && pc[2] <= obb_max[2]) {
                 local_fg.emplace_back(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
             }
         }
@@ -3408,19 +3408,20 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
         cv::Matx33d R_icp = cand.R;
         cv::Vec3d t_icp = cand.t;
         const std::vector<double> tr_scales = {
-            std::clamp(0.065 * diag, 0.014, 0.055),
-            std::clamp(0.030 * diag, 0.008, 0.025)
+            std::clamp(0.050 * diag, 0.010, 0.040),
+            std::clamp(0.025 * diag, 0.006, 0.020)
         };
         runPointToPlaneIcpGeneric(cand.R, cand.t, _mesh_pts, _mesh_normals, fg_icp,
                                   1, std::max<size_t>(1, _mesh_pts.size() / 1600),
                                   tr_scales, 10, fx, fy, cx, cy, w, h, R_icp, t_icp);
-        if (isInTargetWorkspace(t_icp) && cv::norm(t_icp - _track_pose.t) <= std::max(0.12, 0.65 * diag)) {
+        if (isInTargetWorkspace(t_icp) && cv::norm(t_icp - _track_pose.t) <= std::clamp(0.20 * diag, 0.035, 0.080)) {
             cand.R = R_icp;
             cand.t = t_icp;
         }
     }
 
     // Chặng B: Tinh chỉnh Yaw & dịch chuyển mịn quanh Warm-Start theo tỷ lệ pixel/CAD
+    const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
     double sil_cost = 0.0;
     if (!_is_floor_standing && !rgb.empty()) {
         const RgbEdgeMaps dt_canny = buildRgbCannyDistanceTransform(rgb);
@@ -3717,7 +3718,9 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
     if (_temporal_tracking_enabled && !_multi_instance_enabled && roi_hint.empty() &&
         pose.valid && _track_pose.valid && _track_active) {
         const double g_jump = cv::norm(pose.t - _track_pose.t);
-        if (g_jump > std::max(0.10, 0.45 * _real_bounding_diag_m)) {
+        const bool bad_jump = (g_jump > std::max(0.055, 0.24 * _real_bounding_diag_m));
+        const bool worse_jump = (g_jump > 0.030 && pose.rmse_m > _track_pose.rmse_m + 0.0045);
+        if (bad_jump || worse_jump) {
             pose = has_tracked_fallback ? std::move(tracked_fallback) : ObjectPose{};
         }
     }
