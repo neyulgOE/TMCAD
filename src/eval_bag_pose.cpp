@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     estimator.setMultiInstanceMode(multi_mode, 4);
+    estimator.setTemporalTrackingEnabled(use_temporal && !multi_mode);
 
     RealSenseBagSource bag_src(bag_path);
     if (!bag_src.open()) {
@@ -119,7 +120,7 @@ int main(int argc, char** argv) {
         if (intr.cx <= 1e-6 && intr.ppx > 1e-6) intr.cx = intr.ppx;
         if (intr.cy <= 1e-6 && intr.ppy > 1e-6) intr.cy = intr.ppy;
 
-        const bool used_auto_roi = (use_temporal && !multi_mode && has_last && !auto_roi.empty());
+        const bool used_auto_roi = (!estimator.temporalTrackingEnabled() && use_temporal && !multi_mode && has_last && !auto_roi.empty());
         std::vector<tmcad::ObjectPose> poses =
             estimator.estimateMultiObjects(bgr, depth, intr, used_auto_roi ? auto_roi : cv::Rect());
         if (used_auto_roi && poses.empty()) {

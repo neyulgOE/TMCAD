@@ -175,6 +175,20 @@ public:
     void setMultiInstanceMode(bool enable, int max_instances = 4);
     bool multiInstanceMode() const noexcept { return _multi_instance_enabled; }
 
+    void setTemporalTrackingEnabled(bool enable) noexcept {
+        _temporal_tracking_enabled = enable;
+        if (!enable) resetTemporalTrack();
+    }
+    bool temporalTrackingEnabled() const noexcept { return _temporal_tracking_enabled; }
+    void resetTemporalTrack() noexcept {
+        _track_active = false;
+        _track_confirm_streak = 0;
+        _track_miss_streak = 0;
+        _track_has_floor = false;
+        _track_pose = ObjectPose{};
+        _track_prev_global = ObjectPose{};
+    }
+
     const std::string& modelName() const noexcept { return _model_name; }
     const std::string& loadedOnnxPath() const noexcept { return _loaded_onnx_path; }
     bool isFloorStanding() const noexcept { return _is_floor_standing; }
@@ -241,6 +255,11 @@ private:
     static cv::Vec3d rotationMatrixToEulerDeg(const cv::Matx33d& R, bool fold_c2_yaw = false);
 
 private:
+    bool trackFromWarmStart(const cv::Mat& rgb,
+                            const cv::Mat& depth_z16,
+                            const CameraIntrinsics& intr,
+                            ObjectPose& out_pose);
+
     std::vector<ObjectPose> proposeDepthHoleSeeds(const cv::Mat& rgb,
                                                   const cv::Mat& depth_z16,
                                                   const CameraIntrinsics& intr,
@@ -262,6 +281,15 @@ private:
     bool _multi_instance_enabled{true};
     int _max_instances{4};
     int _symmetry_code{0};
+
+    bool _temporal_tracking_enabled{false};
+    bool _track_active{false};
+    int _track_confirm_streak{0};
+    int _track_miss_streak{0};
+    bool _track_has_floor{false};
+    cv::Vec4d _track_floor_plane{0.0, -1.0, 0.0, 0.0};
+    ObjectPose _track_pose;
+    ObjectPose _track_prev_global;
 
     int _last_valid_depth_pts{0};
     bool _last_floor_locked{false};

@@ -3319,7 +3319,12 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
         }
 
         const bool useContinuousTemporal = (isLiveMode || isBagAutoStepping_) && !interactiveRoiRerun;
-        const bool usedAutoRoi = (roiHint.empty() && useContinuousTemporal && !multiMode &&
+        universalPoseEstimator_->setTemporalTrackingEnabled(useContinuousTemporal && !multiMode);
+        if (interactiveRoiRerun) {
+            universalPoseEstimator_->resetTemporalTrack();
+        }
+        const bool usedAutoRoi = (!universalPoseEstimator_->temporalTrackingEnabled() &&
+                                  roiHint.empty() && useContinuousTemporal && !multiMode &&
                                   hasLastAcceptedPose_ && !autoTrackRoi_.empty());
         const cv::Rect effectiveRoi = usedAutoRoi ? autoTrackRoi_ : roiHint;
 
