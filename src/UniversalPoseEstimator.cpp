@@ -91,7 +91,7 @@ struct RgbEdgeMaps {
     bool empty() const { return dt_vert.empty() || dt_horiz.empty(); }
 };
 
-RgbEdgeMaps buildRgbCannyDistanceTransform(const cv::Mat& rgb)
+RgbEdgeMaps buildRgbCannyDistanceTransform(const cv::Mat& rgb, const cv::Mat& fg_mask_2d = cv::Mat())
 {
     RgbEdgeMaps maps;
     if (rgb.empty()) return maps;
@@ -103,6 +103,11 @@ RgbEdgeMaps buildRgbCannyDistanceTransform(const cv::Mat& rgb)
     }
     cv::GaussianBlur(gray, gray, cv::Size(3, 3), 0.8);
     cv::Canny(gray, edges, 45, 130);
+    if (!fg_mask_2d.empty() && fg_mask_2d.size() == edges.size() && fg_mask_2d.type() == CV_8UC1) {
+        cv::Mat mask_dil;
+        cv::dilate(fg_mask_2d, mask_dil, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(13, 13)));
+        cv::bitwise_and(edges, mask_dil, edges);
+    }
     cv::Sobel(gray, gx, CV_32F, 1, 0, 3);
     cv::Sobel(gray, gy, CV_32F, 0, 1, 3);
 
@@ -1379,10 +1384,40 @@ bool UniversalPoseEstimator::loadModelOnnx(const std::string& onnx_path)
         _last_solve_latency_ms = 0.0;
         _last_total_latency_ms = 0.0;
         _last_segmented_points.clear();
+        _mask_matcher.clearTemplates();
         resetTemporalTrack();
 
         if (unpackBlackBoxOnnx()) {
             unpackBlackBoxOnnxMetadata();
+
+            // Auto-load Shared 2D Vision Backbones (FastSAM + DINOv2) & Per-CAD Multi-View Templates
+            {
+                std::filesystem::path onnx_p(onnx_path);
+                std::filesystem::path repo_root_cand = onnx_p.parent_path().parent_path();
+                std::vector<std::filesystem::path> shared_dirs = {
+                    onnx_p.parent_path() / "shared",
+                    repo_root_cand / "models" / "shared",
+                    std::filesystem::path("models") / "shared"
+                };
+                for (const auto& sd : shared_dirs) {
+                    const std::string fs_p = (sd / "fastsam_s.onnx").string();
+                    const std::string dn_p = (sd / "dinov2_vits14.onnx").string();
+                    if (fileExists(fs_p) && fileExists(dn_p)) {
+                        _mask_matcher.initBackbones(fs_p, dn_p);
+                        break;
+                    }
+                }
+                std::vector<std::string> tpl_cands = {
+                    (onnx_p.parent_path() / (_model_name + "_templates.bin")).string(),
+                    (repo_root_cand / "models" / (_model_name + "_templates.bin")).string(),
+                    "models/" + _model_name + "_templates.bin"
+                };
+                for (const auto& tp : tpl_cands) {
+                    if (fileExists(tp) && _mask_matcher.loadTemplates(tp)) {
+                        break;
+                    }
+                }
+            }
 
             // Auto-discover optional <CAD_NAME>_profile.json for adaptive solver hints
             std::filesystem::path onnx_p(onnx_path);
@@ -3424,7 +3459,19 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
     const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
     double sil_cost = 0.0;
     if (!_is_floor_standing && !rgb.empty()) {
-        const RgbEdgeMaps dt_canny = buildRgbCannyDistanceTransform(rgb);
+        cv::Mat proj_mask = cv::Mat::zeros(rgb.rows, rgb.cols, CV_8UC1);
+        const size_t m_step = std::max<size_t>(1, _mesh_pts.size() / 1200);
+        for (size_t i = 0; i < _mesh_pts.size(); i += m_step) {
+            const cv::Vec3d pc = cand.R * cv::Vec3d(_mesh_pts[i]) + cand.t;
+            if (pc[2] <= 0.10) continue;
+            const int u = static_cast<int>(std::round(fx * pc[0] / pc[2] + cx));
+            const int v = static_cast<int>(std::round(fy * pc[1] / pc[2] + cy));
+            if (u >= 0 && u < rgb.cols && v >= 0 && v < rgb.rows) {
+                proj_mask.at<uint8_t>(v, u) = 255;
+            }
+        }
+        cv::dilate(proj_mask, proj_mask, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(19, 19)));
+        const RgbEdgeMaps dt_canny = buildRgbCannyDistanceTransform(rgb, proj_mask);
         if (!dt_canny.empty()) {
             sil_cost = refineTranslationOnRgbSilhouette(
                 cand.R, cand.t, cand.R * cad_mid + cand.t, _cad_min, _cad_max,
@@ -3511,7 +3558,19 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
         }
     }
 
-    SegmentationResult seg_res = _scene_segmenter.segment(depth_z16, intr, roi_hint, _num_obs_points);
+    cv::Mat fg_mask_2d;
+    if (_mask_matcher.isReady() && !rgb.empty() && roi_hint.empty() && !_is_floor_standing) {
+        auto mask_cands = _mask_matcher.match(rgb, 2);
+        if (!mask_cands.empty() && mask_cands[0].score >= 0.45f) {
+            fg_mask_2d = mask_cands[0].mask_u8;
+        }
+    }
+
+    SegmentationResult seg_res = _scene_segmenter.segment(depth_z16, intr, roi_hint, _num_obs_points, fg_mask_2d);
+    if (!fg_mask_2d.empty() && !seg_res.valid) {
+        fg_mask_2d.release();
+        seg_res = _scene_segmenter.segment(depth_z16, intr, roi_hint, _num_obs_points);
+    }
     _last_valid_depth_pts = static_cast<int>(seg_res.dense_object_points.size());
     _last_floor_locked = (_is_floor_standing && seg_res.floor_detected);
     _last_floor_pitch_deg = seg_res.floor_pitch_deg;
@@ -3526,7 +3585,7 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
     }
 
     double ai_ms = 0.0;
-    const RgbEdgeMaps dt_canny = (!_is_floor_standing && !rgb.empty()) ? buildRgbCannyDistanceTransform(rgb) : RgbEdgeMaps{};
+    const RgbEdgeMaps dt_canny = (!_is_floor_standing && !rgb.empty()) ? buildRgbCannyDistanceTransform(rgb, fg_mask_2d) : RgbEdgeMaps{};
     const double sil_fx = (intr.fx > 100.0) ? intr.fx : 600.0;
     const double sil_fy = (intr.fy > 100.0) ? intr.fy : sil_fx;
     const double sil_cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * depth_z16.cols);

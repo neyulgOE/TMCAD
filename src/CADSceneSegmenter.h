@@ -46,13 +46,15 @@ public:
     SegmentationResult segment(const cv::Mat& depth_z16,
                                const CameraIntrinsics& intr,
                                const cv::Rect& roi_hint = cv::Rect(),
-                               size_t target_num_points = 1024) const;
+                               size_t target_num_points = 1024,
+                               const cv::Mat& fg_mask_2d = cv::Mat()) const;
 
 private:
     void extractDepthPoints(const cv::Mat& depth_z16,
                             const CameraIntrinsics& intr,
                             const cv::Rect& roi_hint,
-                            std::vector<cv::Vec3f>& out_pts) const;
+                            std::vector<cv::Vec3f>& out_pts,
+                            const cv::Mat& fg_mask_2d = cv::Mat()) const;
 
     bool fitSupportPlaneRANSAC(const std::vector<cv::Vec3f>& pts,
                                bool has_roi_hint,

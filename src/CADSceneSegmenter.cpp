@@ -435,12 +435,15 @@ void CADSceneSegmenter::setMultiInstanceMode(bool enable, int max_instances) {
 void CADSceneSegmenter::extractDepthPoints(const cv::Mat& depth_z16,
                                            const CameraIntrinsics& intr,
                                            const cv::Rect& roi_hint,
-                                           std::vector<cv::Vec3f>& out_pts) const {
+                                           std::vector<cv::Vec3f>& out_pts,
+                                           const cv::Mat& fg_mask_2d) const {
     out_pts.clear();
     if (depth_z16.empty() || depth_z16.type() != CV_16UC1) return;
 
     const int w = depth_z16.cols;
     const int h = depth_z16.rows;
+    const bool use_mask = (!fg_mask_2d.empty() && fg_mask_2d.cols == w &&
+                           fg_mask_2d.rows == h && fg_mask_2d.type() == CV_8UC1);
 
     // Auto-Intrinsics Fallback if caller passed uninitialized intrinsics
     const float fx = (intr.fx > 100.0) ? static_cast<float>(intr.fx)
@@ -474,7 +477,9 @@ void CADSceneSegmenter::extractDepthPoints(const cv::Mat& depth_z16,
         const uint16_t* row_ptr = depth_z16.ptr<uint16_t>(v);
         const uint16_t* row_up = (v >= 2) ? depth_z16.ptr<uint16_t>(v - 2) : row_ptr;
         const uint16_t* row_dn = (v + 2 < h) ? depth_z16.ptr<uint16_t>(v + 2) : row_ptr;
+        const uint8_t* mask_ptr = use_mask ? fg_mask_2d.ptr<uint8_t>(v) : nullptr;
         for (int u = x0; u < x1; u += stride) {
+            if (mask_ptr && mask_ptr[u] == 0) continue;
             uint16_t d_raw = row_ptr[u];
             if (d_raw == 0) continue;
 
@@ -1327,11 +1332,12 @@ std::vector<cv::Vec3f> CADSceneSegmenter::samplePointsCurvatureAware(const std::
 SegmentationResult CADSceneSegmenter::segment(const cv::Mat& depth_z16,
                                               const CameraIntrinsics& intr,
                                               const cv::Rect& roi_hint,
-                                              size_t target_num_points) const {
+                                              size_t target_num_points,
+                                              const cv::Mat& fg_mask_2d) const {
     SegmentationResult res;
     const bool has_roi = (roi_hint.width > 16 && roi_hint.height > 16);
     std::vector<cv::Vec3f> raw_pts;
-    extractDepthPoints(depth_z16, intr, roi_hint, raw_pts);
+    extractDepthPoints(depth_z16, intr, roi_hint, raw_pts, fg_mask_2d);
     res.raw_points_count = raw_pts.size();
     if (raw_pts.size() < 20) return res;
 

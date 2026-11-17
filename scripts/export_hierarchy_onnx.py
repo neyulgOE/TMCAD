@@ -694,6 +694,18 @@ def main():
     print(f"  -> Saved Named Black-Box ONNX:   {named_onnx_path} ({size_kb:.1f} KB)")
     print(f"  -> Saved in Global Models Store: {global_named_onnx} ({size_kb:.1f} KB)")
 
+    # 4a-bis. Auto-bake 168-view DINOv2 CAD templates alongside <cad_name>.onnx if shared backbone exists
+    dino_shared = os.path.join(project_root, "models", "shared", "dinov2_vits14.onnx")
+    if os.path.exists(dino_shared):
+        try:
+            import subprocess
+            tpl_out = os.path.join(project_root, "models", f"{args.cad_name}_templates.bin")
+            bake_script = os.path.join(project_root, "scripts", "bake_cad_multiview_templates.py")
+            subprocess.run([sys.executable, bake_script, "--cad-name", args.cad_name, "--out-bin", tpl_out,
+                            "--dino-onnx", dino_shared], check=True)
+        except Exception as e:
+            print(f"  [Warn] Multi-view template bake skipped: {e}")
+
     # 4b. Export NPU Static-Graph Backbone for RKNN if needed
     npu_net = RKNNStaticObservationEncoder(model.obs_encoder)
     npu_net.eval()

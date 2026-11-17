@@ -8,6 +8,7 @@
 #include <chrono>
 #include "RgbdFrame.h"
 #include "CADSceneSegmenter.h"
+#include "CADMaskMatcher.h"
 #include "CADTemplateDetector.h"
 
 namespace tmcad {
@@ -322,6 +323,7 @@ private:
     std::vector<cv::Matx33d> _symmetry_matrices;
 
     CADSceneSegmenter _scene_segmenter;
+    CADMaskMatcher _mask_matcher;
     CADTemplateDetector _template_detector;
 };
 

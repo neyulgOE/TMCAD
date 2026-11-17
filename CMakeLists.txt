@@ -35,6 +35,8 @@ list(JOIN ORT_LINK_DIRS ";" ORT_RPATH)
 add_library(tmcad_pose_core STATIC
     src/CADSceneSegmenter.h
     src/CADSceneSegmenter.cpp
+    src/CADMaskMatcher.h
+    src/CADMaskMatcher.cpp
     src/CADTemplateDetector.h
     src/CADTemplateDetector.cpp
     src/UniversalPoseEstimator.h

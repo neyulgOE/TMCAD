@@ -36,6 +36,7 @@ list(JOIN ORT_LINK_DIRS ";" ORT_RPATH)
 # Reuse Single-Source-of-Truth pose core from root src/
 add_library(tmcad_pose_core STATIC
     "${TMCAD_ROOT_DIR}/src/CADSceneSegmenter.cpp"
+    "${TMCAD_ROOT_DIR}/src/CADMaskMatcher.cpp"
     "${TMCAD_ROOT_DIR}/src/CADTemplateDetector.cpp"
     "${TMCAD_ROOT_DIR}/src/UniversalPoseEstimator.cpp"
 )
