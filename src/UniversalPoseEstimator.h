@@ -61,9 +61,9 @@ struct DetectionAcceptancePolicy {
                    (t[1] >= -0.95 && t[1] <= 0.65) &&
                    (t[2] >= 0.45 && t[2] <= 2.95);
         }
-        const double max_z = std::clamp(std::max(0.05, cad_diag) * 8.0, 1.80, 3.20);
-        return (std::abs(t[0]) <= 1.50) &&
-               (std::abs(t[1]) <= 1.20) &&
+        const double max_z = std::clamp(std::max(0.05, cad_diag) * 3.8 + 0.15, 0.95, 2.50);
+        return (std::abs(t[0]) <= 1.20) &&
+               (std::abs(t[1]) <= 1.00) &&
                (t[2] >= 0.15 && t[2] <= max_z);
     }
 
@@ -78,6 +78,7 @@ struct DetectionAcceptancePolicy {
             }
         }
         if (pose.confidence < 0.65f) return false;
+        if (pose.rmse_m <= 1e-5 || pose.inliers_count < 8) return false;
         const double max_rmse = std::clamp(0.072 * std::max(0.05, cad_diag), 0.012, 0.025);
         if (pose.rmse_m > max_rmse) return false;
         if (!is_floor_standing && !pose.rgb_sil_strong && pose.inlier_ratio < 0.50) return false;

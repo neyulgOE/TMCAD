@@ -718,10 +718,10 @@ bool CADSceneSegmenter::fitSupportPlaneRANSAC(const std::vector<cv::Vec3f>& pts,
         if (is_horizontal) {
             accept_peel = (inl_pts.size() >= min_dom_inliers) &&
                           (inl_qdiag > std::max(0.35f, 1.90f * _bounding_diag_m));
-        } else if (wide_full_scene) {
-            const size_t min_wall_inliers = std::max<size_t>(1800, pts.size() / 5);
+        } else if (!has_roi_hint) {
+            const size_t min_wall_inliers = std::max<size_t>(1600, pts.size() / 5);
             accept_peel = (inl_pts.size() >= min_wall_inliers) &&
-                          (inl_qdiag > std::max(0.55f, 2.80f * _bounding_diag_m));
+                          (inl_qdiag > std::max(0.45f, 2.20f * _bounding_diag_m));
         }
         if (!accept_peel) break;
 
@@ -796,17 +796,15 @@ void CADSceneSegmenter::clusterAndMergeTarget(const std::vector<cv::Vec3f>& fg_p
             if (e0 > 0.01f) {
                 float cad_dims[3] = { _expected_length_m, _expected_width_m, _expected_height_m };
                 std::sort(cad_dims, cad_dims + 3, std::greater<float>());
-                if (e2 < 0.010f || (cad_dims[2] > 0.02f && e2 < 0.22f * cad_dims[2])) {
-                    shape_factor *= 0.05; // Phạt mạnh cụm phẳng/mỏng (mặt bàn, màn hình, bàn phím)
+                // Chỉ phạt dải 1D mảnh do cắt mặt phẳng (không phạt bề mặt 2.5D nhìn từ 1 phía của vật thể)
+                if (e1 < 0.14f * cad_dims[2] || (e2 < 0.0025f && e1 < 0.28f * cad_dims[1])) {
+                    shape_factor *= 0.05;
                 }
                 if (cad_dims[0] > 0.02f && cad_dims[1] > 0.02f) {
                     const double err0 = std::abs(e0 - cad_dims[0]) / std::max(0.02f, cad_dims[0]);
                     const double err1 = std::abs(e1 - cad_dims[1]) / std::max(0.02f, cad_dims[1]);
-                    const double err2 = (cad_dims[2] > 0.02f)
-                                            ? (std::abs(e2 - cad_dims[2]) / std::max(0.02f, cad_dims[2]))
-                                            : 0.0;
-                    shape_factor *= 1.0 / (1.0 + 1.2 * err0 + 1.5 * err1 + 0.8 * err2);
-                    if (e1 > 1.55f * cad_dims[1] || e0 > 1.55f * cad_dims[0]) {
+                    shape_factor *= 1.0 / (1.0 + 0.8 * err0 + 0.8 * err1);
+                    if (e1 > 1.65f * cad_dims[1] || e0 > 1.65f * cad_dims[0]) {
                         shape_factor *= 0.25;
                     }
                 }

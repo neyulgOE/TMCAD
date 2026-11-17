@@ -313,8 +313,44 @@ double estimateLocalForegroundDepth(const cv::Mat& depth_z16,
     return (z_plane > 0.15) ? z_plane : fallback_z;
 }
 
+double computeProjectedZeroDepthFraction(const cv::Matx33d& R,
+                                         const cv::Vec3d& t,
+                                         const cv::Vec3d& cad_min,
+                                         const cv::Vec3d& cad_max,
+                                         const cv::Mat& depth_z16,
+                                         double fx, double fy, double cx, double cy)
+{
+    if (depth_z16.empty() || depth_z16.type() != CV_16UC1) return 0.0;
+    int u_min = 0, u_max = 0, v_top = 0, v_bot = 0;
+    if (!projectCadBounds2D(R, t, cad_min, cad_max, fx, fy, cx, cy, u_min, u_max, v_top, v_bot)) {
+        return 0.0;
+    }
+    const int w = depth_z16.cols;
+    const int h = depth_z16.rows;
+    const int bw = u_max - u_min;
+    const int bh = v_bot - v_top;
+    if (bw < 16 || bh < 16) return 0.0;
+
+    const int u0 = std::clamp(u_min + bw / 5, 0, w - 1);
+    const int u1 = std::clamp(u_max - bw / 5, 0, w - 1);
+    const int v0 = std::clamp(v_top + bh / 5, 0, h - 1);
+    const int v1 = std::clamp(v_bot - bh / 5, 0, h - 1);
+    int zero_cnt = 0, tot_cnt = 0;
+    const int step_v = std::max(1, (v1 - v0) / 14);
+    const int step_u = std::max(1, (u1 - u0) / 10);
+    for (int v = v0; v <= v1; v += step_v) {
+        const uint16_t* row = depth_z16.ptr<uint16_t>(v);
+        for (int u = u0; u <= u1; u += step_u) {
+            ++tot_cnt;
+            if (row[u] == 0) ++zero_cnt;
+        }
+    }
+    return (tot_cnt > 0) ? (static_cast<double>(zero_cnt) / tot_cnt) : 0.0;
+}
+
 double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
                                         cv::Vec3d& t,
+                                        const cv::Vec3d& cluster_centroid,
                                         const cv::Vec3d& cad_min,
                                         const cv::Vec3d& cad_max,
                                         const cv::Vec4d& floor_plane,
@@ -330,7 +366,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
 
     // Tạo thêm ứng viên R_up / R_up_flip (vật thể đứng thẳng trên mặt bàn dọc theo pháp tuyến sàn/bàn)
     // để khôi phục hướng đứng khi thân vật thể bị đen Depth chỉ còn điểm ở chân đế làm ICP bị đổ ngang.
-    cv::Vec3d up_cam(0.0, -0.96, 0.28);
+    cv::Vec3d up_cam(0.0, -1.0, 0.0);
     const cv::Vec3d fn(floor_plane[0], floor_plane[1], floor_plane[2]);
     if (has_floor && cv::norm(fn) > 1e-6) {
         up_cam = fn * (1.0 / cv::norm(fn));
@@ -352,7 +388,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
 
     cv::Matx33d R_up = cv::Matx33d::zeros();
     for (int r = 0; r < 3; ++r) {
-        R_up(r, long_ax) = -up_cam[r];
+        R_up(r, long_ax) = up_cam[r];
         R_up(r, ax1) = s1[r];
         R_up(r, ax2) = s2[r];
     }
@@ -366,7 +402,16 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
     }
 
     const std::vector<cv::Matx33d> R_cands = {R, R_up, R_up_flip};
-    const cv::Vec3d base_t = t;
+    const cv::Vec3d cad_mid = 0.5 * (cad_min + cad_max);
+    const double surf_z_off = 0.42 * std::min({span[0], span[1], span[2]});
+    const cv::Vec3d center_pose = R * cad_mid + t;
+    std::vector<cv::Vec3d> anchor_centers = {center_pose};
+    if (cluster_centroid[2] > 0.15) {
+        const cv::Vec3d c_shifted(cluster_centroid[0], cluster_centroid[1], cluster_centroid[2] + surf_z_off);
+        if (cv::norm(c_shifted - center_pose) > 0.015) {
+            anchor_centers.push_back(c_shifted);
+        }
+    }
     cv::Matx33d best_R = R;
     cv::Vec3d best_t = t;
 
@@ -376,28 +421,44 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
         if (!projectCadBounds2D(R_cand, t_probe, cad_min, cad_max, fx, fy, cx, cy, u_min, u_max, v_top, v_bot)) {
             return t_probe;
         }
-        double z_dyn = estimateLocalForegroundDepth(
-            depth_z16, u_min, u_max, v_top, v_bot, floor_plane, has_floor, fx, fy, cx, cy, z0, max_z);
+        const double z_fg = estimateLocalForegroundDepth(
+            depth_z16, u_min, u_max, v_top, v_bot, floor_plane, has_floor, fx, fy, cx, cy, z0 - surf_z_off, max_z);
+        double z_dyn = z_fg + surf_z_off;
+        // Không bao giờ đẩy cụm tiền cảnh (z0) lùi ra màn hình/tường phía sau (z_dyn > z0)
+        if (z_dyn > z0 + 0.020) {
+            z_dyn = z0;
+        }
         cv::Vec3d t_dyn(t_probe[0] * (z_dyn / z0), t_probe[1] * (z_dyn / z0), z_dyn);
-        if (std::abs(z_dyn - z0) > 0.04 &&
+        if (z0 - z_dyn > 0.04 &&
             projectCadBounds2D(R_cand, t_dyn, cad_min, cad_max, fx, fy, cx, cy, u_min, u_max, v_top, v_bot)) {
-            const double z_refined = estimateLocalForegroundDepth(
-                depth_z16, u_min, u_max, v_top, v_bot, floor_plane, has_floor, fx, fy, cx, cy, z_dyn, max_z);
+            const double z_fg2 = estimateLocalForegroundDepth(
+                depth_z16, u_min, u_max, v_top, v_bot, floor_plane, has_floor, fx, fy, cx, cy, z_dyn - surf_z_off, max_z);
+            double z_refined = z_fg2 + surf_z_off;
+            if (z_refined > z0 + 0.020) z_refined = z0;
             t_dyn = cv::Vec3d(t_probe[0] * (z_refined / z0), t_probe[1] * (z_refined / z0), z_refined);
         }
         return t_dyn;
     };
 
-    for (const auto& R_try : R_cands) {
-        for (double dy = -0.18; dy <= 0.061; dy += 0.03) {
-            for (double dx = -0.10; dx <= 0.101; dx += 0.025) {
-                const cv::Vec3d t_probe(base_t[0] + dx, base_t[1] + dy, base_t[2]);
-                const cv::Vec3d t_try = resolveDynamicCandidateT(R_try, t_probe);
-                const double c = computeRgbSilhouetteChamferCost(R_try, t_try, mesh_pts, edge_maps, fx, fy, cx, cy);
-                if (c < best_cost) {
-                    best_cost = c;
-                    best_R = R_try;
-                    best_t = t_try;
+    for (const auto& center_0 : anchor_centers) {
+        for (const auto& R_try : R_cands) {
+            const cv::Vec3d base_t = center_0 - R_try * cad_mid;
+            const bool is_flipped_down = (R_try(1, long_ax) > 0.35);
+            const double flip_pen = is_flipped_down ? 0.85 : 0.0;
+            for (double dy = -0.06; dy <= 0.031; dy += 0.015) {
+                for (double dx = -0.030; dx <= 0.031; dx += 0.015) {
+                    const cv::Vec3d t_probe(base_t[0] + dx, base_t[1] + dy, base_t[2]);
+                    const cv::Vec3d t_try = resolveDynamicCandidateT(R_try, t_probe);
+                    const double drift_x = (cluster_centroid[2] > 0.15)
+                        ? std::abs(t_try[0] - cluster_centroid[0])
+                        : std::abs(dx);
+                    const double reg = 12.0 * drift_x + 3.0 * std::max(0.0, dy) + flip_pen;
+                    const double c = computeRgbSilhouetteChamferCost(R_try, t_try, mesh_pts, edge_maps, fx, fy, cx, cy) + reg;
+                    if (c < best_cost) {
+                        best_cost = c;
+                        best_R = R_try;
+                        best_t = t_try;
+                    }
                 }
             }
         }
@@ -419,7 +480,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
 
     R = best_R;
     t = best_t;
-    return best_cost;
+    return computeRgbSilhouetteChamferCost(best_R, best_t, mesh_pts, edge_maps, fx, fy, cx, cy);
 }
 
 struct BidirectionalConsensus {
@@ -1535,9 +1596,9 @@ bool UniversalPoseEstimator::isInTargetWorkspace(const cv::Vec3d& t) const
                (t[2] >= 0.45 && t[2] <= 2.95);
     }
 
-    double max_z = std::clamp(_real_bounding_diag_m * 8.0, 1.80, 3.20);
-    return (std::abs(t[0]) <= 1.50) &&
-           (std::abs(t[1]) <= 1.20) &&
+    double max_z = std::clamp(_real_bounding_diag_m * 3.8 + 0.15, 0.95, 2.50);
+    return (std::abs(t[0]) <= 1.20) &&
+           (std::abs(t[1]) <= 1.00) &&
            (t[2] >= 0.15 && t[2] <= max_z);
 }
 
@@ -2782,8 +2843,10 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
             local_raw.emplace_back(p);
         }
     }
-    if (local_raw.size() < 36) {
-        return !strict_clutter_gate;
+    if (local_raw.size() < 8) {
+        pose.confidence = 0.05f;
+        pose.inliers_count = 0;
+        return false;
     }
 
     std::vector<cv::Vec3d> unclipped;
@@ -2808,7 +2871,22 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
         pose.inlier_ratio = cons.fwd_fit;
         pose.inliers_count = std::max(pose.inliers_count, static_cast<int>(std::round(cons.fwd_fit * local_raw.size())));
     } else if (strict_clutter_gate) {
+        pose.confidence = 0.05f;
         return false;
+    }
+
+    if (local_raw.size() < 36) {
+        double empty_behind_frac = 0.0, ring_jump_frac = 1.0, wide_out_frac = 1.0, wide_convex_ratio = 1.0;
+        int ring_tot = 0;
+        computeSilhouetteAndEmptyBehind(pose.R, pose.t, _mesh_pts, depth_z16,
+                                        fx, fy, cx, cy, diag,
+                                        empty_behind_frac, ring_jump_frac,
+                                        wide_out_frac, wide_convex_ratio, ring_tot);
+        if (empty_behind_frac > 0.20) {
+            pose.confidence = 0.05f;
+            return false;
+        }
+        return !strict_clutter_gate;
     }
 
     const bool is_cluttered = (full_fg_pts.size() > std::max<size_t>(400, local_raw.size() * 3 / 2));
@@ -2832,6 +2910,7 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
             }
         }
         if (tot_proj >= 20 && static_cast<double>(in_frame) < 0.90 * static_cast<double>(tot_proj)) {
+            pose.confidence = 0.05f;
             return false;
         }
     }
@@ -2845,8 +2924,8 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
         const cv::Vec3d vis_sig = computePcaSigmas(vis_pts);
         const cv::Vec3d obs_sig = computePcaSigmas(unclipped);
         if (vis_sig[2] >= 0.0040 && (obs_sig[2] < 0.28 * vis_sig[2] || obs_sig[1] < 0.40 * vis_sig[1])) {
-            if (strict_clutter_gate) return false;
             pose.confidence = std::max(0.05f, pose.confidence * 0.35f);
+            if (strict_clutter_gate) return false;
         }
     }
 
@@ -2864,8 +2943,8 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
     const int min_ring_tot = strict_clutter_gate ? 24 : 40;
     const double min_ring_jump = strict_clutter_gate ? 0.45 : 0.36;
     if (empty_behind_frac > 0.16 || (ring_tot >= min_ring_tot && ring_jump_frac < min_ring_jump) || concave_crease) {
-        if (strict_clutter_gate) return false;
         pose.confidence = std::max(0.05f, pose.confidence * 0.40f);
+        if (strict_clutter_gate) return false;
     }
 
     const double sil_adj = 0.08 * std::clamp((ring_jump_frac - 0.40) / 0.35, -0.5, 1.0)
@@ -2875,6 +2954,7 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
     if (strict_clutter_gate) {
         const double max_clutter_rmse = std::clamp(0.082 * diag, 0.012, 0.028);
         if (pose.rmse_m > max_clutter_rmse || pose.inlier_ratio < 0.48) {
+            pose.confidence = std::min(pose.confidence, 0.35f);
             return false;
         }
     }
@@ -2896,7 +2976,7 @@ std::vector<ObjectPose> UniversalPoseEstimator::proposeDepthHoleSeeds(
     const double fy = (intr.fy > 100.0) ? intr.fy : 608.128;
     const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * rgb.cols);
     const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * rgb.rows);
-    const double max_ws_z = std::clamp(_real_bounding_diag_m * 8.0, 1.80, 3.20);
+    const double max_ws_z = std::clamp(_real_bounding_diag_m * 3.8 + 0.15, 0.95, 2.50);
 
     const cv::Vec3d span = _cad_max - _cad_min;
     int long_ax = 2;
@@ -2917,7 +2997,8 @@ std::vector<ObjectPose> UniversalPoseEstimator::proposeDepthHoleSeeds(
     }
     if (search_rect.width < 32 || search_rect.height < 32) return seeds;
 
-    // 1. Zero-HSV: Tạo mặt nạ hố khuyết Depth (depth == 0) tách theo ranh giới biên Canny RGB
+    // 1. Zero-HSV: Tạo cả mặt nạ hố khuyết Depth nguyên vẹn lẫn mặt nạ tách theo biên Canny
+    // (để không bị gộp vào màn hình tối phía sau, và tự khôi phục chiều cao thật từ z_rim dưới đáy khi nhãn cắt đôi).
     cv::Mat gray, canny, edge_dil;
     if (rgb.channels() == 3) cv::cvtColor(rgb, gray, cv::COLOR_BGR2GRAY);
     else gray = rgb;
@@ -2925,24 +3006,33 @@ std::vector<ObjectPose> UniversalPoseEstimator::proposeDepthHoleSeeds(
     cv::Canny(gray, canny, 40, 120);
     cv::dilate(canny, edge_dil, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
 
-    cv::Mat hole_mask = cv::Mat::zeros(depth_z16.size(), CV_8UC1);
+    cv::Mat hole_raw = cv::Mat::zeros(depth_z16.size(), CV_8UC1);
+    cv::Mat hole_split = cv::Mat::zeros(depth_z16.size(), CV_8UC1);
     for (int v = search_rect.y; v < search_rect.br().y; ++v) {
         const uint16_t* d_row = depth_z16.ptr<uint16_t>(v);
         const uint8_t* e_row = edge_dil.ptr<uint8_t>(v);
-        uint8_t* h_row = hole_mask.ptr<uint8_t>(v);
+        uint8_t* r_row = hole_raw.ptr<uint8_t>(v);
+        uint8_t* s_row = hole_split.ptr<uint8_t>(v);
         for (int u = search_rect.x; u < search_rect.br().x; ++u) {
-            if (d_row[u] == 0 && e_row[u] == 0) {
-                h_row[u] = 255;
+            if (d_row[u] == 0) {
+                r_row[u] = 255;
+                if (e_row[u] == 0) s_row[u] = 255;
             }
         }
     }
-    cv::morphologyEx(hole_mask, hole_mask, cv::MORPH_OPEN,
+    cv::morphologyEx(hole_raw, hole_raw, cv::MORPH_OPEN,
+                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5)));
+    cv::morphologyEx(hole_raw, hole_raw, cv::MORPH_CLOSE,
+                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 19)));
+    cv::morphologyEx(hole_split, hole_split, cv::MORPH_OPEN,
                      cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
-    cv::morphologyEx(hole_mask, hole_mask, cv::MORPH_CLOSE,
-                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 9)));
+    cv::morphologyEx(hole_split, hole_split, cv::MORPH_CLOSE,
+                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 11)));
 
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(hole_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    std::vector<std::vector<cv::Point>> contours, contours_split;
+    cv::findContours(hole_raw, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    cv::findContours(hole_split, contours_split, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    contours.insert(contours.end(), contours_split.begin(), contours_split.end());
 
     struct ScoredSeed {
         double score{0.0};
@@ -3014,33 +3104,43 @@ std::vector<ObjectPose> UniversalPoseEstimator::proposeDepthHoleSeeds(
         const double z_pinhole = use_stand
             ? (fy * cad_long) / static_cast<double>(box.height)
             : (fx * cad_long) / static_cast<double>(box.width);
-        if (z_pinhole < 0.15 || z_pinhole > max_ws_z) continue;
 
-        // Quét viền nắp/đế trong toàn dải [0.15, max_ws_z] quanh ±30% z_pinhole (lấy phân vị thứ 20)
+        // Quét viền nắp/đế trong toàn dải tiền cảnh [0.15, max_ws_z] (không khóa theo z_pinhole bị cắt ngắn bởi nhãn)
         std::vector<double> rim_zs;
-        const int band_u0 = std::max(0, box.x - 4);
-        const int band_u1 = std::min(depth_z16.cols - 1, box.br().x + 4);
+        const int band_u0 = std::max(0, box.x - 6);
+        const int band_u1 = std::min(depth_z16.cols - 1, box.br().x + 6);
         const int bands[2][2] = {
-            {std::max(0, box.y - 8), std::min(depth_z16.rows - 1, box.y + box.height / 4)},
-            {std::max(0, box.y + 3 * box.height / 4), std::min(depth_z16.rows - 1, box.br().y + 12)}
+            {std::max(0, box.y - 12), std::min(depth_z16.rows - 1, box.y + box.height / 4)},
+            {std::max(0, box.y + 3 * box.height / 4), std::min(depth_z16.rows - 1, box.br().y + 18)}
         };
         for (int b = 0; b < 2; ++b) {
             for (int v = bands[b][0]; v <= bands[b][1]; v += 2) {
                 const uint16_t* d_row = depth_z16.ptr<uint16_t>(v);
                 for (int u = band_u0; u <= band_u1; u += 2) {
                     const double zm = static_cast<double>(d_row[u]) * 0.001;
-                    if (zm >= 0.15 && zm <= max_ws_z && std::abs(zm - z_pinhole) <= 0.30 * z_pinhole) {
+                    if (zm >= 0.15 && zm <= max_ws_z) {
                         rim_zs.push_back(zm);
                     }
                 }
             }
         }
         double z_seed = z_pinhole;
+        double v_c = box.y + 0.5 * box.height;
         if (rim_zs.size() >= 6) {
             std::sort(rim_zs.begin(), rim_zs.end());
             const double z_rim = rim_zs[rim_zs.size() / 5];
-            z_seed = 0.50 * z_pinhole + 0.50 * z_rim;
+            if (use_stand && z_rim < 0.72 * z_pinhole) {
+                // Mảnh hố bị nhãn cắt ngang: lấy z_rim tại chân đế và dựng lại chiều cao Pinhole đầy đủ từ đáy hộp
+                z_seed = z_rim;
+                const double full_h = (fy * cad_long) / std::max(0.15, z_seed);
+                v_c = static_cast<double>(box.br().y) - 0.5 * full_h;
+            } else if (std::abs(z_rim - z_pinhole) <= 0.30 * z_pinhole) {
+                z_seed = 0.50 * z_pinhole + 0.50 * z_rim;
+            } else {
+                z_seed = z_rim;
+            }
         }
+        if (z_seed < 0.15 || z_seed > max_ws_z) continue;
 
         cv::Vec3d axis_long = up_axis;
         if (!use_stand) {
@@ -3063,7 +3163,6 @@ std::vector<ObjectPose> UniversalPoseEstimator::proposeDepthHoleSeeds(
         }
 
         const double u_c = box.x + 0.5 * box.width;
-        const double v_c = box.y + 0.5 * box.height;
         const cv::Vec3d center_3d((u_c - cx) * z_seed / fx, (v_c - cy) * z_seed / fy, z_seed);
         const cv::Vec3d t_seed = center_3d - R_seed * cad_mid;
         if (!isInTargetWorkspace(t_seed)) continue;
@@ -3155,10 +3254,11 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
             if (!cand.valid) continue;
 
             double sil_cost = 0.0;
+            double z_hole_frac = 0.0;
             if (!dt_canny.empty()) {
-                const double max_ws_z = std::clamp(_real_bounding_diag_m * 8.0, 1.80, 3.20);
+                const double max_ws_z = std::clamp(_real_bounding_diag_m * 3.8 + 0.15, 0.95, 2.50);
                 sil_cost = refineTranslationOnRgbSilhouette(
-                    cand.R, cand.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
+                    cand.R, cand.t, cv::Vec3d(cl.centroid), _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
                     _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
                 cand.t_glass = cand.t;
                 const cv::Vec3d euler = rotationMatrixToEulerDeg(cand.R, false);
@@ -3167,19 +3267,31 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                 cand.yaw_deg = euler[2];
                 cand.bbox_2d = projectCadBoundingBox(cand.R, cand.t, intr, depth_z16.cols, depth_z16.rows, &cand.corners_2d);
                 if (!isInTargetWorkspace(cand.t)) continue;
+                z_hole_frac = computeProjectedZeroDepthFraction(
+                    cand.R, cand.t, _cad_min, _cad_max, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy);
             }
 
             ObjectPose strict_cand = cand;
-            const bool strong_rgb_sil = (!dt_canny.empty() && sil_cost <= 4.8);
-            if (rescorePoseUnclipped(strict_cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true) || strong_rgb_sil) {
-                if (strong_rgb_sil) {
+            const bool strong_rgb_sil = (!dt_canny.empty() && sil_cost <= 5.5 && z_hole_frac >= 0.35 &&
+                                         cand.inliers_count >= 12 && cand.rmse_m <= 0.016);
+            const bool acceptable_rgb_sil = (dt_canny.empty() || sil_cost <= 9.5);
+            const bool passed_unclipped = acceptable_rgb_sil &&
+                rescorePoseUnclipped(strict_cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true);
+            if (passed_unclipped || strong_rgb_sil) {
+                if (passed_unclipped && !dt_canny.empty() && sil_cost <= 6.2) {
+                    strict_cand.confidence = std::clamp(strict_cand.confidence + 0.12f, 0.05f, 0.99f);
+                } else if (!passed_unclipped && strong_rgb_sil) {
+                    strict_cand = cand;
                     strict_cand.rgb_sil_strong = true;
                     if (strict_cand.method == "pca_fallback_seed") {
                         strict_cand.method = "rgb_sil_refined";
                     }
-                    strict_cand.confidence = std::clamp(strict_cand.confidence + 0.25f, 0.05f, 0.99f);
+                    strict_cand.confidence = std::clamp(strict_cand.confidence + 0.18f, 0.05f, 0.99f);
                 }
-                double rank = static_cast<double>(strict_cand.confidence) - 2.0 * std::max(0.0, strict_cand.rmse_m - 0.015) - 0.04 * sil_cost;
+                double rank = static_cast<double>(strict_cand.confidence)
+                            - 2.0 * std::max(0.0, strict_cand.rmse_m - 0.015)
+                            - 0.04 * sil_cost
+                            - 0.22 * strict_cand.t[2];
                 if (rank > best_strict_rank) {
                     best_strict_rank = rank;
                     pose = std::move(strict_cand);
@@ -3220,12 +3332,59 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
     }
 
     if (!pose.valid && !_is_floor_standing && !dt_canny.empty()) {
-        const double max_ws_z = std::clamp(_real_bounding_diag_m * 8.0, 1.80, 3.20);
+        const double max_ws_z = std::clamp(_real_bounding_diag_m * 3.8 + 0.15, 0.95, 2.50);
         auto hole_seeds = proposeDepthHoleSeeds(rgb, depth_z16, intr, seg_res.floor_plane, seg_res.floor_detected, roi_hint);
         double best_hole_rank = -1e9;
         for (auto& seed : hole_seeds) {
+            // 1. Thử giải cụm 3D cục bộ (Nắp + Đế) trong khung ROI mở rộng quanh hố khuyết Depth
+            if (seed.bbox_2d.width > 12.0f && seed.bbox_2d.height > 12.0f) {
+                const int pad_x = std::max(24, static_cast<int>(std::round(0.30f * seed.bbox_2d.width)));
+                const int pad_y = std::max(28, static_cast<int>(std::round(0.28f * seed.bbox_2d.height)));
+                const int rx0 = std::max(0, static_cast<int>(std::floor(seed.bbox_2d.x)) - pad_x);
+                const int ry0 = std::max(0, static_cast<int>(std::floor(seed.bbox_2d.y)) - pad_y);
+                const int rx1 = std::min(depth_z16.cols, static_cast<int>(std::ceil(seed.bbox_2d.x + seed.bbox_2d.width)) + pad_x);
+                const int ry1 = std::min(depth_z16.rows, static_cast<int>(std::ceil(seed.bbox_2d.y + seed.bbox_2d.height)) + pad_y);
+                const cv::Rect hole_roi(rx0, ry0, std::max(1, rx1 - rx0), std::max(1, ry1 - ry0));
+
+                SegmentationResult hole_seg = _scene_segmenter.segment(depth_z16, intr, hole_roi, _num_obs_points);
+                if (hole_seg.valid && hole_seg.object_points.size() >= 20) {
+                    double c_ai = 0.0;
+                    ObjectPose roi_cand = estimateSingleCluster(
+                        hole_seg.object_points, hole_seg.dense_object_points,
+                        seg_res.floor_plane, false, seg_res.floor_pitch_deg,
+                        rgb, intr, depth_z16.cols, depth_z16.rows, &c_ai);
+                    ai_ms += c_ai;
+                    if (roi_cand.valid) {
+                        const double roi_sil = refineTranslationOnRgbSilhouette(
+                            roi_cand.R, roi_cand.t, seed.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
+                            _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
+                        if (isInTargetWorkspace(roi_cand.t) && roi_sil <= 6.2) {
+                            roi_cand.t_glass = roi_cand.t;
+                            const cv::Vec3d eu = rotationMatrixToEulerDeg(roi_cand.R, false);
+                            roi_cand.roll_deg = eu[0];
+                            roi_cand.pitch_deg = eu[1];
+                            roi_cand.yaw_deg = eu[2];
+                            roi_cand.bbox_2d = projectCadBoundingBox(roi_cand.R, roi_cand.t, intr, depth_z16.cols, depth_z16.rows, &roi_cand.corners_2d);
+                            rescorePoseUnclipped(roi_cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
+                            if (roi_sil <= 4.8) {
+                                roi_cand.rgb_sil_strong = true;
+                                roi_cand.confidence = std::clamp(roi_cand.confidence + 0.20f, 0.05f, 0.99f);
+                            }
+                            if (DetectionAcceptancePolicy::isAccepted(roi_cand, _real_bounding_diag_m, _is_floor_standing)) {
+                                const double rnk = static_cast<double>(roi_cand.confidence) - 0.04 * roi_sil;
+                                if (rnk > best_hole_rank) {
+                                    best_hole_rank = rnk;
+                                    pose = std::move(roi_cand);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Nhánh tinh chỉnh trực tiếp hạt giống Pinhole + Rim Depth
             const double sil_cost = refineTranslationOnRgbSilhouette(
-                seed.R, seed.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
+                seed.R, seed.t, seed.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
                 _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
             if (!isInTargetWorkspace(seed.t)) continue;
 
@@ -3350,10 +3509,11 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
             if (!inst_pose.valid) continue;
 
             double sil_cost = 0.0;
+            double z_hole_frac = 0.0;
             if (!dt_canny.empty()) {
-                const double max_ws_z = std::clamp(_real_bounding_diag_m * 8.0, 1.80, 3.20);
+                const double max_ws_z = std::clamp(_real_bounding_diag_m * 3.8 + 0.15, 0.95, 2.50);
                 sil_cost = refineTranslationOnRgbSilhouette(
-                    inst_pose.R, inst_pose.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
+                    inst_pose.R, inst_pose.t, cv::Vec3d(cl.centroid), _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
                     _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
                 inst_pose.t_glass = inst_pose.t;
                 const cv::Vec3d euler = rotationMatrixToEulerDeg(inst_pose.R, false);
@@ -3362,17 +3522,26 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
                 inst_pose.yaw_deg = euler[2];
                 inst_pose.bbox_2d = projectCadBoundingBox(inst_pose.R, inst_pose.t, intr, depth_z16.cols, depth_z16.rows, &inst_pose.corners_2d);
                 if (!isInTargetWorkspace(inst_pose.t)) continue;
+                z_hole_frac = computeProjectedZeroDepthFraction(
+                    inst_pose.R, inst_pose.t, _cad_min, _cad_max, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy);
             }
 
             ObjectPose strict_pose = inst_pose;
-            const bool strong_rgb_sil = (!dt_canny.empty() && sil_cost <= 4.8);
-            if (rescorePoseUnclipped(strict_pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true) || strong_rgb_sil) {
-                if (strong_rgb_sil) {
+            const bool strong_rgb_sil = (!dt_canny.empty() && sil_cost <= 5.5 && z_hole_frac >= 0.35 &&
+                                         inst_pose.inliers_count >= 12 && inst_pose.rmse_m <= 0.016);
+            const bool acceptable_rgb_sil = (dt_canny.empty() || sil_cost <= 9.5);
+            const bool passed_unclipped = acceptable_rgb_sil &&
+                rescorePoseUnclipped(strict_pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true);
+            if (passed_unclipped || strong_rgb_sil) {
+                if (passed_unclipped && !dt_canny.empty() && sil_cost <= 6.2) {
+                    strict_pose.confidence = std::clamp(strict_pose.confidence + 0.12f, 0.05f, 0.99f);
+                } else if (!passed_unclipped && strong_rgb_sil) {
+                    strict_pose = inst_pose;
                     strict_pose.rgb_sil_strong = true;
                     if (strict_pose.method == "pca_fallback_seed") {
                         strict_pose.method = "rgb_sil_refined";
                     }
-                    strict_pose.confidence = std::clamp(strict_pose.confidence + 0.25f, 0.05f, 0.99f);
+                    strict_pose.confidence = std::clamp(strict_pose.confidence + 0.18f, 0.05f, 0.99f);
                 }
                 if (DetectionAcceptancePolicy::isAccepted(strict_pose, _real_bounding_diag_m, _is_floor_standing)) {
                     results.push_back(std::move(strict_pose));
