@@ -3352,7 +3352,10 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
             if (!poses.empty() && hasLastAcceptedPose_ && temporalMissStreak_ < 3) {
                 const double jump_m = cv::norm(poses.front().t - lastAcceptedPose_.t);
                 const double max_jump_m = std::max(0.20, 1.5 * cadDiagM);
-                if (jump_m > max_jump_m) {
+                const cv::Vec3d z_cur(poses.front().R(0, 2), poses.front().R(1, 2), poses.front().R(2, 2));
+                const cv::Vec3d z_prv(lastAcceptedPose_.R(0, 2), lastAcceptedPose_.R(1, 2), lastAcceptedPose_.R(2, 2));
+                const double tilt_deg = std::acos(std::clamp(std::abs(z_cur.dot(z_prv)), 0.0, 1.0)) * 180.0 / 3.14159265358979323846;
+                if (jump_m > max_jump_m || tilt_deg > 35.0) {
                     poses.clear();
                 }
             }

@@ -452,7 +452,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
                     const double drift_x = (cluster_centroid[2] > 0.15)
                         ? std::abs(t_try[0] - cluster_centroid[0])
                         : std::abs(dx);
-                    const double reg = 12.0 * drift_x + 3.0 * std::max(0.0, dy) + flip_pen;
+                    const double reg = 3.0 * drift_x + 2.0 * std::max(0.0, dy) + flip_pen;
                     const double c = computeRgbSilhouetteChamferCost(R_try, t_try, mesh_pts, edge_maps, fx, fy, cx, cy) + reg;
                     if (c < best_cost) {
                         best_cost = c;
@@ -464,12 +464,34 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
         }
     }
 
-    // Tinh chỉnh mịn 8mm quanh vị trí và hướng tốt nhất
+    // Tinh chỉnh góc tự xoay (Yaw quanh trục dài long_ax) để khớp bề rộng thực trên biên RGB
+    best_cost = computeRgbSilhouetteChamferCost(best_R, best_t, mesh_pts, edge_maps, fx, fy, cx, cy);
+    {
+        const cv::Vec3d win_center = best_R * cad_mid + best_t;
+        const cv::Matx33d R_base = best_R;
+        for (int deg = -75; deg <= 90; deg += 15) {
+            if (deg == 0) continue;
+            const double rad = static_cast<double>(deg) * kPi / 180.0;
+            const double cs = std::cos(rad), sn = std::sin(rad);
+            cv::Matx33d R_local = cv::Matx33d::eye();
+            R_local(ax1, ax1) = cs;  R_local(ax1, ax2) = -sn;
+            R_local(ax2, ax1) = sn;  R_local(ax2, ax2) = cs;
+            const cv::Matx33d R_yaw = R_base * R_local;
+            const cv::Vec3d t_yaw = win_center - R_yaw * cad_mid;
+            const double c = computeRgbSilhouetteChamferCost(R_yaw, t_yaw, mesh_pts, edge_maps, fx, fy, cx, cy);
+            if (c < best_cost) {
+                best_cost = c;
+                best_R = R_yaw;
+                best_t = t_yaw;
+            }
+        }
+    }
+
+    // Tinh chỉnh mịn 2.5mm (dx, dy) và 5mm (dz) thuần theo biên RGB
     const cv::Vec3d mid_t = best_t;
-    for (double dy = -0.024; dy <= 0.025; dy += 0.008) {
-        for (double dx = -0.024; dx <= 0.025; dx += 0.008) {
-            const cv::Vec3d t_probe(mid_t[0] + dx, mid_t[1] + dy, mid_t[2]);
-            const cv::Vec3d t_try = resolveDynamicCandidateT(best_R, t_probe);
+    for (double dy = -0.015; dy <= 0.0151; dy += 0.0025) {
+        for (double dx = -0.015; dx <= 0.0151; dx += 0.0025) {
+            const cv::Vec3d t_try(mid_t[0] + dx, mid_t[1] + dy, mid_t[2]);
             const double c = computeRgbSilhouetteChamferCost(best_R, t_try, mesh_pts, edge_maps, fx, fy, cx, cy);
             if (c < best_cost) {
                 best_cost = c;
@@ -477,10 +499,20 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
             }
         }
     }
+    const cv::Vec3d fine_t = best_t;
+    for (double dz = -0.015; dz <= 0.0151; dz += 0.005) {
+        if (std::abs(dz) < 1e-4) continue;
+        const cv::Vec3d t_try(fine_t[0], fine_t[1], fine_t[2] + dz);
+        const double c = computeRgbSilhouetteChamferCost(best_R, t_try, mesh_pts, edge_maps, fx, fy, cx, cy);
+        if (c < best_cost) {
+            best_cost = c;
+            best_t = t_try;
+        }
+    }
 
     R = best_R;
     t = best_t;
-    return computeRgbSilhouetteChamferCost(best_R, best_t, mesh_pts, edge_maps, fx, fy, cx, cy);
+    return best_cost;
 }
 
 struct BidirectionalConsensus {
