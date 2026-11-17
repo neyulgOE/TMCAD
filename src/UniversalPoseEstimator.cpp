@@ -334,8 +334,8 @@ double estimateLocalForegroundDepth(const cv::Mat& depth_z16,
         const int h = depth_z16.rows;
         const int u0 = std::clamp(u_min - 6, 0, w - 1);
         const int u1 = std::clamp(u_max + 6, 0, w - 1);
-        const int v0 = std::clamp(v_top - 6, 0, h - 1);
-        const int v1 = std::clamp(v_bot + 12, 0, h - 1);
+        const int v0 = std::clamp(v_top - 4, 0, h - 1);
+        const int v1 = std::clamp(v_bot + 2, 0, h - 1);
 
         const int step_v = std::max(1, (v1 - v0) / 16);
         const int step_u = std::max(1, (u1 - u0) / 12);
@@ -370,9 +370,8 @@ double estimateLocalForegroundDepth(const cv::Mat& depth_z16,
 
     if (!valid_zs.empty()) {
         std::sort(valid_zs.begin(), valid_zs.end());
-        // Lấy phân vị thứ 20 (20th percentile) của các điểm trong vùng vật thể:
-        // Tự động lấy đúng độ sâu bề mặt tiền cảnh (nắp/đế vật thể), loại bỏ bức tường xa phía sau.
-        const double z_fg = valid_zs[valid_zs.size() / 5];
+        // Lấy phân vị thứ 30 của các điểm trong vùng vật thể để tránh vài pixel tay/bàn phía trước kéo Z tụt về gần.
+        const double z_fg = valid_zs[(valid_zs.size() * 3) / 10];
         if (z_plane > 0.15 && std::abs(z_fg - z_plane) <= 0.12) {
             return 0.65 * z_fg + 0.35 * z_plane;
         }
@@ -484,8 +483,9 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
         ? std::vector<cv::Matx33d>{R}
         : std::vector<cv::Matx33d>{R, R_up, R_up_flip};
     const double surf_z_off = 0.42 * std::min({span[0], span[1], span[2]});
+    const double diag_obj = std::max(0.05, cv::norm(span));
     std::vector<cv::Vec3d> anchor_centers = {center_pose};
-    if (cluster_centroid[2] > 0.15) {
+    if (!is_tracking_warm_start && cluster_centroid[2] > 0.15) {
         const cv::Vec3d c_shifted(cluster_centroid[0], cluster_centroid[1], cluster_centroid[2] + surf_z_off);
         if (cv::norm(c_shifted - center_pose) > 0.015) {
             anchor_centers.push_back(c_shifted);
@@ -503,17 +503,15 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
         const double z_fg = estimateLocalForegroundDepth(
             depth_z16, u_min, u_max, v_top, v_bot, floor_plane, has_floor, fx, fy, cx, cy, z0 - surf_z_off, max_z);
         double z_dyn = z_fg + surf_z_off;
-        // Không bao giờ đẩy cụm tiền cảnh (z0) lùi ra màn hình/tường phía sau (z_dyn > z0)
-        if (z_dyn > z0 + 0.020) {
-            z_dyn = z0;
-        }
+        // Không đẩy cụm tiền cảnh lùi ra sau quá 2cm, và không kéo tụt về trước quá 15% diag (tránh tay/vật cản trước mặt)
+        const double max_fwd_pull = std::clamp(0.15 * diag_obj, 0.025, 0.060);
+        z_dyn = std::clamp(z_dyn, z0 - max_fwd_pull, z0 + 0.020);
         cv::Vec3d t_dyn(t_probe[0] * (z_dyn / z0), t_probe[1] * (z_dyn / z0), z_dyn);
         if (z0 - z_dyn > 0.04 &&
             projectCadBounds2D(R_cand, t_dyn, cad_min, cad_max, fx, fy, cx, cy, u_min, u_max, v_top, v_bot)) {
             const double z_fg2 = estimateLocalForegroundDepth(
                 depth_z16, u_min, u_max, v_top, v_bot, floor_plane, has_floor, fx, fy, cx, cy, z_dyn - surf_z_off, max_z);
-            double z_refined = z_fg2 + surf_z_off;
-            if (z_refined > z0 + 0.020) z_refined = z0;
+            double z_refined = std::clamp(z_fg2 + surf_z_off, z0 - max_fwd_pull, z0 + 0.020);
             t_dyn = cv::Vec3d(t_probe[0] * (z_refined / z0), t_probe[1] * (z_refined / z0), z_refined);
         }
         return t_dyn;
@@ -524,14 +522,20 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
             const cv::Vec3d base_t = center_0 - R_try * cad_mid;
             const bool is_flipped_down = (R_try(1, long_ax) > 0.35);
             const double flip_pen = is_flipped_down ? 0.85 : 0.0;
-            for (double dy = -0.06; dy <= 0.031; dy += 0.015) {
-                for (double dx = -0.030; dx <= 0.031; dx += 0.015) {
+            const double dy_min = is_tracking_warm_start ? -0.024 : -0.060;
+            const double dy_max = is_tracking_warm_start ? 0.025 : 0.031;
+            const double dx_lim = is_tracking_warm_start ? 0.024 : 0.030;
+            const double d_step = is_tracking_warm_start ? 0.008 : 0.015;
+            for (double dy = dy_min; dy <= dy_max; dy += d_step) {
+                for (double dx = -dx_lim; dx <= dx_lim + 1e-4; dx += d_step) {
                     const cv::Vec3d t_probe(base_t[0] + dx, base_t[1] + dy, base_t[2]);
-                    const cv::Vec3d t_try = resolveDynamicCandidateT(R_try, t_probe);
-                    const double drift_x = (cluster_centroid[2] > 0.15)
+                    const cv::Vec3d t_try = is_tracking_warm_start ? t_probe : resolveDynamicCandidateT(R_try, t_probe);
+                    const double drift_x = (!is_tracking_warm_start && cluster_centroid[2] > 0.15)
                         ? std::abs(t_try[0] - cluster_centroid[0])
                         : std::abs(dx);
-                    const double reg = 3.0 * drift_x + 2.0 * std::max(0.0, dy) + flip_pen;
+                    const double reg = is_tracking_warm_start
+                        ? (2.0 * (std::abs(dx) + std::abs(dy)))
+                        : (3.0 * drift_x + 2.0 * std::max(0.0, dy) + flip_pen);
                     const double c = computeRgbSilhouetteChamferCost(R_try, t_try, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy) + reg;
                     if (c < best_cost) {
                         best_cost = c;
@@ -543,14 +547,16 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
         }
     }
 
-    // Tinh chỉnh góc tự xoay (Yaw quanh trục dài long_ax) trong [-30..+30] bước 5 độ
-    // để khớp mặt rộng với tia nhìn thực mà không bị chữ trên nhãn kéo xoay chéo 45 độ
+    // Tinh chỉnh góc tự xoay (Yaw quanh trục dài long_ax)
     best_cost = computeRgbSilhouetteChamferCost(best_R, best_t, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
     {
         const cv::Vec3d win_center = best_R * cad_mid + best_t;
         const cv::Matx33d R_base = best_R;
         double best_yaw_obj = best_cost;
-        for (int deg = -30; deg <= 30; deg += 5) {
+        const int yaw_lim = is_tracking_warm_start ? 8 : 30;
+        const int yaw_step = is_tracking_warm_start ? 2 : 5;
+        const double yaw_reg = is_tracking_warm_start ? 0.085 : 0.015;
+        for (int deg = -yaw_lim; deg <= yaw_lim; deg += yaw_step) {
             if (deg == 0) continue;
             const double rad = static_cast<double>(deg) * kPi / 180.0;
             const double cs = std::cos(rad), sn = std::sin(rad);
@@ -560,7 +566,6 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
             const cv::Matx33d R_yaw = R_base * R_local;
             const cv::Vec3d t_yaw = win_center - R_yaw * cad_mid;
             const double c_raw = computeRgbSilhouetteChamferCost(R_yaw, t_yaw, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
-            const double yaw_reg = is_tracking_warm_start ? 0.035 : 0.015;
             const double c_obj = c_raw + yaw_reg * std::abs(deg);
             if (c_obj < best_yaw_obj) {
                 best_yaw_obj = c_obj;
@@ -3445,13 +3450,15 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
 
     // Chặng C: Hậu kiểm độc lập
     const bool strict_ok = rescorePoseUnclipped(cand, local_fg, depth_z16, intr, w, h, true);
-    if (!strict_ok && !_is_floor_standing && sil_cost <= 6.2) {
+    if (!strict_ok && !_is_floor_standing && sil_cost <= 8.0) {
         const double z_hole = computeProjectedZeroDepthFraction(
             cand.R, cand.t, _cad_min, _cad_max, depth_z16, fx, fy, cx, cy);
-        if (z_hole >= 0.25) {
+        if (z_hole >= 0.25 || cand.inliers_count >= 25) {
             rescorePoseUnclipped(cand, local_fg, depth_z16, intr, w, h, false);
-            cand.rgb_sil_strong = true;
-            cand.confidence = std::clamp(cand.confidence + 0.18f, 0.05f, 0.99f);
+            if (sil_cost <= 6.2 && z_hole >= 0.25) {
+                cand.rgb_sil_strong = true;
+                cand.confidence = std::clamp(cand.confidence + 0.18f, 0.05f, 0.99f);
+            }
         }
     }
     if (!DetectionAcceptancePolicy::isAccepted(cand, _real_bounding_diag_m, _is_floor_standing)) {
@@ -3482,10 +3489,12 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
     if (!_initialized || depth_z16.empty()) return pose;
 
     // Fast-path Warm-Start Tracking khi đã khóa 2 frame liên tiếp và không bật ROI thủ công
+    bool has_tracked_fallback = false;
+    ObjectPose tracked_fallback;
     if (_temporal_tracking_enabled && !_multi_instance_enabled && roi_hint.empty() && _track_active) {
         ObjectPose tracked;
         if (trackFromWarmStart(rgb, depth_z16, intr, tracked)) {
-            if (tracked.confidence >= 0.72f) {
+            if (tracked.confidence >= 0.62f) {
                 _track_pose = tracked;
                 _track_miss_streak = 0;
                 auto t_end = std::chrono::steady_clock::now();
@@ -3494,7 +3503,9 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                 _last_solve_latency_ms = _last_total_latency_ms;
                 return tracked;
             }
-            // Adaptive Re-check: chỉ chạy Global nếu chất lượng track bắt đầu suy giảm (< 0.80)
+            // Adaptive Re-check: chỉ chạy Global nếu chất lượng track suy giảm (< 0.62)
+            has_tracked_fallback = true;
+            tracked_fallback = tracked;
             pose = std::move(tracked);
         }
     }
@@ -3698,6 +3709,84 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
             if (rank > best_hole_rank) {
                 best_hole_rank = rank;
                 pose = std::move(seed);
+            }
+        }
+    }
+
+    // Chống nhảy cụm sai & lật góc đối xứng khi Global Detection chạy lại trong lúc đang track
+    if (_temporal_tracking_enabled && !_multi_instance_enabled && roi_hint.empty() &&
+        pose.valid && _track_pose.valid && _track_active) {
+        const double g_jump = cv::norm(pose.t - _track_pose.t);
+        if (g_jump > std::max(0.10, 0.45 * _real_bounding_diag_m)) {
+            pose = has_tracked_fallback ? std::move(tracked_fallback) : ObjectPose{};
+        }
+    }
+    if (_temporal_tracking_enabled && !_multi_instance_enabled && roi_hint.empty() &&
+        pose.valid && _track_pose.valid && !_is_floor_standing) {
+        const cv::Vec3d span = _cad_max - _cad_min;
+        int long_ax = 2;
+        if (span[0] >= span[1] && span[0] >= span[2]) long_ax = 0;
+        else if (span[1] >= span[0] && span[1] >= span[2]) long_ax = 1;
+        const int ax1 = (long_ax + 1) % 3;
+        const int ax2 = (long_ax + 2) % 3;
+        const cv::Vec3d z_cur(pose.R(0, long_ax), pose.R(1, long_ax), pose.R(2, long_ax));
+        const cv::Vec3d z_prv(_track_pose.R(0, long_ax), _track_pose.R(1, long_ax), _track_pose.R(2, long_ax));
+        const cv::Vec3d x_cur(pose.R(0, ax1), pose.R(1, ax1), pose.R(2, ax1));
+        const cv::Vec3d x_prv(_track_pose.R(0, ax1), _track_pose.R(1, ax1), _track_pose.R(2, ax1));
+        if (z_cur.dot(z_prv) > 0.70 && x_cur.dot(x_prv) < -0.50) {
+            const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
+            const cv::Vec3d win_c = pose.R * cad_mid + pose.t;
+            cv::Matx33d R_flip = pose.R;
+            for (int r = 0; r < 3; ++r) {
+                R_flip(r, ax1) = -pose.R(r, ax1);
+                R_flip(r, ax2) = -pose.R(r, ax2);
+            }
+            ObjectPose unflipped = pose;
+            unflipped.R = R_flip;
+            unflipped.t = win_c - R_flip * cad_mid;
+            unflipped.t_glass = unflipped.t;
+            if (rescorePoseUnclipped(unflipped, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false) &&
+                DetectionAcceptancePolicy::isAccepted(unflipped, _real_bounding_diag_m, _is_floor_standing) &&
+                unflipped.confidence >= pose.confidence - 0.06f) {
+                const cv::Vec3d eu = rotationMatrixToEulerDeg(unflipped.R, false);
+                unflipped.roll_deg = eu[0];
+                unflipped.pitch_deg = eu[1];
+                unflipped.yaw_deg = eu[2];
+                unflipped.bbox_2d = projectCadBoundingBox(unflipped.R, unflipped.t, intr, depth_z16.cols, depth_z16.rows, &unflipped.corners_2d);
+                pose = std::move(unflipped);
+            } else {
+                ObjectPose cont = pose;
+                cont.R = _track_pose.R;
+                cont.t = win_c - cont.R * cad_mid;
+                cont.t_glass = cont.t;
+                if (rescorePoseUnclipped(cont, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false) &&
+                    DetectionAcceptancePolicy::isAccepted(cont, _real_bounding_diag_m, _is_floor_standing) &&
+                    cont.confidence >= pose.confidence - 0.12f) {
+                    const cv::Vec3d eu = rotationMatrixToEulerDeg(cont.R, false);
+                    cont.roll_deg = eu[0];
+                    cont.pitch_deg = eu[1];
+                    cont.yaw_deg = eu[2];
+                    cont.bbox_2d = projectCadBoundingBox(cont.R, cont.t, intr, depth_z16.cols, depth_z16.rows, &cont.corners_2d);
+                    pose = std::move(cont);
+                }
+            }
+        } else if (z_cur.dot(z_prv) > 0.85 && x_cur.dot(x_prv) < 0.94) {
+            // Nếu Global Re-check bị nhiễu xoay Yaw > 20 độ quanh trục dài, kiểm tra lại hướng _track_pose.R
+            const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
+            const cv::Vec3d win_c = pose.R * cad_mid + pose.t;
+            ObjectPose cont = pose;
+            cont.R = _track_pose.R;
+            cont.t = win_c - cont.R * cad_mid;
+            cont.t_glass = cont.t;
+            if (rescorePoseUnclipped(cont, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false) &&
+                DetectionAcceptancePolicy::isAccepted(cont, _real_bounding_diag_m, _is_floor_standing) &&
+                cont.confidence >= pose.confidence - 0.12f) {
+                const cv::Vec3d eu = rotationMatrixToEulerDeg(cont.R, false);
+                cont.roll_deg = eu[0];
+                cont.pitch_deg = eu[1];
+                cont.yaw_deg = eu[2];
+                cont.bbox_2d = projectCadBoundingBox(cont.R, cont.t, intr, depth_z16.cols, depth_z16.rows, &cont.corners_2d);
+                pose = std::move(cont);
             }
         }
     }
