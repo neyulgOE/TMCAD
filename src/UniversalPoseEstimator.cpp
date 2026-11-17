@@ -126,9 +126,11 @@ RgbEdgeMaps buildRgbCannyDistanceTransform(const cv::Mat& rgb)
 double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
                                        const cv::Vec3d& t,
                                        const std::vector<cv::Vec3f>& mesh_pts,
+                                       const std::vector<cv::Vec3f>& mesh_normals,
                                        const RgbEdgeMaps& edge_maps,
                                        double fx, double fy, double cx, double cy)
 {
+    (void)mesh_normals;
     if (mesh_pts.empty() || edge_maps.empty()) return 50.0;
 
     const int w = edge_maps.dt_vert.cols;
@@ -180,6 +182,8 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
         if (row_v[b] < 0) continue;
         if (first_b < 0) first_b = b;
         last_b = b;
+        // Bỏ qua 15% đáy dưới cùng (b >= kBins - 3) để giảm nhiễu từ ngón tay/chân kẹp trên bàn
+        if (b >= kBins - 3) continue;
         const int v = row_v[b];
         const int u_l = row_min_u[b];
         const int u_r = row_max_u[b];
@@ -204,7 +208,6 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
     const double mean_vert = 0.5 * (mean_left + mean_right);
     const double bilat_max = std::max(mean_left, mean_right);
     const double mean_horiz = (cnt_horiz > 0) ? (sum_horiz / cnt_horiz) : mean_vert;
-    // Bắt buộc khớp đối xứng cả 2 sườn trái/phải (ngăn đường kẻ dọc đơn lẻ trên cột tường kéo điểm xuống)
     return 0.45 * bilat_max + 0.33 * mean_vert + 0.22 * mean_horiz;
 }
 
@@ -356,12 +359,13 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
                                         const cv::Vec4d& floor_plane,
                                         bool has_floor,
                                         const std::vector<cv::Vec3f>& mesh_pts,
+                                        const std::vector<cv::Vec3f>& mesh_normals,
                                         const RgbEdgeMaps& edge_maps,
                                         const cv::Mat& depth_z16,
                                         double fx, double fy, double cx, double cy,
                                         double max_z)
 {
-    double best_cost = computeRgbSilhouetteChamferCost(R, t, mesh_pts, edge_maps, fx, fy, cx, cy);
+    double best_cost = computeRgbSilhouetteChamferCost(R, t, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
     if (edge_maps.empty() || mesh_pts.empty()) return best_cost;
 
     // Tạo thêm ứng viên R_up / R_up_flip (vật thể đứng thẳng trên mặt bàn dọc theo pháp tuyến sàn/bàn)
@@ -379,9 +383,17 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
     else if (span[1] >= span[0] && span[1] >= span[2]) long_ax = 1;
     const int ax1 = (long_ax + 1) % 3;
     const int ax2 = (long_ax + 2) % 3;
+    const int ax_wide = (span[ax1] >= span[ax2]) ? ax1 : ax2;
+    const int ax_thin = (ax_wide == ax1) ? ax2 : ax1;
 
-    const cv::Vec3d ref_x(1.0, 0.0, 0.0);
-    cv::Vec3d s1 = ref_x - up_cam * up_cam.dot(ref_x);
+    const cv::Vec3d cad_mid = 0.5 * (cad_min + cad_max);
+    const cv::Vec3d center_pose = R * cad_mid + t;
+    const cv::Vec3d view_ray = (center_pose[2] > 0.10)
+        ? (center_pose * (1.0 / std::max(1e-6, cv::norm(center_pose))))
+        : cv::Vec3d(0.0, 0.0, 1.0);
+    cv::Vec3d s1 = view_ray.cross(up_cam);
+    if (cv::norm(s1) < 1e-4) s1 = cv::Vec3d(1.0, 0.0, 0.0);
+    if (s1[0] < 0.0) s1 = -s1;
     s1 *= (1.0 / std::max(1e-9, cv::norm(s1)));
     cv::Vec3d s2 = up_cam.cross(s1);
     s2 *= (1.0 / std::max(1e-9, cv::norm(s2)));
@@ -389,22 +401,20 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
     cv::Matx33d R_up = cv::Matx33d::zeros();
     for (int r = 0; r < 3; ++r) {
         R_up(r, long_ax) = up_cam[r];
-        R_up(r, ax1) = s1[r];
-        R_up(r, ax2) = s2[r];
+        R_up(r, ax_wide) = s1[r];
+        R_up(r, ax_thin) = s2[r];
     }
     if (cv::determinant(R_up) < 0.0) {
-        for (int r = 0; r < 3; ++r) R_up(r, ax2) = -R_up(r, ax2);
+        for (int r = 0; r < 3; ++r) R_up(r, ax_thin) = -R_up(r, ax_thin);
     }
     cv::Matx33d R_up_flip = R_up;
     for (int r = 0; r < 3; ++r) {
         R_up_flip(r, long_ax) = -R_up(r, long_ax);
-        R_up_flip(r, ax1) = -R_up(r, ax1);
+        R_up_flip(r, ax_wide) = -R_up(r, ax_wide);
     }
 
     const std::vector<cv::Matx33d> R_cands = {R, R_up, R_up_flip};
-    const cv::Vec3d cad_mid = 0.5 * (cad_min + cad_max);
     const double surf_z_off = 0.42 * std::min({span[0], span[1], span[2]});
-    const cv::Vec3d center_pose = R * cad_mid + t;
     std::vector<cv::Vec3d> anchor_centers = {center_pose};
     if (cluster_centroid[2] > 0.15) {
         const cv::Vec3d c_shifted(cluster_centroid[0], cluster_centroid[1], cluster_centroid[2] + surf_z_off);
@@ -453,7 +463,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
                         ? std::abs(t_try[0] - cluster_centroid[0])
                         : std::abs(dx);
                     const double reg = 3.0 * drift_x + 2.0 * std::max(0.0, dy) + flip_pen;
-                    const double c = computeRgbSilhouetteChamferCost(R_try, t_try, mesh_pts, edge_maps, fx, fy, cx, cy) + reg;
+                    const double c = computeRgbSilhouetteChamferCost(R_try, t_try, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy) + reg;
                     if (c < best_cost) {
                         best_cost = c;
                         best_R = R_try;
@@ -464,12 +474,14 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
         }
     }
 
-    // Tinh chỉnh góc tự xoay (Yaw quanh trục dài long_ax) để khớp bề rộng thực trên biên RGB
-    best_cost = computeRgbSilhouetteChamferCost(best_R, best_t, mesh_pts, edge_maps, fx, fy, cx, cy);
+    // Tinh chỉnh góc tự xoay (Yaw quanh trục dài long_ax) trong [-30..+30] bước 5 độ
+    // để khớp mặt rộng với tia nhìn thực mà không bị chữ trên nhãn kéo xoay chéo 45 độ
+    best_cost = computeRgbSilhouetteChamferCost(best_R, best_t, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
     {
         const cv::Vec3d win_center = best_R * cad_mid + best_t;
         const cv::Matx33d R_base = best_R;
-        for (int deg = -75; deg <= 90; deg += 15) {
+        double best_yaw_obj = best_cost;
+        for (int deg = -30; deg <= 30; deg += 5) {
             if (deg == 0) continue;
             const double rad = static_cast<double>(deg) * kPi / 180.0;
             const double cs = std::cos(rad), sn = std::sin(rad);
@@ -478,9 +490,11 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
             R_local(ax2, ax1) = sn;  R_local(ax2, ax2) = cs;
             const cv::Matx33d R_yaw = R_base * R_local;
             const cv::Vec3d t_yaw = win_center - R_yaw * cad_mid;
-            const double c = computeRgbSilhouetteChamferCost(R_yaw, t_yaw, mesh_pts, edge_maps, fx, fy, cx, cy);
-            if (c < best_cost) {
-                best_cost = c;
+            const double c_raw = computeRgbSilhouetteChamferCost(R_yaw, t_yaw, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
+            const double c_obj = c_raw + 0.015 * std::abs(deg);
+            if (c_obj < best_yaw_obj) {
+                best_yaw_obj = c_obj;
+                best_cost = c_raw;
                 best_R = R_yaw;
                 best_t = t_yaw;
             }
@@ -492,7 +506,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
     for (double dy = -0.015; dy <= 0.0151; dy += 0.0025) {
         for (double dx = -0.015; dx <= 0.0151; dx += 0.0025) {
             const cv::Vec3d t_try(mid_t[0] + dx, mid_t[1] + dy, mid_t[2]);
-            const double c = computeRgbSilhouetteChamferCost(best_R, t_try, mesh_pts, edge_maps, fx, fy, cx, cy);
+            const double c = computeRgbSilhouetteChamferCost(best_R, t_try, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
             if (c < best_cost) {
                 best_cost = c;
                 best_t = t_try;
@@ -503,7 +517,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
     for (double dz = -0.015; dz <= 0.0151; dz += 0.005) {
         if (std::abs(dz) < 1e-4) continue;
         const cv::Vec3d t_try(fine_t[0], fine_t[1], fine_t[2] + dz);
-        const double c = computeRgbSilhouetteChamferCost(best_R, t_try, mesh_pts, edge_maps, fx, fy, cx, cy);
+        const double c = computeRgbSilhouetteChamferCost(best_R, t_try, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
         if (c < best_cost) {
             best_cost = c;
             best_t = t_try;
@@ -3291,7 +3305,7 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                 const double max_ws_z = std::clamp(_real_bounding_diag_m * 3.8 + 0.15, 0.95, 2.50);
                 sil_cost = refineTranslationOnRgbSilhouette(
                     cand.R, cand.t, cv::Vec3d(cl.centroid), _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
-                    _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
+                    _mesh_pts, _mesh_normals, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
                 cand.t_glass = cand.t;
                 const cv::Vec3d euler = rotationMatrixToEulerDeg(cand.R, false);
                 cand.roll_deg = euler[0];
@@ -3389,7 +3403,7 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                     if (roi_cand.valid) {
                         const double roi_sil = refineTranslationOnRgbSilhouette(
                             roi_cand.R, roi_cand.t, seed.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
-                            _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
+                            _mesh_pts, _mesh_normals, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
                         if (isInTargetWorkspace(roi_cand.t) && roi_sil <= 6.2) {
                             roi_cand.t_glass = roi_cand.t;
                             const cv::Vec3d eu = rotationMatrixToEulerDeg(roi_cand.R, false);
@@ -3417,7 +3431,7 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
             // 2. Nhánh tinh chỉnh trực tiếp hạt giống Pinhole + Rim Depth
             const double sil_cost = refineTranslationOnRgbSilhouette(
                 seed.R, seed.t, seed.t, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
-                _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
+                _mesh_pts, _mesh_normals, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
             if (!isInTargetWorkspace(seed.t)) continue;
 
             seed.t_glass = seed.t;
@@ -3546,7 +3560,7 @@ std::vector<ObjectPose> UniversalPoseEstimator::estimateMultiObjects(const cv::M
                 const double max_ws_z = std::clamp(_real_bounding_diag_m * 3.8 + 0.15, 0.95, 2.50);
                 sil_cost = refineTranslationOnRgbSilhouette(
                     inst_pose.R, inst_pose.t, cv::Vec3d(cl.centroid), _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
-                    _mesh_pts, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
+                    _mesh_pts, _mesh_normals, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
                 inst_pose.t_glass = inst_pose.t;
                 const cv::Vec3d euler = rotationMatrixToEulerDeg(inst_pose.R, false);
                 inst_pose.roll_deg = euler[0];
