@@ -36,9 +36,11 @@ def letterbox(img: np.ndarray, size: int = 224, bg_val: int = 128) -> np.ndarray
 
 def find_cad_mesh(cad_name: str, project_root: str) -> str:
     cad_dir = os.path.join(project_root, "CAD_DATA", cad_name)
-    for ext in ("*.obj", "*.ply", "*.stl", "*.OBJ", "*.PLY", "*.STL"):
+    canon_ply = os.path.join(cad_dir, f"{cad_name}_mesh.ply")
+    if os.path.exists(canon_ply):
+        return canon_ply
+    for ext in ("*.ply", "*.obj", "*.stl", "*.PLY", "*.OBJ", "*.STL"):
         matches = sorted(glob.glob(os.path.join(cad_dir, ext)))
-        # Prefer exact stem match if present
         for m in matches:
             if os.path.splitext(os.path.basename(m))[0] == cad_name:
                 return m
@@ -52,14 +54,29 @@ def find_cad_mesh(cad_name: str, project_root: str) -> str:
     return ""
 
 
+def compute_area_weighted_centroid(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    if len(faces) == 0:
+        return verts.mean(axis=0)
+    v0 = verts[faces[:, 0]]
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+    areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
+    total_area = float(np.sum(areas))
+    if total_area > 1e-12:
+        tri_centers = (v0 + v1 + v2) / 3.0
+        return np.sum(tri_centers * areas[:, None], axis=0) / total_area
+    return verts.mean(axis=0)
+
+
 def render_168_views(mesh_path: str, img_size: int = 224, mask_size: int = 64):
     loaded = trimesh.load(mesh_path, force="mesh")
     if isinstance(loaded, trimesh.Scene):
         loaded = trimesh.util.concatenate(tuple(loaded.geometry.values()))
     verts = np.asarray(loaded.vertices, dtype=np.float64)
     faces = np.asarray(loaded.faces, dtype=np.int64)
-    center = 0.5 * (verts.min(axis=0) + verts.max(axis=0))
-    verts = verts - center
+    if not os.path.basename(mesh_path).endswith("_mesh.ply"):
+        center = compute_area_weighted_centroid(verts, faces)
+        verts = verts - center
     radius = float(np.linalg.norm(verts, axis=1).max())
     if radius < 1e-6:
         radius = 1.0

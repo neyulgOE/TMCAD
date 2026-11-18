@@ -488,17 +488,20 @@ void CADSceneSegmenter::extractDepthPoints(const cv::Mat& depth_z16,
             if (z < _min_depth_m || z > _max_depth_m) continue;
 
             // Khử "Flying Pixels" bằng ngưỡng hình nón quang học theo khoảng cách Z và tiêu cự fx (Zero Hardcode)
+            // Giữ các cấu trúc mảnh 1D (như thanh giằng, gân, tay cầm) có >= 2/4 lân cận liên thông trong mask
             if (!_floor_standing_mode && u >= 2 && u + 2 < w) {
                 const uint16_t d_l = row_ptr[u - 2];
                 const uint16_t d_r = row_ptr[u + 2];
                 const uint16_t d_u = row_up[u];
                 const uint16_t d_d = row_dn[u];
-                if (d_l == 0 || d_r == 0 || d_u == 0 || d_d == 0) continue;
                 const float max_jump_m = std::max(0.014f, (2.0f * z / fx) * tan75);
-                if (std::abs(z - static_cast<float>(d_l) * scale) > max_jump_m ||
-                    std::abs(z - static_cast<float>(d_r) * scale) > max_jump_m ||
-                    std::abs(z - static_cast<float>(d_u) * scale) > max_jump_m ||
-                    std::abs(z - static_cast<float>(d_d) * scale) > max_jump_m) {
+                int valid_nbrs = 0;
+                if (d_l > 0 && std::abs(z - static_cast<float>(d_l) * scale) <= max_jump_m) ++valid_nbrs;
+                if (d_r > 0 && std::abs(z - static_cast<float>(d_r) * scale) <= max_jump_m) ++valid_nbrs;
+                if (d_u > 0 && std::abs(z - static_cast<float>(d_u) * scale) <= max_jump_m) ++valid_nbrs;
+                if (d_d > 0 && std::abs(z - static_cast<float>(d_d) * scale) <= max_jump_m) ++valid_nbrs;
+                const int min_nbrs = use_mask ? 2 : 3;
+                if (valid_nbrs < min_nbrs) {
                     continue;
                 }
             }
@@ -1366,6 +1369,7 @@ SegmentationResult CADSceneSegmenter::segment(const cv::Mat& depth_z16,
                                               const cv::Mat& fg_mask_2d) const {
     SegmentationResult res;
     const bool has_roi = (roi_hint.width > 16 && roi_hint.height > 16);
+    const bool has_mask = !fg_mask_2d.empty();
     std::vector<cv::Vec3f> raw_pts;
     extractDepthPoints(depth_z16, intr, roi_hint, raw_pts, fg_mask_2d);
     res.raw_points_count = raw_pts.size();

@@ -383,7 +383,7 @@ std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr,
                 const double z_med = zs[zs.size() / 2];
                 const double est_diag = z_med * std::hypot(static_cast<double>(b.width) / fx,
                                                            static_cast<double>(b.height) / fy);
-                if (est_diag < 0.42 * cad_diag_m || est_diag > 2.15 * cad_diag_m) {
+                if (est_diag < 0.48 * cad_diag_m || est_diag > 1.45 * cad_diag_m) {
                     continue;
                 }
             }
@@ -469,29 +469,35 @@ std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr,
 
     for (int k = 0; k < n_cand; ++k) {
         const float* f = emb_ptr + static_cast<size_t>(k) * fdim;
+        const auto& cm = kept_cands[k].mask_64;
+        float best_total = -1.0f;
         float best_cos = -1.0f;
+        float best_iou = 0.0f;
         int best_t = -1;
         for (int t = 0; t < n_tpl; ++t) {
             const float* tf = _templates[t].feat.data();
             float dot = 0.0f;
             for (int d = 0; d < fdim; ++d) dot += f[d] * tf[d];
-            if (dot > best_cos) {
+            int inter_cnt = 0, union_cnt = 0;
+            const auto& tm = _templates[t].mask_64;
+            for (int p = 0; p < m_area; ++p) {
+                const int a = cm[p], bval = tm[p];
+                inter_cnt += (a & bval);
+                union_cnt += (a | bval);
+            }
+            const float iou_t = (union_cnt > 0) ? (static_cast<float>(inter_cnt) / union_cnt) : 0.0f;
+            const float tot_t = 0.65f * dot + 0.35f * iou_t;
+            if (tot_t > best_total) {
+                best_total = tot_t;
                 best_cos = dot;
+                best_iou = iou_t;
                 best_t = t;
             }
         }
         if (best_t < 0) continue;
-
-        int inter_cnt = 0, union_cnt = 0;
-        const auto& cm = kept_cands[k].mask_64;
         const auto& tm = _templates[best_t].mask_64;
-        for (int p = 0; p < m_area; ++p) {
-            const int a = cm[p], bval = tm[p];
-            inter_cnt += (a & bval);
-            union_cnt += (a | bval);
-        }
-        const float iou = (union_cnt > 0) ? (static_cast<float>(inter_cnt) / union_cnt) : 0.0f;
-        const float total_score = 0.72f * best_cos + 0.28f * iou;
+        const float iou = best_iou;
+        const float total_score = best_total;
 
         const auto& orig_c = cands[kept_cands[k].cand_idx];
         cv::Mat cm_mat(m_sz, m_sz, CV_8UC1, const_cast<uint8_t*>(cm.data()));

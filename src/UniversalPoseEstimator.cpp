@@ -60,6 +60,7 @@ void computeVisibleCadSubset(const cv::Matx33d& R,
     for (size_t i = 0; i < mesh_pts.size(); i += mesh_stride) {
         cv::Vec3d p_cam = R * cv::Vec3d(mesh_pts[i]) + t;
         if (p_cam[2] <= 0.05) continue;
+        if (mesh_pts[i].dot(mesh_normals[i]) < -1e-4f && (p_cam[2] - t[2]) > 0.0) continue;
         cv::Vec3d n_cam = R * cv::Vec3d(mesh_normals[i]);
         if (n_cam.dot(p_cam) > 0.10 * cv::norm(p_cam)) continue;
 
@@ -89,10 +90,119 @@ void computeVisibleCadSubset(const cv::Matx33d& R,
 struct RgbEdgeMaps {
     cv::Mat dt_vert;
     cv::Mat dt_horiz;
+    cv::Mat dt_outside_mask;
+    std::vector<cv::Point> fg_sample_pts;
     bool empty() const { return dt_vert.empty() || dt_horiz.empty(); }
 };
 
-RgbEdgeMaps buildRgbCannyDistanceTransform(const cv::Mat& rgb, const cv::Mat& fg_mask_2d = cv::Mat())
+void expandMaskWithColorConnectedness(cv::Mat& fg_mask_2d, const cv::Mat& rgb)
+{
+    if (fg_mask_2d.empty() || rgb.empty() || fg_mask_2d.size() != rgb.size() ||
+        fg_mask_2d.type() != CV_8UC1 || rgb.type() != CV_8UC3) {
+        return;
+    }
+    const int orig_area = cv::countNonZero(fg_mask_2d);
+    if (orig_area < 150) return;
+
+    const cv::Rect mb = cv::boundingRect(fg_mask_2d);
+    if (mb.width < 12 || mb.height < 12) return;
+
+    cv::Mat eroded;
+    cv::erode(fg_mask_2d, eroded, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(15, 15)));
+    cv::Mat ring_mask = fg_mask_2d - eroded;
+    if (cv::countNonZero(ring_mask) < 30) ring_mask = fg_mask_2d;
+
+    std::vector<int> bs, gs, rs;
+    bs.reserve(512); gs.reserve(512); rs.reserve(512);
+    for (int v = mb.y; v < mb.y + mb.height; v += 2) {
+        const uint8_t* mrow = ring_mask.ptr<uint8_t>(v);
+        const cv::Vec3b* crow = rgb.ptr<cv::Vec3b>(v);
+        for (int u = mb.x; u < mb.x + mb.width; u += 2) {
+            if (mrow[u] > 0) {
+                bs.push_back(crow[u][0]);
+                gs.push_back(crow[u][1]);
+                rs.push_back(crow[u][2]);
+            }
+        }
+    }
+    if (bs.size() < 16) return;
+    std::nth_element(bs.begin(), bs.begin() + bs.size() / 2, bs.end());
+    std::nth_element(gs.begin(), gs.begin() + gs.size() / 2, gs.end());
+    std::nth_element(rs.begin(), rs.begin() + rs.size() / 2, rs.end());
+    const int b_med = bs[bs.size() / 2];
+    const int g_med = gs[gs.size() / 2];
+    const int r_med = rs[rs.size() / 2];
+    const int bg_med = b_med - g_med;
+    const int rg_med = r_med - g_med;
+
+    const int pad = std::clamp(static_cast<int>(std::round(0.45 * std::max(mb.width, mb.height))), 16, 72);
+    const int x0 = std::max(0, mb.x - pad);
+    const int y0 = std::max(0, mb.y - pad);
+    const int x1 = std::min(rgb.cols, mb.x + mb.width + pad);
+    const int y1 = std::min(rgb.rows, mb.y + mb.height + pad);
+    const cv::Rect roi(x0, y0, x1 - x0, y1 - y0);
+
+    cv::Mat cand_roi = cv::Mat::zeros(roi.size(), CV_8UC1);
+    for (int v = y0; v < y1; ++v) {
+        const uint8_t* frow = fg_mask_2d.ptr<uint8_t>(v);
+        const cv::Vec3b* crow = rgb.ptr<cv::Vec3b>(v);
+        uint8_t* orow = cand_roi.ptr<uint8_t>(v - y0);
+        for (int u = x0; u < x1; ++u) {
+            if (frow[u] > 0) {
+                orow[u - x0] = 255;
+                continue;
+            }
+            const int db = static_cast<int>(crow[u][0]) - b_med;
+            const int dg = static_cast<int>(crow[u][1]) - g_med;
+            const int dr = static_cast<int>(crow[u][2]) - r_med;
+            const int dist_sq = db * db + dg * dg + dr * dr;
+            const int d_chrom = std::abs(( static_cast<int>(crow[u][0]) - static_cast<int>(crow[u][1])) - bg_med)
+                              + std::abs(( static_cast<int>(crow[u][2]) - static_cast<int>(crow[u][1])) - rg_med);
+            if (dist_sq <= 36 * 36 && d_chrom <= 24) {
+                orow[u - x0] = 255;
+            }
+        }
+    }
+
+    cv::morphologyEx(cand_roi, cand_roi, cv::MORPH_CLOSE,
+                     cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
+
+    cv::Mat labels;
+    const int n_labels = cv::connectedComponents(cand_roi, labels, 8, CV_32S);
+    if (n_labels <= 1) return;
+
+    std::vector<uint8_t> keep_label(n_labels, 0);
+    for (int v = mb.y; v < mb.y + mb.height; v += 2) {
+        const uint8_t* frow = fg_mask_2d.ptr<uint8_t>(v);
+        const int* lrow = labels.ptr<int>(v - y0);
+        for (int u = mb.x; u < mb.x + mb.width; u += 2) {
+            if (frow[u] > 0 && lrow[u - x0] > 0) {
+                keep_label[lrow[u - x0]] = 1;
+            }
+        }
+    }
+
+    cv::Mat expanded_roi = fg_mask_2d(roi).clone();
+    int added = 0;
+    for (int r = 0; r < roi.height; ++r) {
+        const int* lrow = labels.ptr<int>(r);
+        uint8_t* erow = expanded_roi.ptr<uint8_t>(r);
+        for (int c = 0; c < roi.width; ++c) {
+            if (erow[c] == 0 && lrow[c] > 0 && keep_label[lrow[c]]) {
+                erow[c] = 255;
+                ++added;
+            }
+        }
+    }
+
+    if (added >= 20 && added <= static_cast<int>(0.48 * orig_area)) {
+        expanded_roi.copyTo(fg_mask_2d(roi));
+    }
+}
+
+RgbEdgeMaps buildRgbCannyDistanceTransform(const cv::Mat& rgb,
+                                           const cv::Mat& fg_mask_2d = cv::Mat(),
+                                           bool is_observed_fg_mask = true)
 {
     RgbEdgeMaps maps;
     if (rgb.empty()) return maps;
@@ -105,9 +215,29 @@ RgbEdgeMaps buildRgbCannyDistanceTransform(const cv::Mat& rgb, const cv::Mat& fg
     cv::GaussianBlur(gray, gray, cv::Size(3, 3), 0.8);
     cv::Canny(gray, edges, 45, 130);
     if (!fg_mask_2d.empty() && fg_mask_2d.size() == edges.size() && fg_mask_2d.type() == CV_8UC1) {
+        const int dil_sz = 19;
         cv::Mat mask_dil;
-        cv::dilate(fg_mask_2d, mask_dil, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(13, 13)));
+        cv::dilate(fg_mask_2d, mask_dil, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(dil_sz, dil_sz)));
         cv::bitwise_and(edges, mask_dil, edges);
+        if (is_observed_fg_mask) {
+            cv::Mat mask_allow;
+            cv::dilate(fg_mask_2d, mask_allow, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
+            cv::Mat inv_fg = (mask_allow == 0);
+            cv::distanceTransform(inv_fg, maps.dt_outside_mask, cv::DIST_L2, 3);
+            cv::Mat fg_grad;
+            cv::morphologyEx(fg_mask_2d, fg_grad, cv::MORPH_GRADIENT,
+                             cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+            std::vector<cv::Point> all_fg;
+            cv::findNonZero(fg_grad, all_fg);
+            if (all_fg.size() < 16) cv::findNonZero(fg_mask_2d, all_fg);
+            if (!all_fg.empty()) {
+                const size_t step_fg = std::max<size_t>(1, all_fg.size() / 160);
+                maps.fg_sample_pts.reserve(all_fg.size() / step_fg + 1);
+                for (size_t i = 0; i < all_fg.size(); i += step_fg) {
+                    maps.fg_sample_pts.push_back(all_fg[i]);
+                }
+            }
+        }
     }
     cv::Sobel(gray, gx, CV_32F, 1, 0, 3);
     cv::Sobel(gray, gy, CV_32F, 0, 1, 3);
@@ -134,13 +264,17 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
                                        const std::vector<cv::Vec3f>& mesh_pts,
                                        const std::vector<cv::Vec3f>& mesh_normals,
                                        const RgbEdgeMaps& edge_maps,
-                                       double fx, double fy, double cx, double cy)
+                                       double fx, double fy, double cx, double cy,
+                                       bool include_mask_coverage = false)
 {
     (void)mesh_normals;
     if (mesh_pts.empty() || edge_maps.empty()) return 50.0;
 
     const int w = edge_maps.dt_vert.cols;
     const int h = edge_maps.dt_vert.rows;
+    const bool has_out_dt = (!edge_maps.dt_outside_mask.empty() &&
+                             edge_maps.dt_outside_mask.cols == w &&
+                             edge_maps.dt_outside_mask.rows == h);
 
     constexpr int kBins = 24;
     int min_v = 100000, max_v = -100000;
@@ -149,6 +283,7 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
 
     std::vector<cv::Point> proj_pts;
     proj_pts.reserve(mesh_pts.size() / step + 1);
+    double sum_out_mask = 0.0;
 
     for (size_t i = 0; i < mesh_pts.size(); i += step) {
         const cv::Vec3d pc = R * cv::Vec3d(mesh_pts[i]) + t;
@@ -157,6 +292,10 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
         const int v = static_cast<int>(std::round(fy * pc[1] / pc[2] + cy));
         if (u < 2 || u >= w - 2 || v < 2 || v >= h - 2) return 50.0;
         proj_pts.emplace_back(u, v);
+        if (has_out_dt) {
+            const float d_out = edge_maps.dt_outside_mask.at<float>(v, u);
+            if (d_out > 2.0f) sum_out_mask += static_cast<double>(std::min(25.0f, d_out - 2.0f));
+        }
         if (v < min_v) min_v = v;
         if (v > max_v) max_v = v;
         if (u < min_u_all) min_u_all = u;
@@ -271,7 +410,31 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
     const double mean_vert = 0.5 * (mean_left + mean_right);
     const double bilat_max = std::max(mean_left, mean_right);
     const double mean_horiz = (cnt_horiz > 0) ? (sum_horiz / cnt_horiz) : mean_vert;
-    return 0.45 * bilat_max + 0.33 * mean_vert + 0.22 * mean_horiz;
+    double base_chamfer = 0.45 * bilat_max + 0.33 * mean_vert + 0.22 * mean_horiz;
+
+    if (include_mask_coverage) {
+        if (has_out_dt && !proj_pts.empty()) {
+            base_chamfer += 0.40 * (sum_out_mask / static_cast<double>(proj_pts.size()));
+        }
+        if (!edge_maps.fg_sample_pts.empty()) {
+            double sum_uncov = 0.0;
+            for (const auto& fp : edge_maps.fg_sample_pts) {
+                const double s = (fp.x - mu_u) * ax_u + (fp.y - mu_v) * ax_v;
+                const double p = (fp.x - mu_u) * perp_u + (fp.y - mu_v) * perp_v;
+                const int b = std::clamp(static_cast<int>((s - min_along) * inv_span_along), 0, kBins - 1);
+                const double d_along = (s < min_along) ? (min_along - s) : ((s > max_along) ? (s - max_along) : 0.0);
+                const double d_perp = (row_lu[b] >= 0)
+                    ? ((p < row_min_perp[b]) ? (row_min_perp[b] - p) : ((p > row_max_perp[b]) ? (p - row_max_perp[b]) : 0.0))
+                    : 8.0;
+                const double d_tot = std::hypot(d_along, d_perp);
+                if (d_tot > 2.5) {
+                    sum_uncov += std::min(25.0, d_tot - 2.5);
+                }
+            }
+            base_chamfer += 0.40 * (sum_uncov / static_cast<double>(edge_maps.fg_sample_pts.size()));
+        }
+    }
+    return base_chamfer;
 }
 
 bool projectCadBounds2D(const cv::Matx33d& R,
@@ -413,6 +576,26 @@ double computeProjectedZeroDepthFraction(const cv::Matx33d& R,
     return (tot_cnt > 0) ? (static_cast<double>(zero_cnt) / tot_cnt) : 0.0;
 }
 
+cv::Vec3d computeVisibleSurfaceCentroid(const cv::Matx33d& R,
+                                        const cv::Vec3d& view_ray,
+                                        const std::vector<cv::Vec3f>& mesh_pts,
+                                        const std::vector<cv::Vec3f>& mesh_normals,
+                                        const cv::Vec3d& fallback_mid)
+{
+    if (mesh_pts.empty() || mesh_normals.size() != mesh_pts.size()) return fallback_mid;
+    const size_t step = std::max<size_t>(1, mesh_pts.size() / 400);
+    cv::Vec3d sum_vis(0.0, 0.0, 0.0);
+    int cnt = 0;
+    for (size_t i = 0; i < mesh_pts.size(); i += step) {
+        const cv::Vec3d n_cam = R * cv::Vec3d(mesh_normals[i]);
+        if (n_cam.dot(view_ray) < -0.05) {
+            sum_vis += cv::Vec3d(mesh_pts[i]);
+            ++cnt;
+        }
+    }
+    return (cnt >= 8) ? (sum_vis * (1.0 / static_cast<double>(cnt))) : fallback_mid;
+}
+
 double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
                                         cv::Vec3d& t,
                                         const cv::Vec3d& cluster_centroid,
@@ -444,10 +627,23 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
     int long_ax = 2;
     if (span[0] >= span[1] && span[0] >= span[2]) long_ax = 0;
     else if (span[1] >= span[0] && span[1] >= span[2]) long_ax = 1;
-    const int ax1 = (long_ax + 1) % 3;
-    const int ax2 = (long_ax + 2) % 3;
+    int vert_ax = long_ax;
+    double best_up_dot = -1.0;
+    for (int a = 0; a < 3; ++a) {
+        const cv::Vec3d col_a(R(0, a), R(1, a), R(2, a));
+        const double d = std::abs(col_a.dot(up_cam));
+        if (d > best_up_dot) {
+            best_up_dot = d;
+            if (d > 0.72) vert_ax = a;
+        }
+    }
+    const int ax1 = (vert_ax + 1) % 3;
+    const int ax2 = (vert_ax + 2) % 3;
     const int ax_wide = (span[ax1] >= span[ax2]) ? ax1 : ax2;
     const int ax_thin = (ax_wide == ax1) ? ax2 : ax1;
+    if (!is_tracking_warm_start && R(1, vert_ax) > 0.35) {
+        best_cost += 0.85;
+    }
 
     const cv::Vec3d cad_mid = 0.5 * (cad_min + cad_max);
     const cv::Vec3d center_pose = R * cad_mid + t;
@@ -463,7 +659,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
 
     cv::Matx33d R_up = cv::Matx33d::zeros();
     for (int r = 0; r < 3; ++r) {
-        R_up(r, long_ax) = up_cam[r];
+        R_up(r, vert_ax) = up_cam[r];
         R_up(r, ax_wide) = s1[r];
         R_up(r, ax_thin) = s2[r];
     }
@@ -472,13 +668,18 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
     }
     cv::Matx33d R_up_flip = R_up;
     for (int r = 0; r < 3; ++r) {
-        R_up_flip(r, long_ax) = -R_up(r, long_ax);
+        R_up_flip(r, vert_ax) = -R_up(r, vert_ax);
         R_up_flip(r, ax_wide) = -R_up(r, ax_wide);
+    }
+    cv::Matx33d R_in_flip = R;
+    for (int r = 0; r < 3; ++r) {
+        R_in_flip(r, vert_ax) = -R(r, vert_ax);
+        R_in_flip(r, ax_thin) = -R(r, ax_thin);
     }
 
     const std::vector<cv::Matx33d> R_cands = is_tracking_warm_start
         ? std::vector<cv::Matx33d>{R}
-        : std::vector<cv::Matx33d>{R, R_up, R_up_flip};
+        : std::vector<cv::Matx33d>{R, R_in_flip, R_up, R_up_flip};
     const double surf_z_off = 0.42 * std::min({span[0], span[1], span[2]});
     const double diag_obj = std::max(0.05, cv::norm(span));
     std::vector<cv::Vec3d> anchor_centers = {center_pose};
@@ -517,8 +718,16 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
     for (const auto& center_0 : anchor_centers) {
         for (const auto& R_try : R_cands) {
             const cv::Vec3d base_t = center_0 - R_try * cad_mid;
-            const bool is_flipped_down = (R_try(1, long_ax) > 0.35);
+            const bool is_flipped_down = (R_try(1, vert_ax) > 0.35);
             const double flip_pen = is_flipped_down ? 0.85 : 0.0;
+            {
+                const double c0 = computeRgbSilhouetteChamferCost(R_try, base_t, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy) + flip_pen;
+                if (c0 < best_cost) {
+                    best_cost = c0;
+                    best_R = R_try;
+                    best_t = base_t;
+                }
+            }
             const double dy_min = is_tracking_warm_start ? -0.024 : -0.060;
             const double dy_max = is_tracking_warm_start ? 0.025 : 0.031;
             const double dx_lim = is_tracking_warm_start ? 0.024 : 0.030;
@@ -544,33 +753,86 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
         }
     }
 
-    // Tinh chỉnh góc tự xoay (Yaw quanh trục dài long_ax)
+    // Tinh chỉnh góc tự xoay quanh trục chính của vật thể (kết hợp Visible-Surface Centroid & Bidirectional Mask)
     best_cost = computeRgbSilhouetteChamferCost(best_R, best_t, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
     {
         const cv::Vec3d win_center = best_R * cad_mid + best_t;
         const cv::Matx33d R_base = best_R;
-        double best_yaw_obj = best_cost;
-        const int yaw_lim = is_tracking_warm_start ? 8 : 30;
-        const int yaw_step = is_tracking_warm_start ? 2 : 5;
-        const double yaw_reg = is_tracking_warm_start ? 0.085 : 0.015;
-        for (int deg = -yaw_lim; deg <= yaw_lim; deg += yaw_step) {
-            if (deg == 0) continue;
+        const cv::Vec3d t_base = best_t;
+        const bool full_mask_search = (!is_tracking_warm_start && !edge_maps.fg_sample_pts.empty());
+        double best_yaw_obj = computeRgbSilhouetteChamferCost(
+            best_R, best_t, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy, full_mask_search);
+
+        std::vector<int> rot_axes = {vert_ax};
+
+        const int yaw_min = full_mask_search ? -180 : (is_tracking_warm_start ? -8 : -30);
+        const int yaw_max = full_mask_search ?  165 : (is_tracking_warm_start ?  8 :  30);
+        const int yaw_step = full_mask_search ?  15 : (is_tracking_warm_start ?  2 :   5);
+        const double yaw_reg = full_mask_search ? 0.002 : (is_tracking_warm_start ? 0.085 : 0.015);
+
+        int best_rot_ax = vert_ax;
+        int best_deg = 0;
+
+        auto evalAxisDeg = [&](int r_ax, int deg, bool flip_pole) {
+            const int r_a1 = (r_ax + 1) % 3;
+            const int r_a2 = (r_ax + 2) % 3;
             const double rad = static_cast<double>(deg) * kPi / 180.0;
             const double cs = std::cos(rad), sn = std::sin(rad);
             cv::Matx33d R_local = cv::Matx33d::eye();
-            R_local(ax1, ax1) = cs;  R_local(ax1, ax2) = -sn;
-            R_local(ax2, ax1) = sn;  R_local(ax2, ax2) = cs;
+            if (flip_pole) {
+                R_local(r_ax, r_ax) = -1.0;
+                R_local(r_a1, r_a1) =  cs;  R_local(r_a1, r_a2) =  sn;
+                R_local(r_a2, r_a1) =  sn;  R_local(r_a2, r_a2) = -cs;
+            } else {
+                R_local(r_a1, r_a1) = cs;  R_local(r_a1, r_a2) = -sn;
+                R_local(r_a2, r_a1) = sn;  R_local(r_a2, r_a2) = cs;
+            }
             const cv::Matx33d R_yaw = R_base * R_local;
-            const cv::Vec3d t_yaw = win_center - R_yaw * cad_mid;
-            const double c_raw = computeRgbSilhouetteChamferCost(R_yaw, t_yaw, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
-            const double c_obj = c_raw + yaw_reg * std::abs(deg);
-            if (c_obj < best_yaw_obj) {
-                best_yaw_obj = c_obj;
-                best_cost = c_raw;
-                best_R = R_yaw;
-                best_t = t_yaw;
+            const double pole_pen = (!is_tracking_warm_start && R_yaw(1, vert_ax) > 0.35) ? 0.85 : 0.0;
+
+            std::vector<cv::Vec3d> t_cands = {
+                t_base,
+                win_center - R_yaw * cad_mid
+            };
+            if (!is_tracking_warm_start && cluster_centroid[2] > 0.15) {
+                t_cands.push_back(cluster_centroid - R_yaw * computeVisibleSurfaceCentroid(R_yaw, view_ray, mesh_pts, mesh_normals, cad_mid));
+            }
+            for (const auto& t_yaw : t_cands) {
+                const double c_raw = computeRgbSilhouetteChamferCost(
+                    R_yaw, t_yaw, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy, full_mask_search);
+                const double c_obj = c_raw + yaw_reg * std::abs(deg) + pole_pen;
+                if (c_obj < best_yaw_obj) {
+                    best_yaw_obj = c_obj;
+                    best_R = R_yaw;
+                    best_t = t_yaw;
+                    best_rot_ax = r_ax;
+                    best_deg = deg;
+                }
+            }
+        };
+
+        if (!is_tracking_warm_start && R_base(1, vert_ax) > 0.35) {
+            best_yaw_obj += 0.85;
+        }
+        bool best_flip_pole = false;
+        for (int r_ax : rot_axes) {
+            const std::vector<bool> flips = full_mask_search ? std::vector<bool>{false, true} : std::vector<bool>{false};
+            for (bool fp : flips) {
+                for (int deg = yaw_min; deg <= yaw_max; deg += yaw_step) {
+                    if (deg == 0 && !fp) continue;
+                    const double prev_best = best_yaw_obj;
+                    evalAxisDeg(r_ax, deg, fp);
+                    if (best_yaw_obj < prev_best) best_flip_pole = fp;
+                }
             }
         }
+        if (full_mask_search) {
+            for (int d_fine = -12; d_fine <= 12; d_fine += 3) {
+                if (d_fine == 0) continue;
+                evalAxisDeg(best_rot_ax, best_deg + d_fine, best_flip_pole);
+            }
+        }
+        best_cost = computeRgbSilhouetteChamferCost(best_R, best_t, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy, false);
     }
 
     // Tinh chỉnh mịn theo tỷ lệ pixel quang học (step_xy = 1.5*Z/fx) và kích thước CAD (step_z = 0.02*diag)
@@ -2569,7 +2831,8 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         if (!isInTargetWorkspace(t_sol)) return;
         const cv::Vec3d pred_mid = R_sol * cad_mid + t_sol;
         if (cv::norm(pred_mid - c_fg) > max_center_drift + 0.35 * diag) return;
-        const double adj = c_sol.score + bonus;
+        const double inv_z_pen = (R_sol(1, 2) > 0.35) ? -0.025 : 0.0;
+        const double adj = c_sol.score + bonus + inv_z_pen;
         if (adj > best_total) {
             best_total = adj;
             best_R = R_sol;
@@ -2584,8 +2847,8 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
     const cv::Matx33d Rx180(1.0,  0.0,  0.0,  0.0, -1.0,  0.0,  0.0,  0.0, -1.0);
     const cv::Matx33d Ry180(-1.0, 0.0,  0.0,  0.0,  1.0,  0.0,  0.0,  0.0, -1.0);
     const cv::Matx33d Rz180(-1.0, 0.0,  0.0,  0.0, -1.0,  0.0,  0.0,  0.0,  1.0);
-    seeds.push_back(PoseSeed{R_cand0 * Rx180, computeVisibleSurfaceOffset(R_cand0 * Rx180, c_fg, cad_mid, _mesh_pts, _mesh_normals), 0.0});
-    seeds.push_back(PoseSeed{R_cand0 * Ry180, computeVisibleSurfaceOffset(R_cand0 * Ry180, c_fg, cad_mid, _mesh_pts, _mesh_normals), 0.0});
+    seeds.push_back(PoseSeed{R_cand0 * Rx180, computeVisibleSurfaceOffset(R_cand0 * Rx180, c_fg, cad_mid, _mesh_pts, _mesh_normals), -0.004});
+    seeds.push_back(PoseSeed{R_cand0 * Ry180, computeVisibleSurfaceOffset(R_cand0 * Ry180, c_fg, cad_mid, _mesh_pts, _mesh_normals), -0.004});
     seeds.push_back(PoseSeed{R_cand0 * Rz180, computeVisibleSurfaceOffset(R_cand0 * Rz180, c_fg, cad_mid, _mesh_pts, _mesh_normals), -0.008});
 
     // 3. Pure 3D Free-Space SO(3) Multi-Hypothesis Search (Zero Table/Floor Dependency!)
@@ -2646,7 +2909,8 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
             auto sc = evaluateBidirectionalConsensus(
                 R_try, t_try, diag, _mesh_pts, _mesh_normals,
                 fg_pts, fx, fy, cx, cy, img_w, img_h, true);
-            cand_pool.push_back(RankedSeed{sc.score, R_try, t_try});
+            const double inv_z_pen = (R_try(1, 2) > 0.35) ? -0.025 : 0.0;
+            cand_pool.push_back(RankedSeed{sc.score + inv_z_pen, R_try, t_try});
         }
 
         // (B) Quét thêm các góc xoay mịn (mỗi 30 độ) quanh cả 3 trục X, Y, Z của R_cand0 (từ AI ONNX)
@@ -2663,7 +2927,8 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
                 auto sc = evaluateBidirectionalConsensus(
                     R_try, t_try, diag, _mesh_pts, _mesh_normals,
                     fg_pts, fx, fy, cx, cy, img_w, img_h, true);
-                cand_pool.push_back(RankedSeed{sc.score, R_try, t_try});
+                const double inv_z_pen = (R_try(1, 2) > 0.35) ? -0.025 : 0.0;
+                cand_pool.push_back(RankedSeed{sc.score + inv_z_pen, R_try, t_try});
             }
         }
 
@@ -2892,18 +3157,21 @@ ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::V
     const std::vector<cv::Vec3f>& icp_cloud = dense_pts.empty() ? sampled_pts : dense_pts;
     refineMultiScaleMeshICP(icp_cloud, pose, intr);
 
-    // Kiểm tra phân cực Đầu nắp vs Đáy chai bằng biên dạng cạnh 2D trên ảnh RGB
-    // khi vật thể có dạng đối xứng trụ (tỷ lệ thiết diện < 1.35) và phần cổ/nắp có thể bị mất Depth.
+    // Kiểm tra đối xứng 180 độ (Azimuthal quanh trục đứng vert_ax & Polar đầu-đáy) bằng biên dạng cạnh 2D trên ảnh RGB
     if (!_is_floor_standing && !rgb.empty() && !_mesh_pts.empty()) {
         const cv::Vec3d cad_span = _cad_max - _cad_min;
-        int long_ax = 2;
-        if (cad_span[0] >= cad_span[1] && cad_span[0] >= cad_span[2]) long_ax = 0;
-        else if (cad_span[1] >= cad_span[0] && cad_span[1] >= cad_span[2]) long_ax = 1;
-        const int s_ax1 = (long_ax + 1) % 3;
-        const int s_ax2 = (long_ax + 2) % 3;
-        const double ratio_cross = std::max(cad_span[s_ax1], cad_span[s_ax2]) /
-                                   std::max(1e-4, std::min(cad_span[s_ax1], cad_span[s_ax2]));
-        if (ratio_cross < 1.35) {
+        int vert_ax = 2;
+        if (cad_span[0] >= cad_span[1] && cad_span[0] >= cad_span[2]) vert_ax = 0;
+        else if (cad_span[1] >= cad_span[0] && cad_span[1] >= cad_span[2]) vert_ax = 1;
+        for (int a = 0; a < 3; ++a) {
+            if (std::abs(pose.R(1, a)) > 0.72) {
+                vert_ax = a;
+                break;
+            }
+        }
+        const int s_ax1 = (vert_ax + 1) % 3;
+        const int s_ax2 = (vert_ax + 2) % 3;
+        {
             cv::Mat gray, edges, inv_edges, dt;
             if (rgb.channels() == 3) cv::cvtColor(rgb, gray, cv::COLOR_BGR2GRAY);
             else gray = rgb;
@@ -2916,13 +3184,18 @@ ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::V
             const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * img_w);
             const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * img_h);
 
-            cv::Matx33d R_flip_local = cv::Matx33d::eye();
-            R_flip_local(long_ax, long_ax) = -1.0;
-            R_flip_local(s_ax2, s_ax2) = -1.0;
+            // 1. Azimuthal 180-deg flip around vert_ax (giữ nguyên cực đứng vert_ax, đảo hướng ngang s_ax1/s_ax2)
+            cv::Matx33d R_azim_local = cv::Matx33d::eye();
+            R_azim_local(s_ax1, s_ax1) = -1.0;
+            R_azim_local(s_ax2, s_ax2) = -1.0;
+
+            // 2. Polar 180-deg flip (đảo cực vert_ax nếu đang bị lộn ngược)
+            cv::Matx33d R_pole_local = cv::Matx33d::eye();
+            R_pole_local(vert_ax, vert_ax) = -1.0;
+            R_pole_local(s_ax2, s_ax2) = -1.0;
+
             const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
             const cv::Vec3d world_mid = pose.R * cad_mid + pose.t;
-            const cv::Matx33d R_flip = pose.R * R_flip_local;
-            const cv::Vec3d t_flip = world_mid - R_flip * cad_mid;
 
             auto eval2DEdgeDist = [&](const cv::Matx33d& R_test, const cv::Vec3d& t_test) -> double {
                 std::vector<cv::Vec3d> vis_pts, vis_norms;
@@ -2942,15 +3215,29 @@ ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::V
                         ++cnt;
                     }
                 }
-                return (cnt >= 10) ? (sum_dt / cnt) : 1e6;
+                const double pole_pen = (R_test(1, vert_ax) > 0.35) ? 0.65 : 0.0;
+                return (cnt >= 10) ? (sum_dt / cnt + pole_pen) : 1e6;
             };
 
-            const double err_cur = eval2DEdgeDist(pose.R, pose.t);
-            const double err_flip = eval2DEdgeDist(R_flip, t_flip);
-            if (err_flip + 0.35 < err_cur) {
-                pose.R = R_flip;
-                pose.t = t_flip;
-                pose.t_glass = t_flip;
+            double best_err = eval2DEdgeDist(pose.R, pose.t);
+            cv::Matx33d best_R_2d = pose.R;
+            cv::Vec3d best_t_2d = pose.t;
+            bool changed_2d = false;
+
+            const cv::Matx33d R_try = pose.R * R_pole_local;
+            for (const cv::Vec3d& t_try : {pose.t, world_mid - R_try * cad_mid}) {
+                const double err_try = eval2DEdgeDist(R_try, t_try);
+                if (err_try + 0.30 < best_err) {
+                    best_err = err_try;
+                    best_R_2d = R_try;
+                    best_t_2d = t_try;
+                    changed_2d = true;
+                }
+            }
+            if (changed_2d) {
+                pose.R = best_R_2d;
+                pose.t = best_t_2d;
+                pose.t_glass = best_t_2d;
                 const cv::Vec3d euler = rotationMatrixToEulerDeg(pose.R, false);
                 pose.roll_deg = euler[0];
                 pose.pitch_deg = euler[1];
@@ -3472,7 +3759,7 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
             : std::hypot(pb.width, pb.height);
         const int ksize = std::clamp(static_cast<int>(std::round(bbox_diag_px * 0.10f)) | 1, 9, 35);
         cv::dilate(proj_mask, proj_mask, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(ksize, ksize)));
-        const RgbEdgeMaps dt_canny = buildRgbCannyDistanceTransform(rgb, proj_mask);
+        const RgbEdgeMaps dt_canny = buildRgbCannyDistanceTransform(rgb, proj_mask, false);
         if (!dt_canny.empty()) {
             sil_cost = refineTranslationOnRgbSilhouette(
                 cand.R, cand.t, cand.R * cad_mid + cand.t, _cad_min, _cad_max,
@@ -3571,8 +3858,9 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
     std::vector<MatchedMaskCandidate> mask_cands;
     if (_mask_matcher.isReady() && !rgb.empty() && roi_hint.empty() && !_is_floor_standing) {
         mask_cands = _mask_matcher.match(rgb, depth_z16, intr, _real_bounding_diag_m, 2);
-        if (!mask_cands.empty() && mask_cands[0].score >= 0.45f) {
-            fg_mask_2d = mask_cands[0].mask_u8;
+        if (!mask_cands.empty() && mask_cands[0].score >= 0.42f) {
+            fg_mask_2d = mask_cands[0].mask_u8.clone();
+            expandMaskWithColorConnectedness(fg_mask_2d, rgb);
         }
     }
 
@@ -3684,6 +3972,69 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                                      seg_res.floor_detected,
                                      seg_res.floor_pitch_deg,
                                      rgb, intr, depth_z16.cols, depth_z16.rows, &ai_ms);
+        if (pose.valid && !_is_floor_standing && !dt_canny.empty()) {
+            int vert_ax_est = 2;
+            for (int a = 0; a < 3; ++a) {
+                if (std::abs(pose.R(1, a)) > 0.72) { vert_ax_est = a; break; }
+            }
+            const bool was_upside_down = (pose.R(1, vert_ax_est) > 0.35);
+            const double sil_before = computeRgbSilhouetteChamferCost(
+                pose.R, pose.t, _mesh_pts, _mesh_normals, dt_canny, sil_fx, sil_fy, sil_cx, sil_cy, true)
+                + (was_upside_down ? 0.85 : 0.0);
+            if (!dt_canny.fg_sample_pts.empty() || was_upside_down) {
+                cv::Vec3d c_fg(0.0, 0.0, 0.0);
+                const auto& pts_ref = seg_res.dense_object_points.empty() ? seg_res.object_points : seg_res.dense_object_points;
+                if (!pts_ref.empty()) {
+                    for (const auto& p : pts_ref) c_fg += cv::Vec3d(p);
+                    c_fg *= (1.0 / static_cast<double>(pts_ref.size()));
+                }
+                ObjectPose sil_cand = pose;
+                const double max_ws_z = std::clamp(_real_bounding_diag_m * 3.8 + 0.15, 0.95, 2.50);
+                refineTranslationOnRgbSilhouette(
+                    sil_cand.R, sil_cand.t, c_fg, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
+                    _mesh_pts, _mesh_normals, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
+                const double sil_after = computeRgbSilhouetteChamferCost(
+                    sil_cand.R, sil_cand.t, _mesh_pts, _mesh_normals, dt_canny, sil_fx, sil_fy, sil_cx, sil_cy, true);
+                if (isInTargetWorkspace(sil_cand.t) && sil_after + 0.20 < sil_before) {
+                    if (pts_ref.size() >= 24) {
+                        const size_t step_p = std::max<size_t>(1, pts_ref.size() / 600);
+                        std::vector<cv::Vec3d> fg_p;
+                        fg_p.reserve(pts_ref.size() / step_p + 1);
+                        for (size_t i = 0; i < pts_ref.size(); i += step_p) fg_p.emplace_back(pts_ref[i]);
+                        cv::Matx33d R_icp = sil_cand.R;
+                        cv::Vec3d t_icp = sil_cand.t;
+                        const std::vector<double> p_scales = {
+                            std::clamp(0.045 * _real_bounding_diag_m, 0.008, 0.032),
+                            std::clamp(0.020 * _real_bounding_diag_m, 0.004, 0.015)
+                        };
+                        runPointToPlaneIcpGeneric(sil_cand.R, sil_cand.t, _mesh_pts, _mesh_normals, fg_p,
+                                                  1, std::max<size_t>(1, _mesh_pts.size() / 1600),
+                                                  p_scales, 10, sil_fx, sil_fy, sil_cx, sil_cy,
+                                                  depth_z16.cols, depth_z16.rows, R_icp, t_icp);
+                        if (isInTargetWorkspace(t_icp) && cv::norm(t_icp - sil_cand.t) <= 0.035) {
+                            sil_cand.R = R_icp;
+                            sil_cand.t = t_icp;
+                        }
+                    }
+                    const bool now_upside_down = (sil_cand.R(1, vert_ax_est) > 0.35);
+                    const double sil_icp = computeRgbSilhouetteChamferCost(
+                        sil_cand.R, sil_cand.t, _mesh_pts, _mesh_normals, dt_canny, sil_fx, sil_fy, sil_cx, sil_cy, true)
+                        + (now_upside_down ? 0.85 : 0.0);
+                    if (sil_icp + 0.15 < sil_before) {
+                        sil_cand.t_glass = sil_cand.t;
+                        const cv::Vec3d eu = rotationMatrixToEulerDeg(sil_cand.R, false);
+                        sil_cand.roll_deg = eu[0];
+                        sil_cand.pitch_deg = eu[1];
+                        sil_cand.yaw_deg = eu[2];
+                        sil_cand.bbox_2d = projectCadBoundingBox(sil_cand.R, sil_cand.t, intr, depth_z16.cols, depth_z16.rows, &sil_cand.corners_2d);
+                        rescorePoseUnclipped(sil_cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
+                        if (sil_cand.rmse_m <= std::max(0.015, pose.rmse_m + 0.005)) {
+                            pose = std::move(sil_cand);
+                        }
+                    }
+                }
+            }
+        }
         if (pose.valid && !_is_floor_standing &&
             seg_res.foreground_points.size() > static_cast<size_t>(pose.valid_depth_pts * 1.18)) {
             rescorePoseUnclipped(pose, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
@@ -3784,8 +4135,8 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
     }
 
     // Ưu tiên 2: Nếu cụm tiền cảnh trong fg_mask_2d thiếu điểm Depth (< 100 điểm) hoặc chưa có pose hợp lệ,
-    // dùng R_cw_prior + bù góc xoay liên tục 2D PCA quanh tia nhìn (dtheta và dtheta + pi) làm giả thuyết bổ sung.
-    if (!pose.valid && !_is_floor_standing && !mask_cands.empty() && mask_cands[0].score >= 0.45f &&
+    // dùng R_cw_prior + bù góc xoay liên tục 2D PCA quanh tia nhìn (dtheta và dtheta + pi) + Visible-Surface Centroid.
+    if (!pose.valid && !_is_floor_standing && !mask_cands.empty() && mask_cands[0].score >= 0.42f &&
         !dt_canny.empty() && !seg_res.dense_object_points.empty() && seg_res.dense_object_points.size() < 100) {
         cv::Vec3d c_fg(0.0, 0.0, 0.0);
         for (const auto& p : seg_res.dense_object_points) c_fg += cv::Vec3d(p);
@@ -3811,11 +4162,15 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
             pr.model_name = _model_name;
             pr.method = "mask_pca_prior";
             pr.R = R_roll * mask_cands[0].R_cw_prior;
-            pr.t = c_fg - pr.R * cad_mid;
+            const cv::Vec3d c_vis = computeVisibleSurfaceCentroid(pr.R, v_ray, _mesh_pts, _mesh_normals, cad_mid);
+            pr.t = c_fg - pr.R * c_vis;
             const double sil_c = refineTranslationOnRgbSilhouette(
                 pr.R, pr.t, c_fg, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
                 _mesh_pts, _mesh_normals, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
             if (!isInTargetWorkspace(pr.t)) continue;
+            if (seg_res.dense_object_points.size() >= 32) {
+                refineMultiScaleMeshICP(seg_res.dense_object_points, pr, intr);
+            }
             pr.t_glass = pr.t;
             const cv::Vec3d eu = rotationMatrixToEulerDeg(pr.R, false);
             pr.roll_deg = eu[0];
@@ -3853,6 +4208,12 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
         int long_ax = 2;
         if (span[0] >= span[1] && span[0] >= span[2]) long_ax = 0;
         else if (span[1] >= span[0] && span[1] >= span[2]) long_ax = 1;
+        for (int a = 0; a < 3; ++a) {
+            if (std::abs(_track_pose.R(1, a)) > 0.72) {
+                long_ax = a;
+                break;
+            }
+        }
         const int ax1 = (long_ax + 1) % 3;
         const int ax2 = (long_ax + 2) % 3;
         const cv::Vec3d z_cur(pose.R(0, long_ax), pose.R(1, long_ax), pose.R(2, long_ax));

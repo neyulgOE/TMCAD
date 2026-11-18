@@ -84,7 +84,7 @@ SymmetryDefinition SymmetryDefinition::loadFromJson(const std::string& jsonPath)
     SymmetryDefinition sym;
     QFile file(QString::fromStdString(jsonPath));
     if (!file.open(QIODevice::ReadOnly)) {
-        sym = createDefault(QFileInfo(file).baseName().toStdString());
+        sym = createDefault(QFileInfo(file).completeBaseName().toStdString());
         return sym;
     }
 

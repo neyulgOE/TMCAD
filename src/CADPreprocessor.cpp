@@ -121,7 +121,23 @@ CADAsset CADPreprocessor::process(const std::string& path, size_t targetPointCou
     asset.sourcePath = path;
     asset.sourceUnitScale = unitScale;
 
-    Eigen::Vector3d rawCentroid = mesh->GetCenter();
+    Eigen::Vector3d rawCentroid = Eigen::Vector3d::Zero();
+    double totalArea = 0.0;
+    for (const auto& tri : mesh->triangles_) {
+        const Eigen::Vector3d& v0 = mesh->vertices_[tri(0)];
+        const Eigen::Vector3d& v1 = mesh->vertices_[tri(1)];
+        const Eigen::Vector3d& v2 = mesh->vertices_[tri(2)];
+        double area = 0.5 * ((v1 - v0).cross(v2 - v0)).norm();
+        if (std::isfinite(area) && area > 1e-12) {
+            rawCentroid += area * ((v0 + v1 + v2) / 3.0);
+            totalArea += area;
+        }
+    }
+    if (totalArea > 1e-12) {
+        rawCentroid /= totalArea;
+    } else {
+        rawCentroid = mesh->GetCenter();
+    }
     mesh->ComputeVertexNormals();
 
     mesh->Translate(-rawCentroid);
@@ -164,7 +180,7 @@ CADAsset CADPreprocessor::process(const std::string& path, size_t targetPointCou
 
     QFileInfo cadFi(QString::fromStdString(path));
     std::string cadDir = cadFi.dir().absolutePath().toStdString();
-    std::string cadName = cadFi.baseName().toStdString();
+    std::string cadName = cadFi.completeBaseName().toStdString();
 
     asset.hierarchy = CADHierarchy::buildFromMesh(metricMesh, cadName);
     std::string symPath = cadDir + "/" + cadName + "_symmetry.json";

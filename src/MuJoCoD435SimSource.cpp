@@ -53,6 +53,7 @@ struct MuJoCoD435SimSource::Impl {
     Eigen::Vector3d targetSize = Eigen::Vector3d(0.0435, 0.0646, 0.1483); // BBQ bottle bounding box (m)
     Eigen::Vector3d targetMinBound = Eigen::Vector3d(-0.02175, -0.0323, 0.0);
     Eigen::Vector3d targetMaxBound = Eigen::Vector3d(0.02175, 0.0323, 0.1483);
+    Eigen::Vector3d canonicalOriginOffset = Eigen::Vector3d(0.0, 0.0, 0.07415);
     std::string lastErrorMessage = "";
     Eigen::Matrix3d targetR = Eigen::Matrix3d::Identity();
     Eigen::Vector3d targetT = Eigen::Vector3d(0.0, 0.0, 0.0); // Offset trên mặt bàn (m)
@@ -907,9 +908,8 @@ void MuJoCoD435SimSource::getGroundTruthPose(Eigen::Matrix3d& outR, Eigen::Vecto
         }
     }
 
-    // Centroid hình học 3D thực tế của vật thể trong World frame:
-    Eigen::Vector3d cadCentroidOffset = 0.5 * (impl_->targetMinBound + impl_->targetMaxBound);
-    Eigen::Vector3d P_obj = P_body + R_wo * cadCentroidOffset;
+    // Gốc tọa độ Canonical (Area-Weighted Surface Centroid) của vật thể trong World frame:
+    Eigen::Vector3d P_obj = P_body + R_wo * impl_->canonicalOriginOffset;
 
     // Chuyển đổi tư thế sang hệ tọa độ quang học của Camera RealSense:
     outR = R_wc_opt.transpose() * R_wo;
@@ -918,13 +918,14 @@ void MuJoCoD435SimSource::getGroundTruthPose(Eigen::Matrix3d& outR, Eigen::Vecto
 
 void MuJoCoD435SimSource::getGroundTruthBBox3D(std::vector<Eigen::Vector3d>& corners) const {
     corners.clear();
-    double hx = impl_->targetSize.x() * 0.5;
-    double hy = impl_->targetSize.y() * 0.5;
-    double hz = impl_->targetSize.z() * 0.5;
+    const Eigen::Vector3d bmin = impl_->targetMinBound - impl_->canonicalOriginOffset;
+    const Eigen::Vector3d bmax = impl_->targetMaxBound - impl_->canonicalOriginOffset;
 
     Eigen::Vector3d localCorners[8] = {
-        {-hx, -hy, -hz}, {hx, -hy, -hz}, {hx, hy, -hz}, {-hx, hy, -hz},
-        {-hx, -hy,  hz}, {hx, -hy,  hz}, {hx, hy,  hz}, {-hx, hy,  hz}
+        {bmin.x(), bmin.y(), bmin.z()}, {bmax.x(), bmin.y(), bmin.z()},
+        {bmax.x(), bmax.y(), bmin.z()}, {bmin.x(), bmax.y(), bmin.z()},
+        {bmin.x(), bmin.y(), bmax.z()}, {bmax.x(), bmin.y(), bmax.z()},
+        {bmax.x(), bmax.y(), bmax.z()}, {bmin.x(), bmax.y(), bmax.z()}
     };
 
     Eigen::Matrix3d gtR;
@@ -1019,16 +1020,40 @@ bool MuJoCoD435SimSource::loadTargetMesh(const std::string& objPath,
         impl_->targetMaxBound = bmax.cwiseProduct(effScale);
         impl_->targetSize = impl_->targetMaxBound - impl_->targetMinBound;
 
+        const bool isCanonicalPly = (objPath.find("_mesh.ply") != std::string::npos);
+        Eigen::Vector3d surfCentroid = Eigen::Vector3d::Zero();
+        if (!isCanonicalPly) {
+            double totalArea = 0.0;
+            for (const auto& tri : mesh->triangles_) {
+                const Eigen::Vector3d& v0 = mesh->vertices_[tri(0)];
+                const Eigen::Vector3d& v1 = mesh->vertices_[tri(1)];
+                const Eigen::Vector3d& v2 = mesh->vertices_[tri(2)];
+                double area = 0.5 * ((v1 - v0).cross(v2 - v0)).norm();
+                if (std::isfinite(area) && area > 1e-12) {
+                    surfCentroid += area * ((v0 + v1 + v2) / 3.0);
+                    totalArea += area;
+                }
+            }
+            if (totalArea > 1e-12) {
+                surfCentroid /= totalArea;
+            } else {
+                surfCentroid = 0.5 * (bmin + bmax);
+            }
+        }
+        impl_->canonicalOriginOffset = surfCentroid.cwiseProduct(effScale);
+
         const bool tooManyFaces = (mesh->triangles_.size() > 95000);
         if (ext == ".ply" || isAsciiStl || tooManyFaces || !mesh->HasTriangles() || impl_->isFloorStandingLargeObject()) {
             const Eigen::Vector3d centerXY(0.5 * (bmin.x() + bmax.x()), 0.5 * (bmin.y() + bmax.y()), 0.0);
-            if (centerXY.norm() > 1e-6) {
+            if (!isCanonicalPly && centerXY.norm() > 1e-6) {
                 mesh->Translate(-centerXY);
                 bmin = mesh->GetMinBound();
                 bmax = mesh->GetMaxBound();
+                surfCentroid -= centerXY;
                 impl_->targetMinBound = bmin.cwiseProduct(effScale);
                 impl_->targetMaxBound = bmax.cwiseProduct(effScale);
                 impl_->targetSize = impl_->targetMaxBound - impl_->targetMinBound;
+                impl_->canonicalOriginOffset = surfCentroid.cwiseProduct(effScale);
             }
             if (!mesh->HasTriangles()) {
                 open3d::geometry::PointCloud pcd(mesh->vertices_);

@@ -1800,8 +1800,8 @@ void MainWindow::onActiveOnnxModelSwitched(const QString& onnxPath) {
         if (uxToolbar_) {
             uxToolbar_->resetDiagnostics();
         }
-        // Nếu MuJoCo 3D Interactive đang chạy, tự động chuyển đổi luôn vật thể CAD khớp với ONNX mới
-        if (activeMuJoCoSim_ && activeMuJoCoSim_->isInteractiveWindowOpen()) {
+        // Nếu MuJoCo 3D Sim đang chạy (cả offscreen tab lẫn interactive window), tự động chuyển đổi vật thể CAD khớp với ONNX mới
+        if (activeMuJoCoSim_ && (activeMuJoCoSim_->isOpen() || activeMuJoCoSim_->isInteractiveWindowOpen())) {
             QFileInfo onnxFi(onnxPath);
             if (onnxFi.isSymLink()) {
                 QFileInfo targetFi(onnxFi.symLinkTarget());
@@ -1828,9 +1828,9 @@ void MainWindow::onActiveOnnxModelSwitched(const QString& onnxPath) {
             if (cadRoot.exists() && !baseName.isEmpty()) {
                 for (const QString& sub : cadRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
                     if (sub.contains(baseName, Qt::CaseInsensitive) && sub != baseName) {
-                        cands << cadRoot.absoluteFilePath(sub + "/" + sub + ".obj")
-                              << cadRoot.absoluteFilePath(sub + "/" + sub + ".stl")
-                              << cadRoot.absoluteFilePath(sub + "/" + sub + "_mesh.ply");
+                        cands << cadRoot.absoluteFilePath(sub + "/" + sub + "_mesh.ply")
+                              << cadRoot.absoluteFilePath(sub + "/" + sub + ".obj")
+                              << cadRoot.absoluteFilePath(sub + "/" + sub + ".stl");
                     }
                 }
             }
