@@ -327,17 +327,25 @@ std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr,
     for (size_t i = 0; i < raw_masks.size(); ++i) {
         for (size_t j = i + 1; j < raw_masks.size(); ++j) {
             if (raw_masks[i].area + raw_masks[j].area > 0.45 * img_area) continue;
-            // Quick bbox check before pixel touch test
-            const cv::Rect expanded(raw_masks[i].bbox.x - 10, raw_masks[i].bbox.y - 10,
-                                    raw_masks[i].bbox.width + 20, raw_masks[i].bbox.height + 20);
-            if ((expanded & raw_masks[j].bbox).area() <= 0) continue;
+            // Quick bbox check before pixel touch test or vertical-band alignment (e.g. label splitting bottle)
+            const auto& bi = raw_masks[i].bbox;
+            const auto& bj = raw_masks[j].bbox;
+            const int x_ov = std::min(bi.x + bi.width, bj.x + bj.width) - std::max(bi.x, bj.x);
+            const int v_gap = std::max(bj.y - (bi.y + bi.height), bi.y - (bj.y + bj.height));
+            const bool vert_aligned = (x_ov >= static_cast<int>(0.45 * std::min(bi.width, bj.width)) && v_gap <= 28);
+            const cv::Rect expanded(bi.x - 10, bi.y - 10, bi.width + 20, bi.height + 20);
+            if (!vert_aligned && (expanded & bj).area() <= 0) continue;
 
-            cv::Mat inter;
-            cv::bitwise_and(dilated[i], raw_masks[j].mask_u8, inter);
-            if (cv::countNonZero(inter) >= 10) {
+            bool should_merge = vert_aligned;
+            if (!should_merge) {
+                cv::Mat inter;
+                cv::bitwise_and(dilated[i], raw_masks[j].mask_u8, inter);
+                should_merge = (cv::countNonZero(inter) >= 10);
+            }
+            if (should_merge) {
                 cv::Mat merged;
                 cv::bitwise_or(raw_masks[i].mask_u8, raw_masks[j].mask_u8, merged);
-                cands.push_back({std::move(merged), raw_masks[i].bbox | raw_masks[j].bbox});
+                cands.push_back({std::move(merged), bi | bj});
             }
         }
     }

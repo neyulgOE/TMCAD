@@ -205,7 +205,11 @@ void expandMaskWithColorConnectedness(cv::Mat& fg_mask_2d, const cv::Mat& rgb)
 
 RgbEdgeMaps buildRgbCannyDistanceTransform(const cv::Mat& rgb,
                                            const cv::Mat& fg_mask_2d = cv::Mat(),
-                                           bool is_observed_fg_mask = true)
+                                           bool is_observed_fg_mask = true,
+                                           const cv::Mat& depth_z16 = cv::Mat(),
+                                           double depth_scale = 0.001,
+                                           double z_fg_m = -1.0,
+                                           double cad_diag_m = 0.20)
 {
     RgbEdgeMaps maps;
     if (rgb.empty()) return maps;
@@ -217,6 +221,25 @@ RgbEdgeMaps buildRgbCannyDistanceTransform(const cv::Mat& rgb,
     }
     cv::GaussianBlur(gray, gray, cv::Size(3, 3), 0.8);
     cv::Canny(gray, edges, 45, 130);
+    // Background-Depth-Gated Canny: suppress background edges (e.g. monitor text behind foreground object)
+    // while preserving a 4px halo around depth == 0 holes for glossy/translucent object boundaries.
+    if (z_fg_m > 0.05 && !depth_z16.empty() && depth_z16.size() == edges.size() && depth_z16.type() == CV_16UC1) {
+        const double z_bg_thresh_m = z_fg_m + std::max(0.08, 0.45 * cad_diag_m);
+        const double safe_scale = (depth_scale > 1e-6) ? depth_scale : 0.001;
+        const uint16_t z_bg_raw = static_cast<uint16_t>(std::min(65534.0, std::round(z_bg_thresh_m / safe_scale)));
+        cv::Mat zero_near;
+        cv::dilate(depth_z16 == 0, zero_near, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9)));
+        for (int v = 0; v < edges.rows; ++v) {
+            uint8_t* erow = edges.ptr<uint8_t>(v);
+            const uint16_t* drow = depth_z16.ptr<uint16_t>(v);
+            const uint8_t* zrow = zero_near.ptr<uint8_t>(v);
+            for (int u = 0; u < edges.cols; ++u) {
+                if (erow[u] > 0 && drow[u] > z_bg_raw && zrow[u] == 0) {
+                    erow[u] = 0;
+                }
+            }
+        }
+    }
     if (!fg_mask_2d.empty() && fg_mask_2d.size() == edges.size() && fg_mask_2d.type() == CV_8UC1) {
         const int dil_sz = 19;
         cv::Mat mask_dil;
@@ -3398,7 +3421,60 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
             const int tot_v = valid_l + valid_r;
             const bool mostly_coplanar = (tot_v >= 20 &&
                                           static_cast<double>(coplanar_l + coplanar_r) / tot_v > 0.72);
-            if (both_coplanar || mostly_coplanar) {
+
+            // One-Sided Flat Panel Gate (e.g. monitor edge): 1 side strongly coplanar + paper-thin box depth spread
+            bool one_sided_flat_panel = false;
+            const double frac_l = (valid_l >= 14) ? (static_cast<double>(coplanar_l) / valid_l) : 0.0;
+            const double frac_r = (valid_r >= 14) ? (static_cast<double>(coplanar_r) / valid_r) : 0.0;
+            if (std::max(frac_l, frac_r) > 0.75) {
+                std::vector<double> box_zs;
+                box_zs.reserve(64);
+                const int u_in0 = std::max(0, bx0 + pad_in);
+                const int u_in1 = std::min(depth_z16.cols - 1, bx1 - pad_in);
+                for (int v = v0; v <= v1; v += 4) {
+                    const uint16_t* d_row = depth_z16.ptr<uint16_t>(v);
+                    for (int u = u_in0; u <= u_in1; u += 4) {
+                        if (d_row[u] > 0) box_zs.push_back(d_row[u] * d_scale);
+                    }
+                }
+                if (box_zs.size() >= 16) {
+                    std::sort(box_zs.begin(), box_zs.end());
+                    const double z_spread = box_zs[9 * box_zs.size() / 10] - box_zs[box_zs.size() / 10];
+                    const double min_cad_dim = std::max(0.02, std::min({_cad_max[0] - _cad_min[0],
+                                                                         _cad_max[1] - _cad_min[1],
+                                                                         _cad_max[2] - _cad_min[2]}));
+                    if (z_spread < 0.15 * min_cad_dim) {
+                        one_sided_flat_panel = true;
+                    }
+                }
+            }
+
+            // Axial End Detachment for horizontally elongated structures (e.g. arm across keyboard)
+            bool axial_end_attached = false;
+            if (bw > 1.35 * bh) {
+                const int v_full0 = std::clamp(static_cast<int>(std::round(pb.y)), 0, depth_z16.rows - 1);
+                const int v_full1 = std::clamp(static_cast<int>(std::round(pb.y)) + bh, 0, depth_z16.rows - 1);
+                int end_cop_l = 0, end_val_l = 0, end_cop_r = 0, end_val_r = 0;
+                for (int v = v_full0; v <= v_full1; v += 2) {
+                    const uint16_t* d_row = depth_z16.ptr<uint16_t>(v);
+                    for (int u = std::max(0, bx0 - pad_out); u < std::max(0, bx0); ++u) {
+                        if (d_row[u] == 0) continue;
+                        ++end_val_l;
+                        if (std::abs(d_row[u] * d_scale - pose.t[2]) < coplanar_tol) ++end_cop_l;
+                    }
+                    for (int u = std::min(depth_z16.cols - 1, bx1); u < std::min(depth_z16.cols - 1, bx1 + pad_out); ++u) {
+                        if (d_row[u] == 0) continue;
+                        ++end_val_r;
+                        if (std::abs(d_row[u] * d_scale - pose.t[2]) < coplanar_tol) ++end_cop_r;
+                    }
+                }
+                if ((end_val_l >= 14 && static_cast<double>(end_cop_l) / end_val_l > 0.65) ||
+                    (end_val_r >= 14 && static_cast<double>(end_cop_r) / end_val_r > 0.65)) {
+                    axial_end_attached = true;
+                }
+            }
+
+            if (both_coplanar || mostly_coplanar || one_sided_flat_panel || axial_end_attached) {
                 pose.valid = false;
                 pose.confidence = std::min(pose.confidence, 0.30f);
                 return false;
@@ -3835,7 +3911,8 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
             : std::hypot(pb.width, pb.height);
         const int ksize = std::clamp(static_cast<int>(std::round(bbox_diag_px * 0.10f)) | 1, 9, 35);
         cv::dilate(proj_mask, proj_mask, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(ksize, ksize)));
-        const RgbEdgeMaps dt_canny = buildRgbCannyDistanceTransform(rgb, proj_mask, false);
+        const RgbEdgeMaps dt_canny = buildRgbCannyDistanceTransform(
+            rgb, proj_mask, false, depth_z16, scale, _track_pose.t[2], diag);
         if (!dt_canny.empty()) {
             sil_cost = refineTranslationOnRgbSilhouette(
                 cand.R, cand.t, cand.R * cad_mid + cand.t, _cad_min, _cad_max,
@@ -3961,7 +4038,22 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
     }
 
     double ai_ms = 0.0;
-    const RgbEdgeMaps dt_canny = (!_is_floor_standing && !rgb.empty()) ? buildRgbCannyDistanceTransform(rgb, fg_mask_2d) : RgbEdgeMaps{};
+    double z_fg_est = -1.0;
+    if (seg_res.dense_object_points.size() >= 40) {
+        std::vector<double> zs_fg;
+        zs_fg.reserve(seg_res.dense_object_points.size());
+        for (const auto& p : seg_res.dense_object_points) {
+            if (p[2] > 0.05f) zs_fg.push_back(p[2]);
+        }
+        if (zs_fg.size() >= 20) {
+            std::nth_element(zs_fg.begin(), zs_fg.begin() + zs_fg.size() / 2, zs_fg.end());
+            z_fg_est = zs_fg[zs_fg.size() / 2];
+        }
+    }
+    const double d_scale_est = (intr.depth_scale > 0.0) ? intr.depth_scale : 0.001;
+    const RgbEdgeMaps dt_canny = (!_is_floor_standing && !rgb.empty())
+        ? buildRgbCannyDistanceTransform(rgb, fg_mask_2d, true, depth_z16, d_scale_est, z_fg_est, _real_bounding_diag_m)
+        : RgbEdgeMaps{};
     const double sil_fx = (intr.fx > 100.0) ? intr.fx : 600.0;
     const double sil_fy = (intr.fy > 100.0) ? intr.fy : sil_fx;
     const double sil_cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * depth_z16.cols);
