@@ -211,6 +211,77 @@ int SyntheticDatasetGenerator::generate(const CADAsset& cadAsset, const DatasetG
             continue;
         }
 
+        // Sim-to-Real D435iF Domain Randomization: glossy specular hole dropout & edge flying pixels
+        if (cfg.useRealisticNoiseModel && frame.depth && frame.depth->bytes_per_channel_ == 2 &&
+            frame.depth->num_of_channels_ == 1) {
+            const int dw = frame.depth->width_;
+            const int dh = frame.depth->height_;
+            uint16_t* dptr = reinterpret_cast<uint16_t*>(frame.depth->data_.data());
+            const uint16_t max_obj_mm = static_cast<uint16_t>(
+                std::min(60000.0, (cfg.addBackgroundPlane ? cfg.backgroundPlaneDistanceMeters - 0.15 : cfg.maxRangeMeters) * 1000.0));
+
+            int umin = dw, umax = -1, vmin = dh, vmax = -1;
+            for (int v = 0; v < dh; ++v) {
+                for (int u = 0; u < dw; ++u) {
+                    const uint16_t d = dptr[v * dw + u];
+                    if (d > 150 && d < max_obj_mm) {
+                        umin = std::min(umin, u);
+                        umax = std::max(umax, u);
+                        vmin = std::min(vmin, v);
+                        vmax = std::max(vmax, v);
+                    }
+                }
+            }
+            if (umax - umin >= 16 && vmax - vmin >= 16) {
+                std::uniform_real_distribution<double> u01(0.0, 1.0);
+                if (u01(rng) < cfg.glossyHoleDropoutProb) {
+                    std::uniform_int_distribution<int> n_blobs_dist(1, 3);
+                    const int n_blobs = n_blobs_dist(rng);
+                    const int bw = umax - umin + 1;
+                    const int bh = vmax - vmin + 1;
+                    for (int b = 0; b < n_blobs; ++b) {
+                        const double cu = umin + (0.20 + 0.60 * u01(rng)) * bw;
+                        const double cv = vmin + (0.20 + 0.60 * u01(rng)) * bh;
+                        const double ru = std::max(4.0, (0.16 + 0.24 * u01(rng)) * bw);
+                        const double rv = std::max(4.0, (0.16 + 0.24 * u01(rng)) * bh);
+                        const int v0 = std::max(vmin, static_cast<int>(std::floor(cv - rv)));
+                        const int v1 = std::min(vmax, static_cast<int>(std::ceil(cv + rv)));
+                        const int u0 = std::max(umin, static_cast<int>(std::floor(cu - ru)));
+                        const int u1 = std::min(umax, static_cast<int>(std::ceil(cu + ru)));
+                        for (int v = v0; v <= v1; ++v) {
+                            for (int u = u0; u <= u1; ++u) {
+                                const double du = (u - cu) / ru;
+                                const double dv = (v - cv) / rv;
+                                if (du * du + dv * dv <= 1.0) {
+                                    dptr[v * dw + u] = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (u01(rng) < cfg.edgeFlyingPixelProb) {
+                    std::uniform_int_distribution<int> jit_dist(-35, 35);
+                    for (int v = std::max(1, vmin); v < std::min(dh - 1, vmax); ++v) {
+                        for (int u = std::max(1, umin); u < std::min(dw - 1, umax); ++u) {
+                            const uint16_t dc = dptr[v * dw + u];
+                            if (dc == 0 || dc >= max_obj_mm) continue;
+                            const uint16_t dl = dptr[v * dw + u - 1];
+                            const uint16_t dr = dptr[v * dw + u + 1];
+                            if (std::abs(static_cast<int>(dc) - static_cast<int>(dl)) > 45 ||
+                                std::abs(static_cast<int>(dc) - static_cast<int>(dr)) > 45) {
+                                if (u01(rng) < 0.45) {
+                                    dptr[v * dw + u] = 0;
+                                } else {
+                                    const int nd = std::max(150, static_cast<int>(dc) + jit_dist(rng));
+                                    dptr[v * dw + u] = static_cast<uint16_t>(nd);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         fs::create_directories(sampleDir, ec);
         if (ec) {
             std::cerr << "SyntheticDatasetGenerator: could not create " << sampleDir.string()

@@ -153,7 +153,11 @@ void CADMaskMatcher::clearTemplates() {
     _templates_ready = false;
 }
 
-std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr, int top_k) const {
+std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr,
+                                                        const cv::Mat& depth_z16,
+                                                        const CameraIntrinsics& intr,
+                                                        double cad_diag_m,
+                                                        int top_k) const {
     std::vector<MatchedMaskCandidate> results;
     if (!isReady() || rgb_bgr.empty() || rgb_bgr.channels() != 3) return results;
 
@@ -321,25 +325,105 @@ std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr, 
         }
     }
 
-    // 3. Batch-encode candidates with DINOv2-vits14 ONNX
-    const int n_cand = static_cast<int>(cands.size());
+    // 2b. Physical 2D/3D scale consistency filter + fast 64x64 Silhouette pre-filter before DINOv2
+    const bool has_depth_scale = (!depth_z16.empty() && depth_z16.type() == CV_16UC1 &&
+                                  depth_z16.cols == img_w && depth_z16.rows == img_h &&
+                                  cad_diag_m > 0.02);
+    const double fx = (intr.fx > 100.0) ? intr.fx : 600.0;
+    const double fy = (intr.fy > 100.0) ? intr.fy : fx;
+    const double d_scale = (intr.depth_scale > 0.0) ? intr.depth_scale : 0.001;
+
     const int m_sz = static_cast<int>(_mask_size);
+    const int n_tpl = static_cast<int>(_templates.size());
+    const int m_area = m_sz * m_sz;
+
+    struct PreFilteredCand {
+        size_t cand_idx;
+        float max_sil_iou;
+        std::vector<uint8_t> mask_64;
+    };
+    std::vector<PreFilteredCand> kept_cands;
+    kept_cands.reserve(cands.size());
+
+    for (size_t idx = 0; idx < cands.size(); ++idx) {
+        const cv::Rect& b = cands[idx].bbox;
+        if (has_depth_scale) {
+            std::vector<double> zs;
+            zs.reserve(64);
+            const int sv = std::max(1, b.height / 10);
+            const int su = std::max(1, b.width / 10);
+            for (int v = b.y; v < b.y + b.height; v += sv) {
+                const uint16_t* drow = depth_z16.ptr<uint16_t>(v);
+                const uint8_t* mrow = cands[idx].mask_u8.ptr<uint8_t>(v);
+                for (int u = b.x; u < b.x + b.width; u += su) {
+                    if (mrow[u] > 127 && drow[u] > 150) {
+                        zs.push_back(static_cast<double>(drow[u]) * d_scale);
+                    }
+                }
+            }
+            if (zs.size() >= 10) {
+                std::sort(zs.begin(), zs.end());
+                const double z_med = zs[zs.size() / 2];
+                const double est_diag = z_med * std::hypot(static_cast<double>(b.width) / fx,
+                                                           static_cast<double>(b.height) / fy);
+                if (est_diag < 0.42 * cad_diag_m || est_diag > 2.15 * cad_diag_m) {
+                    continue;
+                }
+            }
+        }
+
+        cv::Mat m224 = letterbox224(cands[idx].mask_u8(b), 0, cv::INTER_NEAREST);
+        cv::Mat m64;
+        cv::resize(m224, m64, cv::Size(m_sz, m_sz), 0.0, 0.0, cv::INTER_NEAREST);
+        std::vector<uint8_t> cm64(m_area, 0);
+        for (int y = 0; y < m_sz; ++y) {
+            const uint8_t* mrow = m64.ptr<uint8_t>(y);
+            for (int x = 0; x < m_sz; ++x) {
+                cm64[y * m_sz + x] = (mrow[x] > 127) ? 1 : 0;
+            }
+        }
+
+        float max_iou = 0.0f;
+        for (int t = 0; t < n_tpl; ++t) {
+            int inter_cnt = 0, union_cnt = 0;
+            const auto& tm = _templates[t].mask_64;
+            for (int p = 0; p < m_area; ++p) {
+                const int a = cm64[p], bval = tm[p];
+                inter_cnt += (a & bval);
+                union_cnt += (a | bval);
+            }
+            const float iou = (union_cnt > 0) ? (static_cast<float>(inter_cnt) / union_cnt) : 0.0f;
+            if (iou > max_iou) max_iou = iou;
+        }
+        if (max_iou >= 0.35f) {
+            kept_cands.push_back({idx, max_iou, std::move(cm64)});
+        }
+    }
+
+    if (kept_cands.empty()) return results;
+    std::sort(kept_cands.begin(), kept_cands.end(), [](const PreFilteredCand& a, const PreFilteredCand& b) {
+        return a.max_sil_iou > b.max_sil_iou;
+    });
+    if (kept_cands.size() > 24) kept_cands.resize(24);
+
+    // 3. Batch-encode only pre-filtered candidates with DINOv2-vits14 ONNX
+    const int n_cand = static_cast<int>(kept_cands.size());
     std::vector<float> dino_in(static_cast<size_t>(n_cand) * 3 * 224 * 224);
-    std::vector<std::vector<uint8_t>> cand_masks_64(n_cand, std::vector<uint8_t>(m_sz * m_sz, 0));
 
     const float mean_rgb[3] = {0.485f, 0.456f, 0.406f};
     const float std_rgb[3] = {0.229f, 0.224f, 0.225f};
     const size_t plane224 = 224 * 224;
 
-    for (int idx = 0; idx < n_cand; ++idx) {
-        const cv::Rect& b = cands[idx].bbox;
+    for (int k = 0; k < n_cand; ++k) {
+        const auto& cm = cands[kept_cands[k].cand_idx];
+        const cv::Rect& b = cm.bbox;
         cv::Mat masked_crop(b.height, b.width, CV_8UC3, cv::Scalar(128, 128, 128));
-        rgb_bgr(b).copyTo(masked_crop, cands[idx].mask_u8(b));
+        rgb_bgr(b).copyTo(masked_crop, cm.mask_u8(b));
         cv::Mat c224 = letterbox224(masked_crop, 128, cv::INTER_AREA);
         cv::Mat c224_rgb;
         cv::cvtColor(c224, c224_rgb, cv::COLOR_BGR2RGB);
 
-        float* dst = dino_in.data() + static_cast<size_t>(idx) * 3 * plane224;
+        float* dst = dino_in.data() + static_cast<size_t>(k) * 3 * plane224;
         for (int y = 0; y < 224; ++y) {
             const cv::Vec3b* row = c224_rgb.ptr<cv::Vec3b>(y);
             for (int x = 0; x < 224; ++x) {
@@ -347,16 +431,6 @@ std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr, 
                 dst[p] = (static_cast<float>(row[x][0]) / 255.0f - mean_rgb[0]) / std_rgb[0];
                 dst[plane224 + p] = (static_cast<float>(row[x][1]) / 255.0f - mean_rgb[1]) / std_rgb[1];
                 dst[2 * plane224 + p] = (static_cast<float>(row[x][2]) / 255.0f - mean_rgb[2]) / std_rgb[2];
-            }
-        }
-
-        cv::Mat m224 = letterbox224(cands[idx].mask_u8(b), 0, cv::INTER_NEAREST);
-        cv::Mat m64;
-        cv::resize(m224, m64, cv::Size(m_sz, m_sz), 0.0, 0.0, cv::INTER_NEAREST);
-        for (int y = 0; y < m_sz; ++y) {
-            const uint8_t* mrow = m64.ptr<uint8_t>(y);
-            for (int x = 0; x < m_sz; ++x) {
-                cand_masks_64[idx][y * m_sz + x] = (mrow[x] > 127) ? 1 : 0;
             }
         }
     }
@@ -373,12 +447,10 @@ std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr, 
     // 4. Score against templates: 0.72 * dino_cosine + 0.28 * mask_iou_64
     std::vector<MatchedMaskCandidate> scored;
     scored.reserve(n_cand);
-    const int n_tpl = static_cast<int>(_templates.size());
     const int fdim = static_cast<int>(_feat_dim);
-    const int m_area = m_sz * m_sz;
 
-    for (int idx = 0; idx < n_cand; ++idx) {
-        const float* f = emb_ptr + static_cast<size_t>(idx) * fdim;
+    for (int k = 0; k < n_cand; ++k) {
+        const float* f = emb_ptr + static_cast<size_t>(k) * fdim;
         float best_cos = -1.0f;
         int best_t = -1;
         for (int t = 0; t < n_tpl; ++t) {
@@ -393,19 +465,20 @@ std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr, 
         if (best_t < 0) continue;
 
         int inter_cnt = 0, union_cnt = 0;
-        const auto& cm = cand_masks_64[idx];
+        const auto& cm = kept_cands[k].mask_64;
         const auto& tm = _templates[best_t].mask_64;
         for (int p = 0; p < m_area; ++p) {
-            const int a = cm[p], b = tm[p];
-            inter_cnt += (a & b);
-            union_cnt += (a | b);
+            const int a = cm[p], bval = tm[p];
+            inter_cnt += (a & bval);
+            union_cnt += (a | bval);
         }
         const float iou = (union_cnt > 0) ? (static_cast<float>(inter_cnt) / union_cnt) : 0.0f;
         const float total_score = 0.72f * best_cos + 0.28f * iou;
 
+        const auto& orig_c = cands[kept_cands[k].cand_idx];
         MatchedMaskCandidate mc;
-        mc.mask_u8 = cands[idx].mask_u8;
-        mc.bbox = cands[idx].bbox;
+        mc.mask_u8 = orig_c.mask_u8;
+        mc.bbox = orig_c.bbox;
         mc.R_cw_prior = _templates[best_t].R_cw;
         mc.score = total_score;
         mc.dino_sim = best_cos;

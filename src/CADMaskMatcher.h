@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "CameraIntrinsics.h"
 
 namespace tmcad {
 
@@ -31,7 +32,11 @@ public:
     bool isBackbonesReady() const { return _backbones_ready; }
     bool isReady() const { return _backbones_ready && _templates_ready; }
 
-    std::vector<MatchedMaskCandidate> match(const cv::Mat& rgb_bgr, int top_k = 3) const;
+    std::vector<MatchedMaskCandidate> match(const cv::Mat& rgb_bgr,
+                                            const cv::Mat& depth_z16 = cv::Mat(),
+                                            const CameraIntrinsics& intr = CameraIntrinsics{},
+                                            double cad_diag_m = 0.0,
+                                            int top_k = 3) const;
 
 private:
     struct TemplateEntry {

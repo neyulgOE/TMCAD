@@ -62,6 +62,10 @@ struct DatasetGenConfig {
     double backgroundPlaneDistanceMeters = 3.0;
     double backgroundPlaneSizeMeters = 6.0;
 
+    // Sim-to-Real D435iF Domain Randomization (glossy specular holes & edge flying pixels)
+    double glossyHoleDropoutProb = 0.55;
+    double edgeFlyingPixelProb = 0.35;
+
     CameraIntrinsics intrinsics;  // default-constructed = invalid(); caller MUST set this
 
     // Phase 3's contrastive training needs these; a Phase-5-only run that

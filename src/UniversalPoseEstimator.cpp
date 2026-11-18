@@ -142,13 +142,6 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
     const int h = edge_maps.dt_vert.rows;
 
     constexpr int kBins = 24;
-    int row_min_u[kBins], row_max_u[kBins], row_v[kBins];
-    for (int b = 0; b < kBins; ++b) {
-        row_min_u[b] = 100000;
-        row_max_u[b] = -100000;
-        row_v[b] = -1;
-    }
-
     int min_v = 100000, max_v = -100000;
     int min_u_all = 100000, max_u_all = -100000;
     const size_t step = std::max<size_t>(1, mesh_pts.size() / 600);
@@ -171,7 +164,6 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
 
     if (proj_pts.size() < 20 || max_v - min_v < 12 || max_u_all - min_u_all < 10) return 50.0;
 
-    // Tính trục chính 2D của hình chiếu để xoay 24 bin theo góc nghiêng thực tế của vật thể
     double mu_u = 0.0, mu_v = 0.0;
     for (const auto& pt : proj_pts) {
         mu_u += pt.x;
@@ -256,7 +248,6 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
         if (row_lu[b] < 0 || row_ru[b] < 0) continue;
         if (first_b < 0) first_b = b;
         last_b = b;
-        // Bỏ qua 15% đáy dưới cùng (b >= kBins - 3) để giảm nhiễu từ ngón tay/chân kẹp trên bàn
         if (b >= kBins - 3) continue;
         sum_left += sampleSideDt(row_lu[b], row_lv[b]);
         sum_right += sampleSideDt(row_ru[b], row_rv[b]);
@@ -3560,7 +3551,7 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
 
     cv::Mat fg_mask_2d;
     if (_mask_matcher.isReady() && !rgb.empty() && roi_hint.empty() && !_is_floor_standing) {
-        auto mask_cands = _mask_matcher.match(rgb, 2);
+        auto mask_cands = _mask_matcher.match(rgb, depth_z16, intr, _real_bounding_diag_m, 2);
         if (!mask_cands.empty() && mask_cands[0].score >= 0.45f) {
             fg_mask_2d = mask_cands[0].mask_u8;
         }
