@@ -13,6 +13,8 @@ struct MatchedMaskCandidate {
     cv::Mat mask_u8;          // Full-resolution binary mask (CV_8UC1, 0 or 255)
     cv::Rect bbox;            // Tight 2D bounding box in image coordinates
     cv::Matx33d R_cw_prior{cv::Matx33d::eye()};
+    double dtheta_pca_rad{0.0};
+    bool pca_elongated{false};
     float score{0.0f};
     float dino_sim{0.0f};
     float sil_iou{0.0f};

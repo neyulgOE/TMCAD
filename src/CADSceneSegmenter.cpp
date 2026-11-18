@@ -1,4 +1,5 @@
 #include "CADSceneSegmenter.h"
+#include <opencv2/imgproc.hpp>
 #include <fstream>
 #include <sstream>
 #include <cmath>
@@ -505,6 +506,35 @@ void CADSceneSegmenter::extractDepthPoints(const cv::Mat& depth_z16,
             float x = (static_cast<float>(u) - cx) * z / fx;
             float y = (static_cast<float>(v) - cy) * z / fy;
             out_pts.emplace_back(x, y, z);
+        }
+    }
+
+    // Front-Surface Depth Peeling inside fg_mask_2d: strip background wall/table seen through depth holes
+    if (use_mask && !out_pts.empty()) {
+        cv::Mat core_mask;
+        cv::erode(fg_mask_2d, core_mask, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
+        if (cv::countNonZero(core_mask) < 16) core_mask = fg_mask_2d;
+
+        std::vector<float> core_zs;
+        core_zs.reserve(out_pts.size());
+        for (int v = y0; v < y1; v += stride) {
+            const uint16_t* row_ptr = depth_z16.ptr<uint16_t>(v);
+            const uint8_t* c_ptr = core_mask.ptr<uint8_t>(v);
+            for (int u = x0; u < x1; u += stride) {
+                if (c_ptr[u] == 0 || row_ptr[u] == 0) continue;
+                const float z = static_cast<float>(row_ptr[u]) * scale;
+                if (z >= _min_depth_m && z <= _max_depth_m) core_zs.push_back(z);
+            }
+        }
+        if (!core_zs.empty()) {
+            const size_t p15_idx = (core_zs.size() * 15) / 100;
+            std::nth_element(core_zs.begin(), core_zs.begin() + p15_idx, core_zs.end());
+            const float z_p15 = core_zs[p15_idx];
+            const float z_min_keep = std::max(_min_depth_m, z_p15 - 0.35f * _bounding_diag_m);
+            const float z_max_keep = z_p15 + std::max(0.06f, 0.75f * _bounding_diag_m);
+            out_pts.erase(std::remove_if(out_pts.begin(), out_pts.end(), [&](const cv::Vec3f& p) {
+                return p[2] < z_min_keep || p[2] > z_max_keep;
+            }), out_pts.end());
         }
     }
 }

@@ -1,5 +1,6 @@
 #include "UniversalPoseEstimator.h"
 #include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 #include <filesystem>
 #include <iostream>
 #include <fstream>
@@ -3452,6 +3453,7 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
     if (!_is_floor_standing && !rgb.empty()) {
         cv::Mat proj_mask = cv::Mat::zeros(rgb.rows, rgb.cols, CV_8UC1);
         const size_t m_step = std::max<size_t>(1, _mesh_pts.size() / 1200);
+        int min_pu = rgb.cols, max_pu = -1, min_pv = rgb.rows, max_pv = -1;
         for (size_t i = 0; i < _mesh_pts.size(); i += m_step) {
             const cv::Vec3d pc = cand.R * cv::Vec3d(_mesh_pts[i]) + cand.t;
             if (pc[2] <= 0.10) continue;
@@ -3459,9 +3461,17 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
             const int v = static_cast<int>(std::round(fy * pc[1] / pc[2] + cy));
             if (u >= 0 && u < rgb.cols && v >= 0 && v < rgb.rows) {
                 proj_mask.at<uint8_t>(v, u) = 255;
+                min_pu = std::min(min_pu, u);
+                max_pu = std::max(max_pu, u);
+                min_pv = std::min(min_pv, v);
+                max_pv = std::max(max_pv, v);
             }
         }
-        cv::dilate(proj_mask, proj_mask, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(19, 19)));
+        const float bbox_diag_px = (max_pu > min_pu && max_pv > min_pv)
+            ? std::hypot(static_cast<float>(max_pu - min_pu), static_cast<float>(max_pv - min_pv))
+            : std::hypot(pb.width, pb.height);
+        const int ksize = std::clamp(static_cast<int>(std::round(bbox_diag_px * 0.10f)) | 1, 9, 35);
+        cv::dilate(proj_mask, proj_mask, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(ksize, ksize)));
         const RgbEdgeMaps dt_canny = buildRgbCannyDistanceTransform(rgb, proj_mask);
         if (!dt_canny.empty()) {
             sil_cost = refineTranslationOnRgbSilhouette(
@@ -3501,6 +3511,14 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
         }
     }
     if (!DetectionAcceptancePolicy::isAccepted(cand, _real_bounding_diag_m, _is_floor_standing)) {
+        return false;
+    }
+
+    // Tracking Sanity Watchdog: thoát TRACKING -> SEARCHING nếu chất lượng suy giảm 3 frame liên tiếp
+    const bool weak_frame = (sil_cost > 6.8) || (cand.inliers_count < 24 && cand.confidence < 0.58f);
+    _track_weak_frames = weak_frame ? (_track_weak_frames + 1) : 0;
+    if (_track_weak_frames >= 3) {
+        resetTemporalTrack();
         return false;
     }
 
@@ -3550,8 +3568,9 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
     }
 
     cv::Mat fg_mask_2d;
+    std::vector<MatchedMaskCandidate> mask_cands;
     if (_mask_matcher.isReady() && !rgb.empty() && roi_hint.empty() && !_is_floor_standing) {
-        auto mask_cands = _mask_matcher.match(rgb, depth_z16, intr, _real_bounding_diag_m, 2);
+        mask_cands = _mask_matcher.match(rgb, depth_z16, intr, _real_bounding_diag_m, 2);
         if (!mask_cands.empty() && mask_cands[0].score >= 0.45f) {
             fg_mask_2d = mask_cands[0].mask_u8;
         }
@@ -3760,6 +3779,60 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
             if (rank > best_hole_rank) {
                 best_hole_rank = rank;
                 pose = std::move(seed);
+            }
+        }
+    }
+
+    // Ưu tiên 2: Nếu cụm tiền cảnh trong fg_mask_2d thiếu điểm Depth (< 100 điểm) hoặc chưa có pose hợp lệ,
+    // dùng R_cw_prior + bù góc xoay liên tục 2D PCA quanh tia nhìn (dtheta và dtheta + pi) làm giả thuyết bổ sung.
+    if (!pose.valid && !_is_floor_standing && !mask_cands.empty() && mask_cands[0].score >= 0.45f &&
+        !dt_canny.empty() && !seg_res.dense_object_points.empty() && seg_res.dense_object_points.size() < 100) {
+        cv::Vec3d c_fg(0.0, 0.0, 0.0);
+        for (const auto& p : seg_res.dense_object_points) c_fg += cv::Vec3d(p);
+        c_fg *= (1.0 / static_cast<double>(seg_res.dense_object_points.size()));
+        const cv::Vec3d v_ray = (cv::norm(c_fg) > 0.10) ? (c_fg * (1.0 / cv::norm(c_fg))) : cv::Vec3d(0.0, 0.0, 1.0);
+        const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
+        const double max_ws_z = std::clamp(_real_bounding_diag_m * 3.8 + 0.15, 0.95, 2.50);
+
+        std::vector<double> dthetas = {mask_cands[0].dtheta_pca_rad};
+        if (mask_cands[0].pca_elongated) dthetas.push_back(mask_cands[0].dtheta_pca_rad + kPi);
+        double best_pr_rank = -1e9;
+        for (double dth : dthetas) {
+            cv::Mat rvec_mat = (cv::Mat_<double>(3, 1) << v_ray[0] * dth, v_ray[1] * dth, v_ray[2] * dth);
+            cv::Mat R_roll_mat;
+            cv::Rodrigues(rvec_mat, R_roll_mat);
+            cv::Matx33d R_roll;
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c)
+                    R_roll(r, c) = R_roll_mat.at<double>(r, c);
+
+            ObjectPose pr;
+            pr.valid = true;
+            pr.model_name = _model_name;
+            pr.method = "mask_pca_prior";
+            pr.R = R_roll * mask_cands[0].R_cw_prior;
+            pr.t = c_fg - pr.R * cad_mid;
+            const double sil_c = refineTranslationOnRgbSilhouette(
+                pr.R, pr.t, c_fg, _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
+                _mesh_pts, _mesh_normals, dt_canny, depth_z16, sil_fx, sil_fy, sil_cx, sil_cy, max_ws_z);
+            if (!isInTargetWorkspace(pr.t)) continue;
+            pr.t_glass = pr.t;
+            const cv::Vec3d eu = rotationMatrixToEulerDeg(pr.R, false);
+            pr.roll_deg = eu[0];
+            pr.pitch_deg = eu[1];
+            pr.yaw_deg = eu[2];
+            pr.bbox_2d = projectCadBoundingBox(pr.R, pr.t, intr, depth_z16.cols, depth_z16.rows, &pr.corners_2d);
+            rescorePoseUnclipped(pr, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false);
+            if (sil_c <= 5.5) {
+                pr.rgb_sil_strong = true;
+                pr.confidence = std::clamp(pr.confidence + 0.16f, 0.05f, 0.99f);
+            }
+            if (DetectionAcceptancePolicy::isAccepted(pr, _real_bounding_diag_m, _is_floor_standing)) {
+                const double rnk = static_cast<double>(pr.confidence) - 0.04 * sil_c;
+                if (rnk > best_pr_rank) {
+                    best_pr_rank = rnk;
+                    pose = std::move(pr);
+                }
             }
         }
     }

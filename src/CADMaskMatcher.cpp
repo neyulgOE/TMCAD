@@ -53,6 +53,23 @@ cv::Mat letterbox224(const cv::Mat& src, int bg_val, int interp) {
     return out;
 }
 
+double computeMaskPCATheta(const cv::Mat& bin_mask, bool& is_elongated) {
+    cv::Moments m = cv::moments(bin_mask, true);
+    if (m.m00 < 1e-3) {
+        is_elongated = false;
+        return 0.0;
+    }
+    const double mu20 = m.mu20 / m.m00;
+    const double mu02 = m.mu02 / m.m00;
+    const double mu11 = m.mu11 / m.m00;
+    const double diff = mu20 - mu02;
+    const double delta = std::sqrt(4.0 * mu11 * mu11 + diff * diff);
+    const double lambda1 = 0.5 * (mu20 + mu02 + delta);
+    const double lambda2 = std::max(1e-6, 0.5 * (mu20 + mu02 - delta));
+    is_elongated = (lambda1 / lambda2 >= 1.35);
+    return 0.5 * std::atan2(2.0 * mu11, diff);
+}
+
 } // namespace
 
 bool CADMaskMatcher::initBackbones(const std::string& fastsam_onnx_path,
@@ -404,7 +421,8 @@ std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr,
     std::sort(kept_cands.begin(), kept_cands.end(), [](const PreFilteredCand& a, const PreFilteredCand& b) {
         return a.max_sil_iou > b.max_sil_iou;
     });
-    if (kept_cands.size() > 24) kept_cands.resize(24);
+    constexpr size_t kMaxDinoCands = 14;
+    if (kept_cands.size() > kMaxDinoCands) kept_cands.resize(kMaxDinoCands);
 
     // 3. Batch-encode only pre-filtered candidates with DINOv2-vits14 ONNX
     const int n_cand = static_cast<int>(kept_cands.size());
@@ -476,10 +494,18 @@ std::vector<MatchedMaskCandidate> CADMaskMatcher::match(const cv::Mat& rgb_bgr,
         const float total_score = 0.72f * best_cos + 0.28f * iou;
 
         const auto& orig_c = cands[kept_cands[k].cand_idx];
+        cv::Mat cm_mat(m_sz, m_sz, CV_8UC1, const_cast<uint8_t*>(cm.data()));
+        cv::Mat tm_mat(m_sz, m_sz, CV_8UC1, const_cast<uint8_t*>(tm.data()));
+        bool obs_el = false, tpl_el = false;
+        const double theta_obs = computeMaskPCATheta(cm_mat, obs_el);
+        const double theta_tpl = computeMaskPCATheta(tm_mat, tpl_el);
+
         MatchedMaskCandidate mc;
         mc.mask_u8 = orig_c.mask_u8;
         mc.bbox = orig_c.bbox;
         mc.R_cw_prior = _templates[best_t].R_cw;
+        mc.dtheta_pca_rad = (obs_el && tpl_el) ? (theta_obs - theta_tpl) : 0.0;
+        mc.pca_elongated = (obs_el && tpl_el);
         mc.score = total_score;
         mc.dino_sim = best_cos;
         mc.sil_iou = iou;

@@ -185,6 +185,7 @@ public:
         _track_active = false;
         _track_confirm_streak = 0;
         _track_miss_streak = 0;
+        _track_weak_frames = 0;
         _track_has_floor = false;
         _track_pose = ObjectPose{};
         _track_prev_global = ObjectPose{};
@@ -287,6 +288,7 @@ private:
     bool _track_active{false};
     int _track_confirm_streak{0};
     int _track_miss_streak{0};
+    int _track_weak_frames{0};
     bool _track_has_floor{false};
     cv::Vec4d _track_floor_plane{0.0, -1.0, 0.0, 0.0};
     ObjectPose _track_pose;
