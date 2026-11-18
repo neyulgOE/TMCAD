@@ -88,11 +88,13 @@ void computeVisibleCadSubset(const cv::Matx33d& R,
 }
 
 struct RgbEdgeMaps {
-    cv::Mat dt_vert;
-    cv::Mat dt_horiz;
+    cv::Mat dt_all;
+    cv::Mat grad_x;
+    cv::Mat grad_y;
+    cv::Mat grad_mag;
     cv::Mat dt_outside_mask;
     std::vector<cv::Point> fg_sample_pts;
-    bool empty() const { return dt_vert.empty() || dt_horiz.empty(); }
+    bool empty() const { return dt_all.empty() || grad_x.empty() || grad_y.empty(); }
 };
 
 void expandMaskWithColorConnectedness(cv::Mat& fg_mask_2d, const cv::Mat& rgb)
@@ -239,24 +241,212 @@ RgbEdgeMaps buildRgbCannyDistanceTransform(const cv::Mat& rgb,
             }
         }
     }
-    cv::Sobel(gray, gx, CV_32F, 1, 0, 3);
-    cv::Sobel(gray, gy, CV_32F, 0, 1, 3);
+    cv::Sobel(gray, maps.grad_x, CV_32F, 1, 0, 3);
+    cv::Sobel(gray, maps.grad_y, CV_32F, 0, 1, 3);
+    cv::magnitude(maps.grad_x, maps.grad_y, maps.grad_mag);
 
-    cv::Mat abs_gx = cv::abs(gx);
-    cv::Mat abs_gy = cv::abs(gy);
-    cv::Mat vert_mask = (abs_gx > 1.15f * abs_gy);
-    cv::Mat horiz_mask = (abs_gy > 1.15f * abs_gx);
-
-    cv::Mat vert_edges, horiz_edges;
-    cv::bitwise_and(edges, vert_mask, vert_edges);
-    cv::bitwise_and(edges, horiz_mask, horiz_edges);
-
-    cv::Mat inv_vert, inv_horiz;
-    cv::bitwise_not(vert_edges, inv_vert);
-    cv::bitwise_not(horiz_edges, inv_horiz);
-    cv::distanceTransform(inv_vert, maps.dt_vert, cv::DIST_L2, 3);
-    cv::distanceTransform(inv_horiz, maps.dt_horiz, cv::DIST_L2, 3);
+    cv::Mat inv_edges;
+    cv::bitwise_not(edges, inv_edges);
+    cv::distanceTransform(inv_edges, maps.dt_all, cv::DIST_L2, 3);
     return maps;
+}
+
+struct PolarBoundaryPoint {
+    cv::Vec3d p_cad;
+    double nx_2d{0.0};
+    double ny_2d{0.0};
+    double r_px{0.0};
+    int bin{0};
+};
+
+struct PolarBoundaryCache {
+    std::vector<PolarBoundaryPoint> pts;
+    double best_r[32]{};
+    bool valid{false};
+};
+
+PolarBoundaryCache extractPolarBoundaryCache(const cv::Matx33d& R,
+                                             const cv::Vec3d& t,
+                                             const std::vector<cv::Vec3f>& mesh_pts,
+                                             const std::vector<cv::Vec3f>& mesh_normals,
+                                             double fx, double fy, double cx, double cy,
+                                             int w, int h)
+{
+    PolarBoundaryCache cache;
+    constexpr int kAngularBins = 32;
+    for (int b = 0; b < kAngularBins; ++b) cache.best_r[b] = -1.0;
+    if (mesh_pts.empty()) return cache;
+
+    const bool has_normals = (mesh_normals.size() == mesh_pts.size());
+    struct ProjSample {
+        cv::Vec3d p_cad;
+        double u;
+        double v;
+        double nx;
+        double ny;
+    };
+    const size_t step = std::max<size_t>(1, mesh_pts.size() / 600);
+    std::vector<ProjSample> proj_pts;
+    proj_pts.reserve(mesh_pts.size() / step + 1);
+
+    int min_v = 100000, max_v = -100000;
+    int min_u = 100000, max_u = -100000;
+    double mu_u = 0.0, mu_v = 0.0;
+
+    for (size_t i = 0; i < mesh_pts.size(); i += step) {
+        const cv::Vec3d p_cad(mesh_pts[i]);
+        const cv::Vec3d pc = R * p_cad + t;
+        if (pc[2] <= 0.12) continue;
+        const double uf = fx * pc[0] / pc[2] + cx;
+        const double vf = fy * pc[1] / pc[2] + cy;
+        const int u = static_cast<int>(std::round(uf));
+        const int v = static_cast<int>(std::round(vf));
+        if (u < 2 || u >= w - 2 || v < 2 || v >= h - 2) return cache;
+
+        double nx = 0.0, ny = 0.0;
+        if (has_normals) {
+            const cv::Vec3d nc = R * cv::Vec3d(mesh_normals[i]);
+            const double nn = std::hypot(nc[0], nc[1]);
+            if (nn > 1e-4) {
+                nx = nc[0] / nn;
+                ny = nc[1] / nn;
+            }
+        }
+        proj_pts.push_back({p_cad, uf, vf, nx, ny});
+        mu_u += uf;
+        mu_v += vf;
+        min_v = std::min(min_v, v); max_v = std::max(max_v, v);
+        min_u = std::min(min_u, u); max_u = std::max(max_u, u);
+    }
+
+    if (proj_pts.size() < 20 || max_v - min_v < 12 || max_u - min_u < 10) return cache;
+    mu_u /= static_cast<double>(proj_pts.size());
+    mu_v /= static_cast<double>(proj_pts.size());
+
+    PolarBoundaryPoint bin_pts[kAngularBins];
+    constexpr double kTwoPi = 2.0 * kPi;
+    for (const auto& pt : proj_pts) {
+        const double du = pt.u - mu_u;
+        const double dv = pt.v - mu_v;
+        const double r = std::hypot(du, dv);
+        if (r < 2.0) continue;
+        const double ang = std::atan2(dv, du) + kPi;
+        int b = static_cast<int>(ang * (kAngularBins / kTwoPi));
+        if (b >= kAngularBins) b = kAngularBins - 1;
+        if (b < 0) b = 0;
+        if (r > cache.best_r[b]) {
+            cache.best_r[b] = r;
+            bin_pts[b].p_cad = pt.p_cad;
+            bin_pts[b].r_px = r;
+            bin_pts[b].bin = b;
+            if (std::hypot(pt.nx, pt.ny) > 0.5) {
+                bin_pts[b].nx_2d = pt.nx;
+                bin_pts[b].ny_2d = pt.ny;
+            } else {
+                bin_pts[b].nx_2d = du / r;
+                bin_pts[b].ny_2d = dv / r;
+            }
+        }
+    }
+
+    cache.pts.reserve(kAngularBins);
+    for (int b = 0; b < kAngularBins; ++b) {
+        if (cache.best_r[b] > 0.0) {
+            cache.pts.push_back(bin_pts[b]);
+        }
+    }
+    cache.valid = (cache.pts.size() >= 8);
+    return cache;
+}
+
+double evalPolarBoundaryCost(const cv::Matx33d& R,
+                             const cv::Vec3d& t,
+                             const PolarBoundaryCache& cache,
+                             const RgbEdgeMaps& edge_maps,
+                             double fx, double fy, double cx, double cy,
+                             bool include_mask_coverage = false)
+{
+    if (!cache.valid || edge_maps.empty()) return 50.0;
+
+    const int w = edge_maps.dt_all.cols;
+    const int h = edge_maps.dt_all.rows;
+    const double mu_u = fx * t[0] / std::max(0.12, t[2]) + cx;
+    const double mu_v = fy * t[1] / std::max(0.12, t[2]) + cy;
+    const bool has_out_dt = (include_mask_coverage && !edge_maps.dt_outside_mask.empty() &&
+                             edge_maps.dt_outside_mask.cols == w && edge_maps.dt_outside_mask.rows == h);
+
+    constexpr double kTukeyC = 10.0;
+    double sum_left = 0.0, w_left = 0.0;
+    double sum_right = 0.0, w_right = 0.0;
+    double sum_out_mask = 0.0;
+    int valid_cnt = 0;
+
+    for (const auto& bp : cache.pts) {
+        const cv::Vec3d pc = R * bp.p_cad + t;
+        if (pc[2] <= 0.12) continue;
+        const int u = static_cast<int>(std::round(fx * pc[0] / pc[2] + cx));
+        const int v = static_cast<int>(std::round(fy * pc[1] / pc[2] + cy));
+        if (u < 2 || u >= w - 2 || v < 2 || v >= h - 2) return 50.0;
+
+        if (has_out_dt) {
+            const float d_out = edge_maps.dt_outside_mask.at<float>(v, u);
+            if (d_out > 2.0f) sum_out_mask += static_cast<double>(std::min(25.0f, d_out - 2.0f));
+        }
+
+        const float d_canny = std::min(30.0f, edge_maps.dt_all.at<float>(v, u));
+        const float gx = edge_maps.grad_x.at<float>(v, u);
+        const float gy = edge_maps.grad_y.at<float>(v, u);
+        const float gmag = edge_maps.grad_mag.at<float>(v, u);
+
+        double cos_align = 0.0;
+        if (gmag > 8.0f) {
+            cos_align = std::min(1.0, std::abs(gx * bp.nx_2d + gy * bp.ny_2d) / static_cast<double>(gmag));
+        }
+        const double raw_res = static_cast<double>(d_canny) + 3.0 * (1.0 - cos_align);
+        const double r_norm = std::min(1.0, raw_res / kTukeyC);
+        const double w_tk = std::max(0.12, (1.0 - r_norm * r_norm) * (1.0 - r_norm * r_norm));
+        const double robust_cost = std::min(raw_res, kTukeyC);
+
+        if (u < mu_u) {
+            sum_left += w_tk * robust_cost;
+            w_left += w_tk;
+        } else {
+            sum_right += w_tk * robust_cost;
+            w_right += w_tk;
+        }
+        ++valid_cnt;
+    }
+
+    if (valid_cnt < 8 || w_left < 0.5 || w_right < 0.5) return 50.0;
+    const double mean_left = sum_left / w_left;
+    const double mean_right = sum_right / w_right;
+    const double mean_all = (sum_left + sum_right) / (w_left + w_right);
+    const double bilat_max = std::max(mean_left, mean_right);
+    double base_chamfer = 0.55 * mean_all + 0.45 * bilat_max;
+
+    if (include_mask_coverage) {
+        if (has_out_dt && valid_cnt > 0) {
+            base_chamfer += 0.40 * (sum_out_mask / static_cast<double>(valid_cnt));
+        }
+        if (!edge_maps.fg_sample_pts.empty()) {
+            constexpr int kAngularBins = 32;
+            constexpr double kTwoPi = 2.0 * kPi;
+            double sum_uncov = 0.0;
+            for (const auto& fp : edge_maps.fg_sample_pts) {
+                const double du = static_cast<double>(fp.x) - mu_u;
+                const double dv = static_cast<double>(fp.y) - mu_v;
+                const double r_fp = std::hypot(du, dv);
+                const double ang = std::atan2(dv, du) + kPi;
+                int b = static_cast<int>(ang * (kAngularBins / kTwoPi));
+                if (b >= kAngularBins) b = kAngularBins - 1;
+                if (b < 0) b = 0;
+                const double d_tot = (cache.best_r[b] > 0.0) ? std::max(0.0, r_fp - cache.best_r[b]) : 8.0;
+                if (d_tot > 2.5) sum_uncov += std::min(25.0, d_tot - 2.5);
+            }
+            base_chamfer += 0.40 * (sum_uncov / static_cast<double>(edge_maps.fg_sample_pts.size()));
+        }
+    }
+    return base_chamfer;
 }
 
 double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
@@ -267,174 +457,10 @@ double computeRgbSilhouetteChamferCost(const cv::Matx33d& R,
                                        double fx, double fy, double cx, double cy,
                                        bool include_mask_coverage = false)
 {
-    (void)mesh_normals;
     if (mesh_pts.empty() || edge_maps.empty()) return 50.0;
-
-    const int w = edge_maps.dt_vert.cols;
-    const int h = edge_maps.dt_vert.rows;
-    const bool has_out_dt = (!edge_maps.dt_outside_mask.empty() &&
-                             edge_maps.dt_outside_mask.cols == w &&
-                             edge_maps.dt_outside_mask.rows == h);
-
-    constexpr int kBins = 24;
-    int min_v = 100000, max_v = -100000;
-    int min_u_all = 100000, max_u_all = -100000;
-    const size_t step = std::max<size_t>(1, mesh_pts.size() / 600);
-
-    std::vector<cv::Point> proj_pts;
-    proj_pts.reserve(mesh_pts.size() / step + 1);
-    double sum_out_mask = 0.0;
-
-    for (size_t i = 0; i < mesh_pts.size(); i += step) {
-        const cv::Vec3d pc = R * cv::Vec3d(mesh_pts[i]) + t;
-        if (pc[2] <= 0.12) continue;
-        const int u = static_cast<int>(std::round(fx * pc[0] / pc[2] + cx));
-        const int v = static_cast<int>(std::round(fy * pc[1] / pc[2] + cy));
-        if (u < 2 || u >= w - 2 || v < 2 || v >= h - 2) return 50.0;
-        proj_pts.emplace_back(u, v);
-        if (has_out_dt) {
-            const float d_out = edge_maps.dt_outside_mask.at<float>(v, u);
-            if (d_out > 2.0f) sum_out_mask += static_cast<double>(std::min(25.0f, d_out - 2.0f));
-        }
-        if (v < min_v) min_v = v;
-        if (v > max_v) max_v = v;
-        if (u < min_u_all) min_u_all = u;
-        if (u > max_u_all) max_u_all = u;
-    }
-
-    if (proj_pts.size() < 20 || max_v - min_v < 12 || max_u_all - min_u_all < 10) return 50.0;
-
-    double mu_u = 0.0, mu_v = 0.0;
-    for (const auto& pt : proj_pts) {
-        mu_u += pt.x;
-        mu_v += pt.y;
-    }
-    mu_u /= proj_pts.size();
-    mu_v /= proj_pts.size();
-    double cuu = 0.0, cvv = 0.0, cuv = 0.0;
-    for (const auto& pt : proj_pts) {
-        const double du = pt.x - mu_u;
-        const double dv = pt.y - mu_v;
-        cuu += du * du;
-        cvv += dv * dv;
-        cuv += du * dv;
-    }
-    const double tr = cuu + cvv;
-    const double disc = std::sqrt(std::max(0.0, (cuu - cvv) * (cuu - cvv) + 4.0 * cuv * cuv));
-    const double lam0 = 0.5 * (tr + disc);
-    double ax_u = (std::abs(cuv) > 1e-6) ? (lam0 - cvv) : ((cuu >= cvv) ? 1.0 : 0.0);
-    double ax_v = (std::abs(cuv) > 1e-6) ? cuv : ((cuu >= cvv) ? 0.0 : 1.0);
-    const double ax_n = std::hypot(ax_u, ax_v);
-    if (ax_n > 1e-6) {
-        ax_u /= ax_n;
-        ax_v /= ax_n;
-    } else {
-        ax_u = 0.0;
-        ax_v = 1.0;
-    }
-    if (ax_v < 0.0) { ax_u = -ax_u; ax_v = -ax_v; }
-    const double perp_u = ax_v;
-    const double perp_v = -ax_u;
-
-    double min_along = 1e9, max_along = -1e9;
-    for (const auto& pt : proj_pts) {
-        const double s = (pt.x - mu_u) * ax_u + (pt.y - mu_v) * ax_v;
-        if (s < min_along) min_along = s;
-        if (s > max_along) max_along = s;
-    }
-    const double inv_span_along = static_cast<double>(kBins - 1) / std::max(1.0, max_along - min_along);
-
-    double row_min_perp[kBins], row_max_perp[kBins];
-    int row_lu[kBins], row_lv[kBins], row_ru[kBins], row_rv[kBins];
-    for (int b = 0; b < kBins; ++b) {
-        row_min_perp[b] = 1e9;
-        row_max_perp[b] = -1e9;
-        row_lu[b] = row_lv[b] = row_ru[b] = row_rv[b] = -1;
-    }
-    for (const auto& pt : proj_pts) {
-        const double s = (pt.x - mu_u) * ax_u + (pt.y - mu_v) * ax_v;
-        const double p = (pt.x - mu_u) * perp_u + (pt.y - mu_v) * perp_v;
-        const int b = std::clamp(static_cast<int>((s - min_along) * inv_span_along), 0, kBins - 1);
-        if (p < row_min_perp[b]) {
-            row_min_perp[b] = p;
-            row_lu[b] = pt.x;
-            row_lv[b] = pt.y;
-        }
-        if (p > row_max_perp[b]) {
-            row_max_perp[b] = p;
-            row_ru[b] = pt.x;
-            row_rv[b] = pt.y;
-        }
-    }
-
-    const float w_side_v = static_cast<float>(ax_v * ax_v);
-    const float w_side_h = static_cast<float>(ax_u * ax_u);
-    auto sampleSideDt = [&](int u, int v) -> double {
-        const float dv = std::min(30.0f, edge_maps.dt_vert.at<float>(v, u));
-        const float dh = std::min(30.0f, edge_maps.dt_horiz.at<float>(v, u));
-        return static_cast<double>(w_side_v * dv + w_side_h * dh);
-    };
-    auto sampleEndDt = [&](int u, int v) -> double {
-        const float dv = std::min(30.0f, edge_maps.dt_vert.at<float>(v, u));
-        const float dh = std::min(30.0f, edge_maps.dt_horiz.at<float>(v, u));
-        return static_cast<double>(w_side_v * dh + w_side_h * dv);
-    };
-
-    double sum_left = 0.0;
-    double sum_right = 0.0;
-    int cnt_side = 0;
-    int first_b = -1, last_b = -1;
-    for (int b = 0; b < kBins; ++b) {
-        if (row_lu[b] < 0 || row_ru[b] < 0) continue;
-        if (first_b < 0) first_b = b;
-        last_b = b;
-        if (b >= kBins - 3) continue;
-        sum_left += sampleSideDt(row_lu[b], row_lv[b]);
-        sum_right += sampleSideDt(row_ru[b], row_rv[b]);
-        ++cnt_side;
-    }
-    if (cnt_side < 4) return 50.0;
-
-    double sum_horiz = 0.0;
-    int cnt_horiz = 0;
-    for (int b : {first_b, last_b}) {
-        if (b < 0 || row_lu[b] < 0 || row_ru[b] < 0) continue;
-        const int u_mid = (row_lu[b] + row_ru[b]) / 2;
-        const int v_mid = (row_lv[b] + row_rv[b]) / 2;
-        sum_horiz += sampleEndDt(u_mid, v_mid);
-        ++cnt_horiz;
-    }
-
-    const double mean_left = sum_left / cnt_side;
-    const double mean_right = sum_right / cnt_side;
-    const double mean_vert = 0.5 * (mean_left + mean_right);
-    const double bilat_max = std::max(mean_left, mean_right);
-    const double mean_horiz = (cnt_horiz > 0) ? (sum_horiz / cnt_horiz) : mean_vert;
-    double base_chamfer = 0.45 * bilat_max + 0.33 * mean_vert + 0.22 * mean_horiz;
-
-    if (include_mask_coverage) {
-        if (has_out_dt && !proj_pts.empty()) {
-            base_chamfer += 0.40 * (sum_out_mask / static_cast<double>(proj_pts.size()));
-        }
-        if (!edge_maps.fg_sample_pts.empty()) {
-            double sum_uncov = 0.0;
-            for (const auto& fp : edge_maps.fg_sample_pts) {
-                const double s = (fp.x - mu_u) * ax_u + (fp.y - mu_v) * ax_v;
-                const double p = (fp.x - mu_u) * perp_u + (fp.y - mu_v) * perp_v;
-                const int b = std::clamp(static_cast<int>((s - min_along) * inv_span_along), 0, kBins - 1);
-                const double d_along = (s < min_along) ? (min_along - s) : ((s > max_along) ? (s - max_along) : 0.0);
-                const double d_perp = (row_lu[b] >= 0)
-                    ? ((p < row_min_perp[b]) ? (row_min_perp[b] - p) : ((p > row_max_perp[b]) ? (p - row_max_perp[b]) : 0.0))
-                    : 8.0;
-                const double d_tot = std::hypot(d_along, d_perp);
-                if (d_tot > 2.5) {
-                    sum_uncov += std::min(25.0, d_tot - 2.5);
-                }
-            }
-            base_chamfer += 0.40 * (sum_uncov / static_cast<double>(edge_maps.fg_sample_pts.size()));
-        }
-    }
-    return base_chamfer;
+    const PolarBoundaryCache cache = extractPolarBoundaryCache(
+        R, t, mesh_pts, mesh_normals, fx, fy, cx, cy, edge_maps.dt_all.cols, edge_maps.dt_all.rows);
+    return evalPolarBoundaryCost(R, t, cache, edge_maps, fx, fy, cx, cy, include_mask_coverage);
 }
 
 bool projectCadBounds2D(const cv::Matx33d& R,
@@ -715,13 +741,17 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
         return t_dyn;
     };
 
+    const int img_w_em = edge_maps.dt_all.cols;
+    const int img_h_em = edge_maps.dt_all.rows;
     for (const auto& center_0 : anchor_centers) {
         for (const auto& R_try : R_cands) {
             const cv::Vec3d base_t = center_0 - R_try * cad_mid;
+            const PolarBoundaryCache r_cache = extractPolarBoundaryCache(
+                R_try, base_t, mesh_pts, mesh_normals, fx, fy, cx, cy, img_w_em, img_h_em);
             const bool is_flipped_down = (R_try(1, vert_ax) > 0.35);
             const double flip_pen = is_flipped_down ? 0.85 : 0.0;
             {
-                const double c0 = computeRgbSilhouetteChamferCost(R_try, base_t, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy) + flip_pen;
+                const double c0 = evalPolarBoundaryCost(R_try, base_t, r_cache, edge_maps, fx, fy, cx, cy) + flip_pen;
                 if (c0 < best_cost) {
                     best_cost = c0;
                     best_R = R_try;
@@ -742,7 +772,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
                     const double reg = is_tracking_warm_start
                         ? (2.0 * (std::abs(dx) + std::abs(dy)))
                         : (3.0 * drift_x + 2.0 * std::max(0.0, dy) + flip_pen);
-                    const double c = computeRgbSilhouetteChamferCost(R_try, t_try, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy) + reg;
+                    const double c = evalPolarBoundaryCost(R_try, t_try, r_cache, edge_maps, fx, fy, cx, cy) + reg;
                     if (c < best_cost) {
                         best_cost = c;
                         best_R = R_try;
@@ -842,11 +872,13 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
     const double step_z = std::clamp(0.02 * std::max(0.05, cv::norm(span)), 0.004, 0.025);
     const double range_z = 3.0 * step_z;
 
+    const PolarBoundaryCache fine_cache = extractPolarBoundaryCache(
+        best_R, best_t, mesh_pts, mesh_normals, fx, fy, cx, cy, img_w_em, img_h_em);
     const cv::Vec3d mid_t = best_t;
     for (double dy = -range_xy; dy <= range_xy + 1e-6; dy += step_xy) {
         for (double dx = -range_xy; dx <= range_xy + 1e-6; dx += step_xy) {
             const cv::Vec3d t_try(mid_t[0] + dx, mid_t[1] + dy, mid_t[2]);
-            const double c = computeRgbSilhouetteChamferCost(best_R, t_try, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
+            const double c = evalPolarBoundaryCost(best_R, t_try, fine_cache, edge_maps, fx, fy, cx, cy);
             if (c < best_cost) {
                 best_cost = c;
                 best_t = t_try;
@@ -857,7 +889,7 @@ double refineTranslationOnRgbSilhouette(cv::Matx33d& R,
     for (double dz = -range_z; dz <= range_z + 1e-6; dz += step_z) {
         if (std::abs(dz) < 1e-4) continue;
         const cv::Vec3d t_try(fine_t[0], fine_t[1], fine_t[2] + dz);
-        const double c = computeRgbSilhouetteChamferCost(best_R, t_try, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
+        const double c = evalPolarBoundaryCost(best_R, t_try, fine_cache, edge_maps, fx, fy, cx, cy);
         if (c < best_cost) {
             best_cost = c;
             best_t = t_try;
@@ -2989,17 +3021,36 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
 
         const int s_ax1 = (long_ax + 1) % 3;
         const int s_ax2 = (long_ax + 2) % 3;
-        const double ratio_cross = std::max(cad_span[s_ax1], cad_span[s_ax2]) /
-                                   std::max(1e-4, std::min(cad_span[s_ax1], cad_span[s_ax2]));
 
-        if (!_is_floor_standing && ratio_cross < 1.35) {
+        // Đo độ bất đối xứng pháp tuyến thiết diện ngang (Normal Covariance Anisotropy) từ _mesh_normals:
+        // Chỉ neo spin theo tia nhìn khi lưới CAD thực sự tròn xoay trơn (lam1 / lam2 < 1.08);
+        // giữ nguyên 100% góc Yaw thật cho mọi vật thể có mặt dẹt, gờ hoặc quai cầm.
+        double normal_anisotropy = 1.0;
+        if (_mesh_normals.size() >= 32) {
+            double c11 = 0.0, c12 = 0.0, c22 = 0.0;
+            const size_t n_step = std::max<size_t>(1, _mesh_normals.size() / 600);
+            for (size_t i = 0; i < _mesh_normals.size(); i += n_step) {
+                const double n1 = static_cast<double>(_mesh_normals[i][s_ax1]);
+                const double n2 = static_cast<double>(_mesh_normals[i][s_ax2]);
+                c11 += n1 * n1;
+                c12 += n1 * n2;
+                c22 += n2 * n2;
+            }
+            const double tr_n = c11 + c22;
+            const double disc_n = std::sqrt(std::max(0.0, (c11 - c22) * (c11 - c22) + 4.0 * c12 * c12));
+            const double lam1 = 0.5 * (tr_n + disc_n);
+            const double lam2 = 0.5 * (tr_n - disc_n);
+            normal_anisotropy = (lam2 > 1e-6) ? (lam1 / lam2) : 10.0;
+        }
+
+        if (!_is_floor_standing && normal_anisotropy < 1.08) {
             cv::Vec3d axis_long(R_final(0, long_ax), R_final(1, long_ax), R_final(2, long_ax));
             axis_long *= (1.0 / std::max(1e-9, cv::norm(axis_long)));
 
-            cv::Vec3d cam_back(0.0, 0.0, -1.0);
-            if (std::abs(axis_long.dot(cam_back)) > 0.92) cam_back = cv::Vec3d(1.0, 0.0, 0.0);
+            cv::Vec3d view_ref = (cv::norm(t_final) > 0.10) ? (-t_final * (1.0 / cv::norm(t_final))) : cv::Vec3d(0.0, 0.0, -1.0);
+            if (std::abs(axis_long.dot(view_ref)) > 0.92) view_ref = cv::Vec3d(1.0, 0.0, 0.0);
 
-            cv::Vec3d axis_s1 = cam_back - axis_long * axis_long.dot(cam_back);
+            cv::Vec3d axis_s1 = view_ref - axis_long * axis_long.dot(view_ref);
             axis_s1 *= (1.0 / std::max(1e-9, cv::norm(axis_s1)));
             cv::Vec3d axis_s2 = axis_long.cross(axis_s1);
             axis_s2 *= (1.0 / std::max(1e-9, cv::norm(axis_s2)));
@@ -3398,6 +3449,46 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
         if (pose.rmse_m > max_clutter_rmse || pose.inlier_ratio < 0.48) {
             pose.confidence = std::min(pose.confidence, 0.35f);
             return false;
+        }
+        // Lateral Depth Detachment: reject flat wall/table patches whose left & right flanks are coplanar with box
+        if (!depth_z16.empty() && depth_z16.type() == CV_16UC1 && img_w > 0 && img_h > 0) {
+            const cv::Rect2f pb = projectCadBoundingBox(pose.R, pose.t, intr, img_w, img_h);
+            const int bw = static_cast<int>(std::round(pb.width));
+            const int bh = static_cast<int>(std::round(pb.height));
+            if (bw >= 12 && bh >= 16) {
+                const int v0 = std::clamp(static_cast<int>(std::round(pb.y)) + bh / 5, 0, depth_z16.rows - 1);
+                const int v1 = std::clamp(static_cast<int>(std::round(pb.y)) + 4 * bh / 5, 0, depth_z16.rows - 1);
+                const int bx0 = static_cast<int>(std::round(pb.x));
+                const int bx1 = bx0 + bw;
+                const int pad_in = std::max(3, bw / 8);
+                const int pad_out = std::max(10, bw / 4);
+                const double d_scale = (intr.depth_scale > 0.0) ? intr.depth_scale : 0.001;
+                const double coplanar_tol = std::max(0.035, 0.22 * diag);
+                int coplanar_l = 0, valid_l = 0, coplanar_r = 0, valid_r = 0;
+                for (int v = v0; v <= v1; v += 2) {
+                    const uint16_t* d_row = depth_z16.ptr<uint16_t>(v);
+                    for (int u = std::max(0, bx0 - pad_out); u < std::max(0, bx0 - pad_in); ++u) {
+                        if (d_row[u] == 0) continue;
+                        ++valid_l;
+                        if (std::abs(d_row[u] * d_scale - pose.t[2]) < coplanar_tol) ++coplanar_l;
+                    }
+                    for (int u = std::min(depth_z16.cols - 1, bx1 + pad_in); u < std::min(depth_z16.cols - 1, bx1 + pad_out); ++u) {
+                        if (d_row[u] == 0) continue;
+                        ++valid_r;
+                        if (std::abs(d_row[u] * d_scale - pose.t[2]) < coplanar_tol) ++coplanar_r;
+                    }
+                }
+                const bool both_coplanar = (valid_l >= 8 && valid_r >= 8 &&
+                                            static_cast<double>(coplanar_l) / valid_l > 0.60 &&
+                                            static_cast<double>(coplanar_r) / valid_r > 0.60);
+                const int tot_v = valid_l + valid_r;
+                const bool mostly_coplanar = (tot_v >= 20 &&
+                                              static_cast<double>(coplanar_l + coplanar_r) / tot_v > 0.72);
+                if (both_coplanar || mostly_coplanar) {
+                    pose.confidence = std::min(pose.confidence, 0.30f);
+                    return false;
+                }
+            }
         }
     }
     return true;
