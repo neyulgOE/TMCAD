@@ -209,6 +209,10 @@ public:
     double lastSolveLatencyMs() const noexcept { return _last_solve_latency_ms; }
     double lastTotalLatencyMs() const noexcept { return _last_total_latency_ms; }
     const std::vector<cv::Vec3f>& lastSegmentedPoints() const noexcept { return _last_segmented_points; }
+    const cv::Mat& lastFgMask2D() const noexcept { return _last_fg_mask_2d; }
+    float computeMaskSilhouetteIoU(const ObjectPose& pose,
+                                   const cv::Mat& fg_mask_2d,
+                                   const CameraIntrinsics& intr) const;
 
 private:
     bool unpackBlackBoxOnnx();
@@ -302,6 +306,7 @@ private:
     double _last_solve_latency_ms{0.0};
     double _last_total_latency_ms{0.0};
     std::vector<cv::Vec3f> _last_segmented_points;
+    cv::Mat _last_fg_mask_2d;
 
     size_t _num_obs_points{1024};
     size_t _num_cad_samples{0};

@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
     const CameraIntrinsics base_intr = bag_src.intrinsics();
     const std::string csv_path = (fs::path(out_dir) / "bag_eval.csv").string();
     std::ofstream csv(csv_path);
-    csv << "frame_idx,num_accepted,accepted,confidence,rmse_mm,inlier_ratio,"
+    csv << "frame_idx,num_accepted,accepted,confidence,rmse_mm,inlier_ratio,sil_iou,"
         << "tx,ty,tz,roll_deg,pitch_deg,yaw_deg,bbox_x,bbox_y,bbox_w,bbox_h,"
         << "valid_depth_pts,ai_ms,solve_ms,total_ms,method\n";
 
@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
 
     int frame_idx = 0;
     int accepted_frames = 0;
-    std::vector<double> confs, rmses_mm, latencies_ms;
+    std::vector<double> confs, rmses_mm, latencies_ms, sil_ious;
 
     RGBDFrame frame;
     while ((max_frames < 0 || frame_idx < max_frames) && bag_src.grabFrame(frame)) {
@@ -183,10 +183,13 @@ int main(int argc, char** argv) {
         cv::imwrite((fs::path(out_dir) / "overlays" / fname).string(), vis);
 
         const bool acc = !poses.empty();
+        float sil_iou = -1.0f;
         if (acc) {
             ++accepted_frames;
             confs.push_back(poses.front().confidence);
             rmses_mm.push_back(poses.front().rmse_m * 1000.0);
+            sil_iou = estimator.computeMaskSilhouetteIoU(poses.front(), estimator.lastFgMask2D(), intr);
+            if (sil_iou >= 0.0f) sil_ious.push_back(sil_iou);
         }
         latencies_ms.push_back(estimator.lastTotalLatencyMs());
 
@@ -196,6 +199,7 @@ int main(int argc, char** argv) {
                 << std::fixed << std::setprecision(4) << p.confidence << ","
                 << std::setprecision(2) << (p.rmse_m * 1000.0) << ","
                 << std::setprecision(4) << p.inlier_ratio << ","
+                << std::setprecision(4) << sil_iou << ","
                 << p.t[0] << "," << p.t[1] << "," << p.t[2] << ","
                 << std::setprecision(2) << p.roll_deg << "," << p.pitch_deg << "," << p.yaw_deg << ","
                 << p.bbox_2d.x << "," << p.bbox_2d.y << "," << p.bbox_2d.width << "," << p.bbox_2d.height << ","
@@ -205,7 +209,7 @@ int main(int argc, char** argv) {
                 << estimator.lastTotalLatencyMs() << ","
                 << p.method << "\n";
         } else {
-            csv << frame_idx << ",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
+            csv << frame_idx << ",0,0,0,0,0,-1,0,0,0,0,0,0,0,0,0,0,"
                 << estimator.lastValidDepthPts() << ","
                 << std::fixed << std::setprecision(2)
                 << estimator.lastAiLatencyMs() << ","
@@ -224,6 +228,7 @@ int main(int argc, char** argv) {
               << (frame_idx > 0 ? 100.0 * accepted_frames / frame_idx : 0.0) << "%)"
               << " | Med Conf: " << std::setprecision(3) << medianOf(confs)
               << " | Med RMSE: " << std::setprecision(2) << medianOf(rmses_mm) << " mm"
+              << " | Med Sil_IoU: " << std::setprecision(3) << medianOf(sil_ious)
               << " | Lat p50/p95: " << std::setprecision(1) << medianOf(latencies_ms)
               << " / " << percentileOf(latencies_ms, 0.95) << " ms\n"
               << "[eval_bag_pose] CSV: " << csv_path << "\n";
