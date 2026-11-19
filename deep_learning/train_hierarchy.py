@@ -12,9 +12,9 @@ if project_root not in sys.path:
 import torch
 from torch.utils.data import DataLoader
 
-from deep_learning.dataset_hierarchy import CADHierarchyDataset
+from deep_learning.dataset_hierarchy import CADHierarchyDataset, OnTheFlyTriangleDataset
 from deep_learning.model_hierarchy import CADHierarchyCorrespondenceModel
-from deep_learning.loss_hierarchy import SymmetryAwareInfoNCELoss, compute_matching_recall
+from deep_learning.loss_hierarchy import SymmetryAwareInfoNCELoss, TriangleAwareTopologyLoss, compute_matching_recall
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CAD-Aware Hierarchical Correspondence Model")
@@ -31,6 +31,10 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.07, help="InfoNCE temperature")
     parser.add_argument("--checkpoint-dir", type=str, default="", help="Output checkpoint directory")
     parser.add_argument("--reset-data", action="store_true", help="Reset existing checkpoint")
+    parser.add_argument("--on-the-fly", action="store_true",
+                        help="Sinh mẫu trực tiếp trên lưới tam giác trong RAM (0 MB ổ cứng)")
+    parser.add_argument("--samples-per-epoch", type=int, default=2400,
+                        help="Số góc nhìn sinh mới mỗi epoch ở chế độ --on-the-fly")
     return parser.parse_args()
 
 def main():
@@ -64,29 +68,51 @@ def main():
     # 1. Datasets & DataLoaders
     norm_ds = os.path.normpath(args.dataset_dir)
     dataset_root = os.path.dirname(norm_ds) if os.path.basename(norm_ds) == args.cad_name else norm_ds
+    use_on_the_fly = args.on_the_fly or (not os.path.isdir(os.path.join(dataset_root, args.cad_name)))
 
-    train_dataset = CADHierarchyDataset(
-        dataset_root=dataset_root,
-        cad_data_dir=args.cad_dir,
-        cad_name=args.cad_name,
-        split="train",
-        num_obs_points=args.num_obs_samples,
-        num_cad_samples=args.num_cad_samples,
-        enable_sim2real_noise=True,
-    )
-
-    val_dataset = CADHierarchyDataset(
-        dataset_root=dataset_root,
-        cad_data_dir=args.cad_dir,
-        cad_name=args.cad_name,
-        split="val",
-        num_obs_points=args.num_obs_samples,
-        num_cad_samples=args.num_cad_samples,
-        enable_sim2real_noise=False,
-    )
+    if use_on_the_fly:
+        print(f"[DATASET] OnTheFlyTriangleDataset ({args.samples_per_epoch} views/epoch, 0 MB disk)")
+        train_dataset = OnTheFlyTriangleDataset(
+            cad_data_dir=args.cad_dir,
+            cad_name=args.cad_name,
+            split="train",
+            samples_per_epoch=args.samples_per_epoch,
+            num_obs_points=args.num_obs_samples,
+            num_cad_samples=args.num_cad_samples,
+            enable_sim2real_noise=True,
+        )
+        val_dataset = OnTheFlyTriangleDataset(
+            cad_data_dir=args.cad_dir,
+            cad_name=args.cad_name,
+            split="val",
+            samples_per_epoch=256,
+            num_obs_points=args.num_obs_samples,
+            num_cad_samples=args.num_cad_samples,
+            enable_sim2real_noise=False,
+        )
+    else:
+        train_dataset = CADHierarchyDataset(
+            dataset_root=dataset_root,
+            cad_data_dir=args.cad_dir,
+            cad_name=args.cad_name,
+            split="train",
+            num_obs_points=args.num_obs_samples,
+            num_cad_samples=args.num_cad_samples,
+            enable_sim2real_noise=True,
+        )
+        val_dataset = CADHierarchyDataset(
+            dataset_root=dataset_root,
+            cad_data_dir=args.cad_dir,
+            cad_name=args.cad_name,
+            split="val",
+            num_obs_points=args.num_obs_samples,
+            num_cad_samples=args.num_cad_samples,
+            enable_sim2real_noise=False,
+        )
 
     key_indices_np = train_dataset.cad_key_indices
     patch_hops_const = torch.from_numpy(train_dataset.patch_hops).to(device)
+    in_channels = int(train_dataset.patch_features.shape[-1])
 
     def prepare_batch(batch):
         obs_cam = batch["obs_points_norm"].to(device, non_blocking=True)
@@ -95,6 +121,9 @@ def main():
         B = obs_cam.shape[0]
         patch_rel = patch_feat[..., 0:3] - patch_centers.unsqueeze(2)
         patch_hops = patch_hops_const.unsqueeze(0).expand(B, -1, -1)
+
+        if use_on_the_fly:
+            return obs_cam, patch_feat, patch_rel, patch_hops, None
 
         gt_cad = batch["gt_cad_points"].to(device, non_blocking=True)
         sym_mats = batch["symmetry_matrices"].to(device, non_blocking=True)
@@ -108,18 +137,27 @@ def main():
         return obs_cam, patch_feat, patch_rel, patch_hops, targets
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              num_workers=4, pin_memory=True, drop_last=True)
+                              num_workers=4, persistent_workers=True, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                            num_workers=2, pin_memory=True)
+                            num_workers=2, persistent_workers=True, pin_memory=True)
 
     # 2. Model, Loss, Optimizer
     model = CADHierarchyCorrespondenceModel(
         descriptor_dim=args.descriptor_dim,
         patch_k=32,
         obs_k=20,
-        temperature=args.temperature
+        temperature=args.temperature,
+        in_channels=in_channels,
     ).to(device)
 
+    topo_criterion = TriangleAwareTopologyLoss(
+        temperature=args.temperature,
+        lambda_plane=2.0,
+        lambda_topo=1.0,
+        lambda_conf=0.5,
+        topo_k=4,
+        pos_radius_ratio=0.06,
+    )
     criterion = SymmetryAwareInfoNCELoss(temperature=args.temperature)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
@@ -138,15 +176,37 @@ def main():
             obs_cam, patch_feat, patch_rel, patch_hops, targets = prepare_batch(batch)
 
             optimizer.zero_grad()
-            sim, _, _ = model(obs_cam, patch_feat, patch_rel, patch_hops)
-            loss = criterion(sim, targets)
+            if use_on_the_fly:
+                obs_desc, conf_logits = model.obs_encoder(obs_cam, return_confidence=True)
+                cad_desc = model.cad_encoder(patch_feat, patch_rel, patch_hops)
+                loss, metrics = topo_criterion(
+                    obs_desc=obs_desc,
+                    cad_desc=cad_desc,
+                    patch_centers=batch["patch_centers"].to(device, non_blocking=True),
+                    patch_normals=batch["patch_normals"].to(device, non_blocking=True),
+                    obs_points_cad=batch["obs_points_cad"].to(device, non_blocking=True),
+                    obs_points_cam=batch["obs_points_cam"].to(device, non_blocking=True),
+                    obs_patch_targets=batch["obs_patch_targets"].to(device, non_blocking=True),
+                    obs_region_ids=batch["obs_region_ids"].to(device, non_blocking=True),
+                    inlier_mask=batch["inlier_mask"].to(device, non_blocking=True),
+                    conf_logits=conf_logits,
+                    sym_matrices=batch["symmetry_matrices"].to(device, non_blocking=True),
+                    cad_diag=train_dataset.real_bounding_diag_m,
+                )
+                r1, r5 = metrics["recall_at_1"], metrics["recall_at_5"]
+            else:
+                sim, _, _ = model(obs_cam, patch_feat, patch_rel, patch_hops)
+                loss = criterion(sim, targets)
+                r1 = compute_matching_recall(sim, targets, topk=1)
+                r5 = compute_matching_recall(sim, targets, topk=5)
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             total_train_loss += loss.item()
-            train_recall1_sum += compute_matching_recall(sim, targets, topk=1)
-            train_recall5_sum += compute_matching_recall(sim, targets, topk=5)
+            train_recall1_sum += r1
+            train_recall5_sum += r5
 
         scheduler.step()
 
@@ -165,12 +225,33 @@ def main():
             for batch in val_loader:
                 obs_cam, patch_feat, patch_rel, patch_hops, targets = prepare_batch(batch)
 
-                sim, _, _ = model(obs_cam, patch_feat, patch_rel, patch_hops)
-                val_loss = criterion(sim, targets)
+                if use_on_the_fly:
+                    obs_desc, conf_logits = model.obs_encoder(obs_cam, return_confidence=True)
+                    cad_desc = model.cad_encoder(patch_feat, patch_rel, patch_hops)
+                    val_loss, metrics = topo_criterion(
+                        obs_desc=obs_desc,
+                        cad_desc=cad_desc,
+                        patch_centers=batch["patch_centers"].to(device, non_blocking=True),
+                        patch_normals=batch["patch_normals"].to(device, non_blocking=True),
+                        obs_points_cad=batch["obs_points_cad"].to(device, non_blocking=True),
+                        obs_points_cam=batch["obs_points_cam"].to(device, non_blocking=True),
+                        obs_patch_targets=batch["obs_patch_targets"].to(device, non_blocking=True),
+                        obs_region_ids=batch["obs_region_ids"].to(device, non_blocking=True),
+                        inlier_mask=batch["inlier_mask"].to(device, non_blocking=True),
+                        conf_logits=conf_logits,
+                        sym_matrices=batch["symmetry_matrices"].to(device, non_blocking=True),
+                        cad_diag=val_dataset.real_bounding_diag_m,
+                    )
+                    r1, r5 = metrics["recall_at_1"], metrics["recall_at_5"]
+                else:
+                    sim, _, _ = model(obs_cam, patch_feat, patch_rel, patch_hops)
+                    val_loss = criterion(sim, targets)
+                    r1 = compute_matching_recall(sim, targets, topk=1)
+                    r5 = compute_matching_recall(sim, targets, topk=5)
 
                 total_val_loss += val_loss.item()
-                val_recall1_sum += compute_matching_recall(sim, targets, topk=1)
-                val_recall5_sum += compute_matching_recall(sim, targets, topk=5)
+                val_recall1_sum += r1
+                val_recall5_sum += r5
 
         avg_val_loss = total_val_loss / max(1, num_val_batches)
         avg_val_recall1 = val_recall1_sum / max(1, num_val_batches)

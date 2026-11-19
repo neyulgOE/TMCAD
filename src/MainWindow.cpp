@@ -4835,14 +4835,16 @@ void MainWindow::onTrainAIModel() {
          << "--cad-name" << cadName
          << "--dataset-dir" << datasetDir
          << "--cad-dir" << QFileInfo(cadPath).dir().absolutePath()
+         << "--on-the-fly"
+         << "--samples-per-epoch" << "2400"
          << "--epochs" << QString::number(epochs)
          << "--batch-size" << QString::number(batchSize)
          << "--lr" << QString::number(lr, 'f', 5);
 
     const CADAsset& asset = scene_->getOrProcessCADAsset(obj->filePath());
     if (asset.valid() && asset.realBoundingDiag < 0.45) {
-        args << "--num-cad-samples" << "128";
-        pipelineLog(QString("  [AUTO-ADAPT] Vật thể nhỏ (diag=%1m) -> Tự động tối ưu num_cad_samples=128.").arg(asset.realBoundingDiag, 0, 'f', 3));
+        args << "--num-cad-samples" << "256";
+        pipelineLog(QString("  [AUTO-ADAPT] Vật thể nhỏ (diag=%1m) -> Tự động tối ưu num_cad_samples=256 (On-the-fly).").arg(asset.realBoundingDiag, 0, 'f', 3));
     }
 
     if (reset) {
@@ -5433,12 +5435,14 @@ void MainWindow::runOneClickAutoPipeline(const QString& cadFilePath) {
                  << "--cad-name" << state->cadName
                  << "--dataset-dir" << state->datasetDir
                  << "--cad-dir" << projDir.absoluteFilePath("CAD_DATA/" + state->cadName)
+                 << "--on-the-fly"
+                 << "--samples-per-epoch" << "2400"
                  << "--epochs" << "20"
                  << "--batch-size" << "8"
                  << "--lr" << "0.001"
                  << "--reset-data";
             if (state->diagM < 0.45) {
-                args << "--num-cad-samples" << "128";
+                args << "--num-cad-samples" << "256";
             }
         } else {
             self->pipelineLog(QString("  [STAGE 3/3] Đóng gói Black-Box ONNX tự chủ cho %1...").arg(state->cadName));

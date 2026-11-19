@@ -47,19 +47,21 @@ def get_graph_feature(x, k=20, idx=None):
 class CADPatchEncoder(nn.Module):
     """
     Encodes local topological K-ring patches from Canonical CAD Hierarchy into descriptors.
+    Tự động bổ sung góc nhị diện cục bộ (cos_dih, sin_dih) và attention gate theo bước nhảy hop.
     Input:
-      - patch_features: (B, N_cad, K, 13)
+      - patch_features: (B, N_cad, K, C)
       - patch_rel_pos:  (B, N_cad, K, 3)
       - patch_hops:     (B, N_cad, K)
     Output:
       - D_cad: (B, N_cad, descriptor_dim) L2-normalized
     """
-    def __init__(self, descriptor_dim: int = 128, patch_k: int = 32):
+    def __init__(self, descriptor_dim: int = 128, patch_k: int = 32, in_channels: int = 13):
         super().__init__()
         self.descriptor_dim = descriptor_dim
         self.patch_k = patch_k
+        self.in_channels = in_channels
 
-        in_dim = 13 + 3 + 1  # 17 dimensions (features13 + rel_xyz + hop)
+        in_dim = in_channels + 6  # features(C) + rel_xyz(3) + hop(1) + cos_dih(1) + sin_dih(1)
         self.mlp1 = nn.Sequential(
             nn.Linear(in_dim, 64),
             nn.BatchNorm1d(64),
@@ -72,6 +74,12 @@ class CADPatchEncoder(nn.Module):
             nn.LeakyReLU(0.2, inplace=True)
         )
 
+        self.attn_gate = nn.Sequential(
+            nn.Linear(3, 32),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(32, 1),
+        )
+
         self.mlp2 = nn.Sequential(
             nn.Linear(256 * 2, 256),
             nn.BatchNorm1d(256),
@@ -80,11 +88,9 @@ class CADPatchEncoder(nn.Module):
         )
 
     def forward(self, patch_features, patch_rel_pos, patch_hops):
-        # Flatten batch and key primitive dims: (B * N_cad, K, C)
         B, N_cad, K, _ = patch_features.shape
         hops_norm = (patch_hops.unsqueeze(-1).float()) / float(self.patch_k)
 
-        # x: (B, N_cad, K, 17)
         min_m = min(patch_features.shape[1], patch_rel_pos.shape[1], hops_norm.shape[1])
         if patch_features.shape[1] != min_m or patch_rel_pos.shape[1] != min_m or hops_norm.shape[1] != min_m:
             patch_features = patch_features[:, :min_m, :, :]
@@ -92,18 +98,23 @@ class CADPatchEncoder(nn.Module):
             hops_norm = hops_norm[:, :min_m, :, :]
             N_cad = min_m
 
-        x = torch.cat([patch_features, patch_rel_pos, hops_norm], dim=-1)
+        n_all = F.normalize(patch_features[..., 3:6], dim=-1, eps=1e-6)
+        n_center = n_all[:, :, 0:1, :]
+        cos_dih = (n_all * n_center).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+        sin_dih = torch.sqrt((1.0 - cos_dih * cos_dih).clamp(min=1e-6))
+
+        x = torch.cat([patch_features, patch_rel_pos, hops_norm, cos_dih, sin_dih], dim=-1)
         x = x.view(B * N_cad * K, -1)
 
-        feat = self.mlp1(x) # (B * N_cad * K, 256)
-        feat = feat.view(B * N_cad, K, 256)
+        feat = self.mlp1(x).view(B * N_cad, K, 256)
 
-        max_pool = torch.max(feat, dim=1)[0]   # (B * N_cad, 256)
-        mean_pool = torch.mean(feat, dim=1)    # (B * N_cad, 256)
-        fused = torch.cat([max_pool, mean_pool], dim=-1) # (B * N_cad, 512)
+        edge_cue = torch.cat([hops_norm, cos_dih, sin_dih], dim=-1).view(B * N_cad, K, 3)
+        attn_w = torch.softmax(self.attn_gate(edge_cue), dim=1)
+        attn_pool = torch.sum(feat * attn_w, dim=1)
+        max_pool = torch.max(feat, dim=1)[0]
+        fused = torch.cat([max_pool, attn_pool], dim=-1)
 
-        desc = self.mlp2(fused) # (B * N_cad, descriptor_dim)
-        desc = desc.view(B, N_cad, self.descriptor_dim)
+        desc = self.mlp2(fused).view(B, N_cad, self.descriptor_dim)
         return F.normalize(desc, p=2, dim=-1)
 
 class ObservationEncoder(nn.Module):
@@ -151,7 +162,13 @@ class ObservationEncoder(nn.Module):
             nn.Conv1d(256, descriptor_dim, kernel_size=1)
         )
 
-    def forward(self, obs_pts):
+        self.inlier_head = nn.Sequential(
+            nn.Linear(descriptor_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, obs_pts, return_confidence: bool = False):
         # obs_pts: (B, N, 3) -> (B, 3, N)
         x = obs_pts.transpose(2, 1).contiguous()
         B, C, N = x.shape
@@ -176,19 +193,23 @@ class ObservationEncoder(nn.Module):
 
         desc = self.mlp_out(fused) # (B, descriptor_dim, N)
         desc = desc.transpose(2, 1).contiguous() # (B, N, descriptor_dim)
-        return F.normalize(desc, p=2, dim=-1)
+        obs_desc = F.normalize(desc, p=2, dim=-1)
+        if return_confidence:
+            conf_logits = self.inlier_head(obs_desc).squeeze(-1)
+            return obs_desc, conf_logits
+        return obs_desc
 
 class CADHierarchyCorrespondenceModel(nn.Module):
     """
     Full CAD-aware Hierarchical Correspondence Learning Network:
       CADPatchEncoder + ObservationEncoder + Cosine Similarity Matrix.
     """
-    def __init__(self, descriptor_dim: int = 128, patch_k: int = 32, obs_k: int = 20, temperature: float = 0.07):
+    def __init__(self, descriptor_dim: int = 128, patch_k: int = 32, obs_k: int = 20, temperature: float = 0.07, in_channels: int = 13):
         super().__init__()
         self.descriptor_dim = descriptor_dim
         self.temperature = temperature
 
-        self.cad_encoder = CADPatchEncoder(descriptor_dim=descriptor_dim, patch_k=patch_k)
+        self.cad_encoder = CADPatchEncoder(descriptor_dim=descriptor_dim, patch_k=patch_k, in_channels=in_channels)
         self.obs_encoder = ObservationEncoder(k=obs_k, descriptor_dim=descriptor_dim)
 
     def encode_cad(self, patch_features, patch_rel_pos, patch_hops):

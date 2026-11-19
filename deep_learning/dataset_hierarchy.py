@@ -9,6 +9,7 @@ PyTorch Dataset cho TMCAD Single-CAD Hierarchy:
 """
 
 import json
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -349,6 +350,416 @@ class CADHierarchyDataset(Dataset):
             "obs_points_norm": torch.from_numpy(pts_cam_norm),
             "gt_cad_points": torch.from_numpy(cad_pts),
             "gt_patch_ids": torch.from_numpy(patch_ids),
+            "inlier_mask": torch.from_numpy(inlier_mask),
+            "patch_features": torch.from_numpy(self.patch_features),
+            "patch_centers": torch.from_numpy(self.patch_centers),
+            "patch_normals": torch.from_numpy(self.patch_normals),
+            "symmetry_matrices": self.symmetry_matrices_tensor,
+            "R_gt": torch.from_numpy(R_gt),
+            "t_gt": torch.from_numpy(t_gt),
+        }
+
+
+def _load_mesh_triangles(mesh_path: str):
+    """Đọc đỉnh (V, 3) và mặt tam giác (F, 3) từ _mesh.ply khi _triangles.npz không có vertices."""
+    if not os.path.isfile(mesh_path):
+        return None, None
+    try:
+        import trimesh
+        mesh = trimesh.load(mesh_path, force="mesh", process=False)
+        if hasattr(mesh, "vertices") and hasattr(mesh, "faces") and len(mesh.faces) > 0:
+            return np.asarray(mesh.vertices, dtype=np.float32), np.asarray(mesh.faces, dtype=np.int64)
+    except Exception:
+        pass
+    try:
+        import open3d as o3d
+        mesh = o3d.io.read_triangle_mesh(mesh_path)
+        if len(mesh.triangles) > 0:
+            return np.asarray(mesh.vertices, dtype=np.float32), np.asarray(mesh.triangles, dtype=np.int64)
+    except Exception:
+        pass
+    return None, None
+
+
+def _random_so3_matrix(rng: np.random.Generator) -> np.ndarray:
+    """Sinh ma trận xoay đều trên SO(3) (Shoemake uniform quaternion)."""
+    u1, u2, u3 = rng.random(3)
+    q0 = math.sqrt(1.0 - u1) * math.sin(2.0 * math.pi * u2)
+    q1 = math.sqrt(1.0 - u1) * math.cos(2.0 * math.pi * u2)
+    q2 = math.sqrt(u1) * math.sin(2.0 * math.pi * u3)
+    q3 = math.sqrt(u1) * math.cos(2.0 * math.pi * u3)
+    x, y, z, w = q0, q1, q2, q3
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],
+        [2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)],
+    ], dtype=np.float32)
+
+
+def _look_at_camera_from_object(cam_pos: np.ndarray, target: np.ndarray, up_hint: np.ndarray):
+    """Trả về (R_cam_obj, t_cam_obj) chuẩn OpenCV (+X phải, +Y xuống, +Z nhìn vào vật)."""
+    z_cam = target - cam_pos
+    z_cam = z_cam / (np.linalg.norm(z_cam) + 1e-8)
+    x_cam = np.cross(z_cam, up_hint)
+    if np.linalg.norm(x_cam) < 1e-5:
+        x_cam = np.cross(z_cam, np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    x_cam = x_cam / (np.linalg.norm(x_cam) + 1e-8)
+    y_cam = np.cross(z_cam, x_cam)
+    R_cam_obj = np.stack([x_cam, y_cam, z_cam], axis=0).astype(np.float32)
+    t_cam_obj = (-R_cam_obj @ cam_pos).astype(np.float32)
+    return R_cam_obj, t_cam_obj
+
+
+class OnTheFlyTriangleDataset(Dataset):
+    """
+    Dataset sinh mẫu trực tiếp trên lưới tam giác trong RAM (0 MB ổ cứng):
+      - Barycentric Sampling theo trọng số diện tích (khử Tessellation Bias)
+      - Backface Culling + Z-buffer 2D vectorized (loại bỏ vách khuất ruột engine_block)
+      - Sim-to-Real Dropout (góc nghiêng > 68°, che khuất khối cầu 15-35%, nhiễu Z^2, clutter)
+      - Chuẩn hóa (pts - centroid_3d) / real_bounding_diag_m khớp 100% với C++
+    """
+
+    def __init__(
+        self,
+        cad_data_dir: str,
+        cad_name: str,
+        split: str = "train",
+        samples_per_epoch: int = 2400,
+        num_obs_points: int = 1024,
+        num_cad_samples: int = 256,
+        enable_sim2real_noise: bool = True,
+        max_occlusion_ratio: float = 0.35,
+        zbuffer_grid: int = 64,
+    ):
+        super().__init__()
+        self.cad_data_dir = cad_data_dir
+        self.cad_name = cad_name
+        self.split = split
+        self.samples_per_epoch = int(samples_per_epoch if split == "train" else min(samples_per_epoch, 256))
+        self.num_obs_points = int(num_obs_points)
+        self.num_cad_samples = int(num_cad_samples)
+        self.enable_sim2real_noise = bool(enable_sim2real_noise and split == "train")
+        self.max_occlusion_ratio = float(max_occlusion_ratio)
+        self.zbuffer_grid = int(zbuffer_grid)
+
+        self._load_canonical_cad_assets()
+        self._build_fixed_val_views()
+
+    def _resolve_file(self, suffix: str) -> str:
+        cands = [
+            os.path.join(self.cad_data_dir, f"{self.cad_name}{suffix}"),
+            os.path.join(self.cad_data_dir, self.cad_name, f"{self.cad_name}{suffix}"),
+        ]
+        for p in cands:
+            if os.path.isfile(p):
+                return p
+        return cands[0]
+
+    def _load_canonical_cad_assets(self):
+        tri_npz = np.load(self._resolve_file("_triangles.npz"))
+        patch_npz = np.load(self._resolve_file("_patches.npz"))
+
+        if "features" in tri_npz:
+            self.tri_features = tri_npz["features"].astype(np.float32)
+        else:
+            centers = tri_npz["centers"].astype(np.float32)
+            normals = tri_npz["normals"].astype(np.float32)
+            areas = tri_npz["areas"].astype(np.float32).reshape(-1, 1)
+            extra = np.zeros((len(centers), 6), dtype=np.float32)
+            self.tri_features = np.concatenate([centers, normals, areas, extra], axis=-1)
+
+        self.tri_centers = tri_npz["centers"].astype(np.float32) if "centers" in tri_npz else self.tri_features[:, 0:3]
+        self.tri_normals = tri_npz["normals"].astype(np.float32) if "normals" in tri_npz else self.tri_features[:, 3:6]
+        n_norm = np.linalg.norm(self.tri_normals, axis=1, keepdims=True) + 1e-8
+        self.tri_normals = self.tri_normals / n_norm
+
+        if "vertices" in tri_npz and tri_npz["vertices"].ndim == 3 and tri_npz["vertices"].shape[1:] == (3, 3):
+            verts3 = tri_npz["vertices"].astype(np.float32)
+            self.v0 = verts3[:, 0]
+            self.v1 = verts3[:, 1]
+            self.v2 = verts3[:, 2]
+            self.has_exact_mesh = True
+        else:
+            verts, faces = _load_mesh_triangles(self._resolve_file("_mesh.ply"))
+            if verts is not None and faces is not None and len(faces) == len(self.tri_centers):
+                self.v0 = verts[faces[:, 0]]
+                self.v1 = verts[faces[:, 1]]
+                self.v2 = verts[faces[:, 2]]
+                self.has_exact_mesh = True
+            else:
+                self.v0 = self.v1 = self.v2 = None
+                self.has_exact_mesh = False
+
+        if "areas" in tri_npz:
+            areas = tri_npz["areas"].astype(np.float64).reshape(-1)
+        elif self.has_exact_mesh:
+            cross_v = np.cross(self.v1 - self.v0, self.v2 - self.v0)
+            areas = 0.5 * np.linalg.norm(cross_v, axis=1).astype(np.float64)
+        else:
+            areas = np.ones(len(self.tri_centers), dtype=np.float64)
+        areas = np.clip(areas, 1e-10, None)
+        self.tri_area_probs = (areas / np.sum(areas)).astype(np.float64)
+
+        reg_path = self._resolve_file("_regions.npz")
+        if os.path.isfile(reg_path):
+            reg_npz = np.load(reg_path)
+            reg_key = "region_ids" if "region_ids" in reg_npz else (
+                "triangle_regions" if "triangle_regions" in reg_npz else list(reg_npz.keys())[0]
+            )
+            self.tri_regions = reg_npz[reg_key].astype(np.int64).reshape(-1)
+        else:
+            self.tri_regions = np.zeros(len(self.tri_centers), dtype=np.int64)
+
+        prof_path = self._resolve_file("_profile.json")
+        if os.path.isfile(prof_path):
+            with open(prof_path, "r", encoding="utf-8") as f:
+                prof = json.load(f)
+            self.is_floor_standing = (prof.get("placement_mode", "FREE_6DOF") == "FLOOR_STANDING")
+            self.real_bounding_diag_m = float(prof.get("real_bounding_diag_m", 0.0))
+            bmin_raw = prof.get("cad_min_xyz_m", prof.get("bbox_min", self.tri_centers.min(axis=0)))
+            bmax_raw = prof.get("cad_max_xyz_m", prof.get("bbox_max", self.tri_centers.max(axis=0)))
+            self.bbox_min = np.asarray(bmin_raw, dtype=np.float32)
+            self.bbox_max = np.asarray(bmax_raw, dtype=np.float32)
+        else:
+            self.is_floor_standing = ("TABLE" in self.cad_name.upper())
+            self.bbox_min = self.tri_centers.min(axis=0).astype(np.float32)
+            self.bbox_max = self.tri_centers.max(axis=0).astype(np.float32)
+            self.real_bounding_diag_m = float(np.linalg.norm(self.bbox_max - self.bbox_min))
+
+        if self.real_bounding_diag_m <= 1e-4:
+            self.real_bounding_diag_m = float(np.linalg.norm(self.bbox_max - self.bbox_min))
+        self.cad_center = 0.5 * (self.bbox_min + self.bbox_max)
+
+        sym_path = self._resolve_file("_symmetry.json")
+        self.symmetry_type = "None"
+        sym_list = [np.eye(3, dtype=np.float32)]
+        if os.path.isfile(sym_path):
+            with open(sym_path, "r", encoding="utf-8") as f:
+                sym_j = json.load(f)
+            self.symmetry_type = sym_j.get("symmetry_type", "None")
+            mats = sym_j.get("symmetry_transforms", [])
+            if mats:
+                parsed_syms = []
+                for m in mats:
+                    arr = np.asarray(m, dtype=np.float32)
+                    if arr.size == 16:
+                        parsed_syms.append(arr.reshape(4, 4)[:3, :3])
+                    elif arr.ndim == 2 and arr.shape[0] >= 3 and arr.shape[1] >= 3:
+                        parsed_syms.append(arr[:3, :3])
+                    elif arr.size == 9:
+                        parsed_syms.append(arr.reshape(3, 3))
+                if parsed_syms:
+                    sym_list = parsed_syms
+        self.symmetry_matrices_tensor = torch.from_numpy(np.stack(sym_list, axis=0))
+
+        M_total = len(self.tri_features)
+        key_path = os.path.join(self.cad_data_dir, f"{self.cad_name}_key_triangles_{self.num_cad_samples}.npy")
+        if os.path.isfile(key_path):
+            key_idx = np.clip(np.load(key_path).astype(np.int64), 0, M_total - 1)
+        elif M_total >= self.num_cad_samples:
+            key_idx = np.linspace(0, M_total - 1, self.num_cad_samples, dtype=np.int64)
+        else:
+            rng_k = np.random.default_rng(1337)
+            key_idx = rng_k.choice(M_total, size=self.num_cad_samples, replace=True).astype(np.int64)
+        self.cad_key_indices = key_idx
+
+        if "patch_features" in patch_npz:
+            pf = patch_npz["patch_features"].astype(np.float32)
+            self.patch_features = pf[key_idx] if len(pf) != len(key_idx) else pf
+        else:
+            idx_key = "patch_indices" if "patch_indices" in patch_npz else "patch_triangle_indices"
+            p_idx = patch_npz[idx_key].astype(np.int64)
+            if len(p_idx) != len(key_idx):
+                p_idx = p_idx[key_idx]
+            self.patch_features = self.tri_features[np.clip(p_idx, 0, M_total - 1)]
+
+        self.patch_centers = self.patch_features[:, 0, 0:3].copy()
+        self.patch_normals = self.patch_features[:, 0, 3:6].copy()
+
+        if "patch_hops" in patch_npz:
+            ph = patch_npz["patch_hops"].astype(np.float32)
+            self.patch_hops = ph[key_idx] if len(ph) != len(key_idx) else ph
+        else:
+            self.patch_hops = np.zeros(self.patch_features.shape[:2], dtype=np.float32)
+
+    def _build_fixed_val_views(self):
+        self.val_poses = []
+        if self.split == "train":
+            return
+        rng = np.random.default_rng(2026)
+        N = self.samples_per_epoch
+        golden = math.pi * (3.0 - math.sqrt(5.0))
+        for i in range(N):
+            if self.is_floor_standing:
+                az = 2.0 * math.pi * (i / max(1, N))
+                cam_h = 0.20 + 0.95 * ((i % 7) / 6.0)
+                dist = self.real_bounding_diag_m * (1.2 + 1.0 * ((i % 5) / 4.0))
+                cam_pos = np.array([
+                    self.cad_center[0] + dist * math.cos(az),
+                    self.cad_center[1] + dist * math.sin(az),
+                    self.bbox_min[2] + cam_h,
+                ], dtype=np.float32)
+                R, t = _look_at_camera_from_object(cam_pos, self.cad_center, np.array([0, 0, 1], dtype=np.float32))
+            else:
+                y = 1.0 - (i / max(1, N - 1)) * 2.0
+                r = math.sqrt(max(0.0, 1.0 - y * y))
+                theta = golden * i
+                dist = self.real_bounding_diag_m * rng.uniform(2.2, 4.5)
+                cam_pos = self.cad_center + dist * np.array([math.cos(theta) * r, math.sin(theta) * r, y], dtype=np.float32)
+                up = rng.normal(size=3).astype(np.float32)
+                up = up / (np.linalg.norm(up) + 1e-8)
+                R, t = _look_at_camera_from_object(cam_pos, self.cad_center, up)
+            self.val_poses.append((R, t))
+
+    def __len__(self) -> int:
+        return self.samples_per_epoch
+
+    def _sample_camera_pose(self, rng: np.random.Generator, idx: int):
+        if self.split != "train":
+            return self.val_poses[idx]
+        if self.is_floor_standing:
+            az = rng.uniform(0.0, 2.0 * math.pi)
+            cam_h = rng.uniform(0.15, 1.25)
+            dist = rng.uniform(max(0.65, 1.1 * self.real_bounding_diag_m), max(2.2, 2.6 * self.real_bounding_diag_m))
+            cam_pos = np.array([
+                self.cad_center[0] + dist * math.cos(az),
+                self.cad_center[1] + dist * math.sin(az),
+                self.bbox_min[2] + cam_h,
+            ], dtype=np.float32)
+            target = self.cad_center + rng.normal(0.0, 0.03 * self.real_bounding_diag_m, size=3).astype(np.float32)
+            return _look_at_camera_from_object(cam_pos, target, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+
+        R = _random_so3_matrix(rng)
+        dist = rng.uniform(max(0.28, 1.8 * self.real_bounding_diag_m), max(0.85, 5.5 * self.real_bounding_diag_m))
+        t = np.array([
+            rng.uniform(-0.12, 0.12) * dist,
+            rng.uniform(-0.12, 0.12) * dist,
+            dist,
+        ], dtype=np.float32) - (R @ self.cad_center)
+        return R, t
+
+    def _sample_visible_surface(self, R: np.ndarray, t: np.ndarray, rng: np.random.Generator):
+        n_raw = max(4096, self.num_obs_points * 4)
+        tri_ids = rng.choice(len(self.tri_centers), size=n_raw, replace=True, p=self.tri_area_probs)
+
+        if self.has_exact_mesh:
+            r1 = np.sqrt(rng.random(n_raw, dtype=np.float32))[:, None]
+            r2 = rng.random(n_raw, dtype=np.float32)[:, None]
+            w0 = 1.0 - r1
+            w1 = r1 * (1.0 - r2)
+            w2 = r1 * r2
+            pts_cad = w0 * self.v0[tri_ids] + w1 * self.v1[tri_ids] + w2 * self.v2[tri_ids]
+        else:
+            pts_cad = self.tri_centers[tri_ids].copy()
+
+        norms_cad = self.tri_normals[tri_ids]
+        pts_cam = (pts_cad @ R.T) + t[None, :]
+        norms_cam = norms_cad @ R.T
+
+        ray_len = np.linalg.norm(pts_cam, axis=1, keepdims=True) + 1e-8
+        view_dir = pts_cam / ray_len
+        cos_inc = -np.sum(norms_cam * view_dir, axis=1)
+        vis_mask = (pts_cam[:, 2] > 0.10) & (cos_inc > 0.05)
+        if np.sum(vis_mask) < 64:
+            vis_mask = pts_cam[:, 2] > 0.05
+
+        pts_cam = pts_cam[vis_mask]
+        pts_cad = pts_cad[vis_mask]
+        tri_ids = tri_ids[vis_mask]
+        cos_inc = cos_inc[vis_mask]
+
+        u = pts_cam[:, 0] / np.clip(pts_cam[:, 2], 1e-4, None)
+        v = pts_cam[:, 1] / np.clip(pts_cam[:, 2], 1e-4, None)
+        u_min, u_max = float(u.min()), float(u.max())
+        v_min, v_max = float(v.min()), float(v.max())
+        G = self.zbuffer_grid
+        bx = np.clip(((u - u_min) / max(1e-6, u_max - u_min) * (G - 1)).astype(np.int32), 0, G - 1)
+        by = np.clip(((v - v_min) / max(1e-6, v_max - v_min) * (G - 1)).astype(np.int32), 0, G - 1)
+        cell_idx = by * G + bx
+
+        z_min_grid = np.full(G * G, np.inf, dtype=np.float32)
+        np.minimum.at(z_min_grid, cell_idx, pts_cam[:, 2])
+        z_tol = max(0.006, 0.035 * self.real_bounding_diag_m)
+        front_mask = pts_cam[:, 2] <= (z_min_grid[cell_idx] + z_tol)
+
+        if np.sum(front_mask) >= 64:
+            pts_cam = pts_cam[front_mask]
+            pts_cad = pts_cad[front_mask]
+            tri_ids = tri_ids[front_mask]
+            cos_inc = cos_inc[front_mask]
+
+        return pts_cam, pts_cad, tri_ids, cos_inc
+
+    def _apply_sim2real_noise(self, pts_cam, pts_cad, tri_ids, cos_inc, rng: np.random.Generator):
+        keep_prob = np.where(cos_inc < 0.375, 0.20, 1.0)
+        keep = rng.random(len(pts_cam)) < keep_prob
+        if np.sum(keep) >= 96:
+            pts_cam, pts_cad, tri_ids = pts_cam[keep], pts_cad[keep], tri_ids[keep]
+
+        if rng.random() < 0.75 and len(pts_cam) > 160:
+            center_occ = pts_cam[rng.integers(0, len(pts_cam))]
+            rad_occ = rng.uniform(0.12, 0.28) * self.real_bounding_diag_m
+            dist_occ = np.linalg.norm(pts_cam - center_occ[None, :], axis=1)
+            not_occ = dist_occ > rad_occ
+            if np.mean(~not_occ) <= self.max_occlusion_ratio and np.sum(not_occ) >= 96:
+                pts_cam, pts_cad, tri_ids = pts_cam[not_occ], pts_cad[not_occ], tri_ids[not_occ]
+
+        z = np.clip(pts_cam[:, 2], 0.15, 3.0)
+        sigma_z = (0.0015 + 0.0028 * (z ** 2)).astype(np.float32)
+        ray_dir = pts_cam / (np.linalg.norm(pts_cam, axis=1, keepdims=True) + 1e-8)
+        pts_cam = pts_cam + ray_dir * (rng.normal(0.0, 1.0, size=len(pts_cam)).astype(np.float32) * sigma_z)[:, None]
+
+        n_clutter = int(self.num_obs_points * rng.uniform(0.05, 0.10)) if rng.random() < 0.7 else 0
+        n_obj = self.num_obs_points - n_clutter
+        sel = rng.choice(len(pts_cam), size=n_obj, replace=(len(pts_cam) < n_obj))
+
+        obj_cam = pts_cam[sel]
+        obj_cad = pts_cad[sel]
+        obj_tri = tri_ids[sel]
+        inlier_mask = np.ones(self.num_obs_points, dtype=np.float32)
+
+        if n_clutter > 0:
+            c_mean = obj_cam.mean(axis=0)
+            clutter_cam = c_mean[None, :] + rng.uniform(
+                -0.75 * self.real_bounding_diag_m, 0.75 * self.real_bounding_diag_m, size=(n_clutter, 3)
+            ).astype(np.float32)
+            obj_cam = np.concatenate([obj_cam, clutter_cam], axis=0)
+            obj_cad = np.concatenate([obj_cad, np.zeros((n_clutter, 3), dtype=np.float32)], axis=0)
+            obj_tri = np.concatenate([obj_tri, np.full(n_clutter, -1, dtype=np.int64)], axis=0)
+            inlier_mask[n_obj:] = 0.0
+
+        return obj_cam, obj_cad, obj_tri, inlier_mask
+
+    def __getitem__(self, idx: int) -> dict:
+        rng = np.random.default_rng() if self.split == "train" else np.random.default_rng(10000 + idx)
+        R_gt, t_gt = self._sample_camera_pose(rng, idx)
+        pts_cam, pts_cad, tri_ids, cos_inc = self._sample_visible_surface(R_gt, t_gt, rng)
+
+        if self.enable_sim2real_noise:
+            obs_cam, obs_cad, obs_tri, inlier_mask = self._apply_sim2real_noise(pts_cam, pts_cad, tri_ids, cos_inc, rng)
+        else:
+            sel = rng.choice(len(pts_cam), size=self.num_obs_points, replace=(len(pts_cam) < self.num_obs_points))
+            obs_cam = pts_cam[sel]
+            obs_cad = pts_cad[sel]
+            obs_tri = tri_ids[sel]
+            inlier_mask = np.ones(self.num_obs_points, dtype=np.float32)
+
+        centroid_3d = obs_cam.mean(axis=0, keepdims=True)
+        obs_points_norm = ((obs_cam - centroid_3d) / max(1e-4, self.real_bounding_diag_m)).astype(np.float32)
+
+        dists_sq = np.sum((obs_cad[:, None, :] - self.patch_centers[None, :, :]) ** 2, axis=-1)
+        patch_targets = np.argmin(dists_sq, axis=1).astype(np.int64)
+        patch_targets[inlier_mask < 0.5] = -1
+
+        region_ids = np.where(obs_tri >= 0, self.tri_regions[np.clip(obs_tri, 0, len(self.tri_regions) - 1)], -1).astype(np.int64)
+
+        return {
+            "obs_points_norm": torch.from_numpy(obs_points_norm),
+            "obs_points_cam": torch.from_numpy(obs_cam.astype(np.float32)),
+            "obs_points_cad": torch.from_numpy(obs_cad.astype(np.float32)),
+            "obs_tri_ids": torch.from_numpy(obs_tri),
+            "obs_patch_targets": torch.from_numpy(patch_targets),
+            "obs_region_ids": torch.from_numpy(region_ids),
             "inlier_mask": torch.from_numpy(inlier_mask),
             "patch_features": torch.from_numpy(self.patch_features),
             "patch_centers": torch.from_numpy(self.patch_centers),
