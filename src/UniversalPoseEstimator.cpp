@@ -57,9 +57,6 @@ void computeVisibleCadSubset(const cv::Matx33d& R,
     for (size_t i = 0; i < mesh_pts.size(); i += mesh_stride) {
         cv::Vec3d p_cam = R * cv::Vec3d(mesh_pts[i]) + t;
         if (p_cam[2] <= 0.05) continue;
-        if (mesh_pts[i].dot(mesh_normals[i]) < -1e-4f && (p_cam[2] - t[2]) > 0.0) continue;
-        cv::Vec3d n_cam = R * cv::Vec3d(mesh_normals[i]);
-        if (n_cam.dot(p_cam) > 0.10 * cv::norm(p_cam)) continue;
 
         double u = p_cam[0] * fx / p_cam[2] + cx;
         double v = p_cam[1] * fy / p_cam[2] + cy;
@@ -73,8 +70,9 @@ void computeVisibleCadSubset(const cv::Matx33d& R,
     }
     if (cands.empty()) return;
 
-    // Lưới Z-buffer cục bộ 48x48 phủ khít khung hình chiếu 2D của vật thể (bất biến theo kích thước/cự ly)
-    constexpr int kGrid = 48;
+    // Lưới Z-buffer cục bộ tự thích nghi mật độ điểm (đảm bảo ~3-4 điểm/ô để mặt lưng không lọt qua pinhole
+    // ở mọi mức stride, và bất biến hoàn toàn với chiều pháp tuyến/winding của CAD hở/lắp ghép)
+    const int kGrid = std::clamp(static_cast<int>(std::sqrt(static_cast<double>(cands.size()) * 0.45)), 12, 40);
     std::vector<float> z_buf(kGrid * kGrid, 1e6f);
     const double u_span = std::max(1.0, u_max - u_min);
     const double v_span = std::max(1.0, v_max - v_min);
@@ -88,7 +86,7 @@ void computeVisibleCadSubset(const cv::Matx33d& R,
         if (c.z < cell_z) cell_z = c.z;
     }
 
-    const float z_tol = static_cast<float>(std::max(0.008, 0.04 * std::max(0.05, cad_diag_m)));
+    const float z_tol = static_cast<float>(std::max(0.006, 0.035 * std::max(0.05, cad_diag_m)));
     out_pts.reserve(cands.size());
     out_norms.reserve(cands.size());
     for (const auto& c : cands) {
@@ -139,6 +137,118 @@ double computeProjectedDepthCoverage(const cv::Matx33d& R,
         }
     }
     return (total_proj >= 12) ? (static_cast<double>(valid_near) / static_cast<double>(total_proj)) : 0.0;
+}
+
+// DEPTH FREE-SPACE CARVING (Zero-Custom, bất biến với dạng hình học/winding của mọi CAD):
+// Tia camera đi qua pixel (u,v) đo được độ sâu z_obs. Nếu một điểm vật liệu CAD bất kỳ (kể cả bị che) nằm ở z_cad
+// mà z_obs > z_cad + tol thì tia đã xuyên qua chỗ CAD khẳng định có vật chất => mâu thuẫn không gian trống.
+// - Quai/chi tiết CAD chĩa sai hướng ra vùng nền trống => bị phạt nặng.
+// - Quai CAD xoay ra sau thân (bị che, z_cad > z_obs) => không bị phạt (đúng vật lý che khuất).
+// - Pixel mất Depth (raw == 0) => không biết => bỏ qua (không phạt oan khi quai mất Depth).
+// Lấy min-depth trong cửa sổ 3x3 để miễn nhiễm với flying-pixels ở biên silhouette.
+double computeFreeSpaceViolation(const cv::Matx33d& R,
+                                 const cv::Vec3d& t,
+                                 const std::vector<cv::Vec3f>& mesh_pts,
+                                 const cv::Mat& depth_z16,
+                                 double fx, double fy, double cx, double cy,
+                                 double depth_scale,
+                                 double cad_diag_m,
+                                 size_t max_samples = 700)
+{
+    if (mesh_pts.empty() || depth_z16.empty() || depth_z16.type() != CV_16UC1) return 0.0;
+    const double d_scale = (depth_scale > 1e-6) ? depth_scale : 0.001;
+    const double tol = std::clamp(0.08 * cad_diag_m, 0.010, 0.025);
+    const int w = depth_z16.cols, h = depth_z16.rows;
+    const size_t step = std::max<size_t>(1, mesh_pts.size() / std::max<size_t>(64, max_samples));
+    int known = 0, viol = 0;
+    for (size_t i = 0; i < mesh_pts.size(); i += step) {
+        const cv::Vec3d pc = R * cv::Vec3d(mesh_pts[i]) + t;
+        if (pc[2] <= 0.08) continue;
+        const int u = static_cast<int>(std::round(fx * pc[0] / pc[2] + cx));
+        const int v = static_cast<int>(std::round(fy * pc[1] / pc[2] + cy));
+        if (u < 1 || u >= w - 1 || v < 1 || v >= h - 1) continue;
+        uint16_t min_raw = 0xFFFF;
+        for (int dv = -1; dv <= 1; ++dv) {
+            const uint16_t* row = depth_z16.ptr<uint16_t>(v + dv);
+            for (int du = -1; du <= 1; ++du) {
+                const uint16_t r = row[u + du];
+                if (r > 0 && r < min_raw) min_raw = r;
+            }
+        }
+        if (min_raw == 0xFFFF) continue;
+        ++known;
+        const double z_obs = static_cast<double>(min_raw) * d_scale;
+        if (z_obs > pc[2] + tol) ++viol;
+    }
+    return (known >= 24) ? (static_cast<double>(viol) / static_cast<double>(known)) : 0.0;
+}
+// Trọng số phạt Free-Space trong xếp hạng giả thuyết toàn cục (đúng: fs≈0; lật/sai: fs≈0.03–0.3)
+constexpr double kFreeSpaceWeight = 0.5;
+
+// Quét 1D quanh trục xoay yếu (weak_axis_cam) bằng Free-Space Carving, pivot tại mesh_center (tâm bề mặt thật).
+// Chỉ chấp nhận góc mới khi giảm vi phạm không gian trống rõ rệt (không gán cứng góc, không đổi tâm vật).
+bool refineWeakAxisWithFreeSpace(cv::Matx33d& R,
+                                 cv::Vec3d& t,
+                                 const cv::Vec3d& weak_axis_cam,
+                                 const cv::Vec3d& mesh_center,
+                                 const std::vector<cv::Vec3f>& mesh_pts,
+                                 const cv::Mat& depth_z16,
+                                 double fx, double fy, double cx, double cy,
+                                 double depth_scale,
+                                 double cad_diag_m,
+                                 double* out_base_viol = nullptr,
+                                 double* out_best_viol = nullptr)
+{
+    const double base = computeFreeSpaceViolation(R, t, mesh_pts, depth_z16, fx, fy, cx, cy, depth_scale, cad_diag_m);
+    if (out_base_viol) *out_base_viol = base;
+    if (out_best_viol) *out_best_viol = base;
+    if (base < 0.025) return false; // Đã khớp không gian trống, không cần xoay
+    const cv::Vec3d world_center = R * mesh_center + t;
+    const double an = cv::norm(weak_axis_cam);
+    if (an < 1e-6) return false;
+    const cv::Vec3d ax = weak_axis_cam * (1.0 / an);
+
+    double best = base;
+    double best_deg = 0.0;
+    for (int deg = -180; deg < 180; deg += 10) {
+        if (deg == 0) continue;
+        const double rad = static_cast<double>(deg) * CV_PI / 180.0;
+        cv::Mat rv = (cv::Mat_<double>(3, 1) << ax[0] * rad, ax[1] * rad, ax[2] * rad);
+        cv::Mat Rm;
+        cv::Rodrigues(rv, Rm);
+        const cv::Matx33d dR(Rm);
+        const cv::Matx33d R_try = dR * R;
+        const cv::Vec3d t_try = world_center - R_try * mesh_center;
+        // Phạt nhẹ theo biên độ góc để ưu tiên chuyển động nhỏ khi ngang nhau
+        const double v = computeFreeSpaceViolation(R_try, t_try, mesh_pts, depth_z16, fx, fy, cx, cy, depth_scale, cad_diag_m)
+                       + 0.00008 * std::abs(static_cast<double>(deg));
+        if (v < best) { best = v; best_deg = static_cast<double>(deg); }
+    }
+    // Tinh chỉnh mịn ±5° quanh góc tốt nhất (bước 2.5°)
+    if (best_deg != 0.0) {
+        for (double dd : {-5.0, -2.5, 2.5, 5.0}) {
+            const double deg = best_deg + dd;
+            const double rad = deg * CV_PI / 180.0;
+            cv::Mat rv = (cv::Mat_<double>(3, 1) << ax[0] * rad, ax[1] * rad, ax[2] * rad);
+            cv::Mat Rm;
+            cv::Rodrigues(rv, Rm);
+            const cv::Matx33d R_try = cv::Matx33d(Rm) * R;
+            const cv::Vec3d t_try = world_center - R_try * mesh_center;
+            const double v = computeFreeSpaceViolation(R_try, t_try, mesh_pts, depth_z16, fx, fy, cx, cy, depth_scale, cad_diag_m)
+                           + 0.00008 * std::abs(deg);
+            if (v < best) { best = v; best_deg = deg; }
+        }
+    }
+    if (out_best_viol) *out_best_viol = best;
+    // Chỉ xoay khi giảm vi phạm rõ rệt: tuyệt đối >= 2.5% điểm VÀ tương đối <= 60% mức cũ
+    if (best_deg == 0.0 || best > base - 0.025 || best > 0.60 * base) return false;
+    const double rad = best_deg * CV_PI / 180.0;
+    cv::Mat rv = (cv::Mat_<double>(3, 1) << ax[0] * rad, ax[1] * rad, ax[2] * rad);
+    cv::Mat Rm;
+    cv::Rodrigues(rv, Rm);
+    R = cv::Matx33d(Rm) * R;
+    t = world_center - R * mesh_center;
+    return true;
 }
 
 struct RgbEdgeMaps {
@@ -1048,11 +1158,12 @@ inline double computeNormalConsistencyWeight(const cv::Vec3f& n_obs,
     if (n_obs.dot(n_obs) < 0.25f) return 1.0;
     const double n_vis_len = cv::norm(n_vis_cam);
     if (n_vis_len < 1e-6) return 1.0;
-    const double cos_ang = (static_cast<double>(n_obs[0]) * n_vis_cam[0] +
-                            static_cast<double>(n_obs[1]) * n_vis_cam[1] +
-                            static_cast<double>(n_obs[2]) * n_vis_cam[2]) / n_vis_len;
-    constexpr double kCosReject = 0.35; // ~69.5°
-    constexpr double kCosFull   = 0.90; // ~25.8°
+    const double cos_ang = std::abs(
+        static_cast<double>(n_obs[0]) * n_vis_cam[0] +
+        static_cast<double>(n_obs[1]) * n_vis_cam[1] +
+        static_cast<double>(n_obs[2]) * n_vis_cam[2]) / n_vis_len;
+    constexpr double kCosReject = 0.25; // ~75.5°
+    constexpr double kCosFull   = 0.80; // ~36.9°
     if (cos_ang <= kCosReject) return 0.0;
     if (cos_ang >= kCosFull)   return 1.0;
     return (cos_ang - kCosReject) / (kCosFull - kCosReject);
@@ -1289,7 +1400,7 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
             const double w_n = (has_n_obs && j < vis_norms.size())
                 ? computeNormalConsistencyWeight(n_obs_cad_f, vis_norms[j])
                 : 1.0;
-            const double pen_dsq = dsq * (1.0 + 1.5 * (1.0 - w_n));
+            const double pen_dsq = dsq * (1.0 + 0.6 * (1.0 - w_n));
             if (pen_dsq < min_score_dsq) {
                 min_score_dsq = pen_dsq;
                 best_min_dsq = dsq;
@@ -1306,10 +1417,10 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
             const double d_eff = std::min(d_euc, d_p2pl + 0.15 * d_tan);
             eff_dsq = d_eff * d_eff;
         }
-        const double w_k = has_n_obs ? (0.15 + 0.85 * best_w_n) : 1.0;
+        const double w_k = has_n_obs ? (0.65 + 0.35 * best_w_n) : 1.0;
         fwd_kern_sum += std::exp(-eff_dsq * inv_2sig2) * w_k;
         dsq_sum += std::min(eff_dsq, clamp_fwd);
-        if (eff_dsq <= tol_sq && (!has_n_obs || best_w_n >= 0.35)) ++fwd_inliers;
+        if (eff_dsq <= tol_sq) ++fwd_inliers;
         ++fwd_total;
     }
 
@@ -1341,7 +1452,7 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
         }
         double w_bwd = 1.0;
         if (use_obs_normals && j < vis_norms.size() && (*obs_normals)[best_i].dot((*obs_normals)[best_i]) > 0.25f) {
-            w_bwd = 0.15 + 0.85 * computeNormalConsistencyWeight((*obs_normals)[best_i], vn_cam);
+            w_bwd = 0.65 + 0.35 * computeNormalConsistencyWeight((*obs_normals)[best_i], vn_cam);
         }
         bwd_kern_sum += std::exp(-eff_dsq * inv_2sig2) * w_bwd;
         bwd_dsq_sum += std::min(eff_dsq, clamp_bwd);
@@ -1574,11 +1685,8 @@ cv::Vec3d computeVisibleSurfaceOffset(const cv::Matx33d& R,
         const cv::Vec3d p_local(mesh_pts[i]);
         const cv::Vec3d p_rot = R * (p_local - cad_mid);
         if (p_rot.dot(view_dir) > front_shell_cutoff) continue; // Loại bỏ mặt lưng & vách sâu phía sau
-        const cv::Vec3d n_cam = R * cv::Vec3d(mesh_normals[i]);
-        if (n_cam.dot(view_dir) < -0.05) {
-            vis_sum += p_local;
-            ++vis_cnt;
-        }
+        vis_sum += p_local;
+        ++vis_cnt;
     }
     if (vis_cnt >= 10) {
         const cv::Vec3d vis_mean_local = vis_sum * (1.0 / static_cast<double>(vis_cnt));
@@ -3476,11 +3584,11 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         std::clamp(diag * 0.013, 0.0035, 0.007)
     };
     const size_t search_fg_stride = std::max<size_t>(1, fg_pts.size() / 220);
-    const size_t search_mesh_stride = std::max<size_t>(1, _mesh_pts.size() / 520);
+    const size_t search_mesh_stride = std::max<size_t>(1, _mesh_pts.size() / 1200);
     const size_t polish_fg_stride = 1;
     const size_t polish_mesh_stride = (_mesh_pts.size() > 6000) ? 2 : 1;
 
-    const std::vector<cv::Vec3f> fg_normals = computeObsNormalsFromDepth(fg_pts, depth_z16, intr, 2);
+    const std::vector<cv::Vec3f> fg_normals = computeObsNormalsFromDepth(fg_pts, depth_z16, intr, 1);
 
     struct PoseSeed {
         cv::Matx33d R;
@@ -3521,13 +3629,19 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
     BidirectionalConsensus best_cons;
 
     const double max_center_drift = std::max(0.065, 0.45 * diag);
+    const double fs_depth_scale = (intr.depth_scale > 0.0) ? intr.depth_scale : 0.001;
+    const bool use_free_space = !_is_floor_standing && !depth_z16.empty() && depth_z16.type() == CV_16UC1;
     auto considerSolution = [&](const cv::Matx33d& R_sol, const cv::Vec3d& t_sol,
                                 const BidirectionalConsensus& c_sol, double bonus) {
         if (!isInTargetWorkspace(t_sol)) return;
         const cv::Vec3d pred_mid = R_sol * cad_mid + t_sol;
         if (cv::norm(pred_mid - c_fg) > max_center_drift + 0.35 * diag) return;
         const double inv_z_pen = (R_sol(1, 2) > 0.35) ? -0.025 : 0.0;
-        const double adj = c_sol.score + bonus + inv_z_pen;
+        // Free-Space Carving: phạt giả thuyết đặt vật chất CAD vào vùng camera đã nhìn xuyên qua (nền trống)
+        const double fs_viol = use_free_space
+            ? computeFreeSpaceViolation(R_sol, t_sol, _mesh_pts, depth_z16, fx, fy, cx, cy, fs_depth_scale, diag)
+            : 0.0;
+        const double adj = c_sol.score + bonus + inv_z_pen - kFreeSpaceWeight * fs_viol;
         if (adj > best_total) {
             best_total = adj;
             best_R = R_sol;
@@ -3706,12 +3820,16 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         const int s_ax1 = (long_ax + 1) % 3;
         const int s_ax2 = (long_ax + 2) % 3;
 
-        // Đo độ bất đối xứng pháp tuyến thiết diện ngang (Normal Covariance Anisotropy) từ _mesh_normals:
-        // Chỉ neo spin theo tia nhìn khi lưới CAD thực sự tròn xoay trơn (lam1 / lam2 < 1.08);
-        // giữ nguyên 100% góc Yaw thật cho mọi vật thể có mặt dẹt, gờ hoặc quai cầm.
-        double normal_anisotropy = 1.0;
-        if (_mesh_normals.size() >= 32) {
+        // Đo độ đối xứng trụ tròn thực sự (SO(2) continuous rotational symmetry) từ _mesh_normals:
+        // Chỉ neo spin theo tia nhìn khi vật thể vừa thuôn dài (elong >= 1.35), vừa tròn đều bậc 2 (lam1/lam2 < 1.08)
+        // VÀ bậc 4 (|E[e^{i4θ}]| < 0.12) để tuyệt đối không nhận nhầm khối lập phương / cơ khí 4 mặt (như engine_block).
+        const double elong = cad_span[long_ax] / std::max(1e-6, std::max(cad_span[s_ax1], cad_span[s_ax2]));
+        double normal_anisotropy = 10.0;
+        double h4_mag = 1.0;
+        if (_mesh_normals.size() >= 32 && elong >= 1.35) {
             double c11 = 0.0, c12 = 0.0, c22 = 0.0;
+            double sum_c4 = 0.0, sum_s4 = 0.0;
+            int cnt_lat = 0;
             const size_t n_step = std::max<size_t>(1, _mesh_normals.size() / 600);
             for (size_t i = 0; i < _mesh_normals.size(); i += n_step) {
                 const double n1 = static_cast<double>(_mesh_normals[i][s_ax1]);
@@ -3719,15 +3837,25 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
                 c11 += n1 * n1;
                 c12 += n1 * n2;
                 c22 += n2 * n2;
+                const double r2 = n1 * n1 + n2 * n2;
+                if (r2 > 0.09) {
+                    const double th = std::atan2(n2, n1);
+                    sum_c4 += std::cos(4.0 * th);
+                    sum_s4 += std::sin(4.0 * th);
+                    ++cnt_lat;
+                }
             }
             const double tr_n = c11 + c22;
             const double disc_n = std::sqrt(std::max(0.0, (c11 - c22) * (c11 - c22) + 4.0 * c12 * c12));
             const double lam1 = 0.5 * (tr_n + disc_n);
             const double lam2 = 0.5 * (tr_n - disc_n);
             normal_anisotropy = (lam2 > 1e-6) ? (lam1 / lam2) : 10.0;
+            if (cnt_lat >= 16) {
+                h4_mag = std::hypot(sum_c4, sum_s4) / static_cast<double>(cnt_lat);
+            }
         }
 
-        if (!_is_floor_standing && normal_anisotropy < 1.08) {
+        if (!_is_floor_standing && elong >= 1.35 && normal_anisotropy < 1.08 && h4_mag < 0.12) {
             cv::Vec3d axis_long(R_final(0, long_ax), R_final(1, long_ax), R_final(2, long_ax));
             axis_long *= (1.0 / std::max(1e-9, cv::norm(axis_long)));
 
@@ -4540,6 +4668,32 @@ PoseRefinerCallbacks UniversalPoseEstimator::makeTrackerCallbacks() const
             const int rw = rgb.cols;
             const int rh = rgb.rows;
             const double scale = (intr.depth_scale > 0.0) ? intr.depth_scale : 0.001;
+
+            // (3a) Depth Free-Space Carving quanh trục yếu: kéo quai/chi tiết CAD ra khỏi vùng nền trống
+            //      (xoay ra sau thân khi bị khuất) — chạy trước RGB contour để xử lý góc lớn, ~1 ms.
+            if (!depth_z16.empty() && depth_z16.type() == CV_16UC1) {
+                cv::Vec3d mesh_center_fs(0.0, 0.0, 0.0);
+                const size_t mc_step_fs = std::max<size_t>(1, _mesh_pts.size() / 500);
+                int mc_cnt_fs = 0;
+                for (size_t i = 0; i < _mesh_pts.size(); i += mc_step_fs) {
+                    mesh_center_fs += cv::Vec3d(_mesh_pts[i]);
+                    ++mc_cnt_fs;
+                }
+                if (mc_cnt_fs > 0) mesh_center_fs *= (1.0 / static_cast<double>(mc_cnt_fs));
+                cv::Matx33d R_fs = cand.R;
+                cv::Vec3d t_fs = cand.t;
+                if (refineWeakAxisWithFreeSpace(R_fs, t_fs, obs_info.weak_axis_cam, mesh_center_fs, _mesh_pts,
+                                                depth_z16, fx, fy, cx, cy, scale, diag)) {
+                    const BidirectionalConsensus c_old = evaluateBidirectionalConsensus(
+                        cand.R, cand.t, diag, _mesh_pts, _mesh_normals, fg_icp, fx, fy, cx, cy, w, h, false);
+                    const BidirectionalConsensus c_new = evaluateBidirectionalConsensus(
+                        R_fs, t_fs, diag, _mesh_pts, _mesh_normals, fg_icp, fx, fy, cx, cy, w, h, false);
+                    if (isInTargetWorkspace(t_fs) && c_new.score >= c_old.score - 0.03) {
+                        cand.R = R_fs;
+                        cand.t = t_fs;
+                    }
+                }
+            }
             cv::Mat proj_mask = cv::Mat::zeros(rh, rw, CV_8UC1);
             const size_t p_step = std::max<size_t>(1, _mesh_pts.size() / 900);
             int min_pu = rw, max_pu = 0, min_pv = rh, max_pv = 0;
@@ -5559,6 +5713,26 @@ cv::Rect2f UniversalPoseEstimator::projectCadBoundingBox(const cv::Matx33d& R,
         if (out_corners) out_corners->emplace_back(u, v);
         min_u = std::min(min_u, u); max_u = std::max(max_u, u);
         min_v = std::min(min_v, v); max_v = std::max(max_v, v);
+    }
+    // Khung 2D ôm khít hình chiếu bề mặt thật (_mesh_pts) thay vì 8 đỉnh OBB:
+    // OBB 3D vẫn giữ kích thước CAD (corners_2d), nhưng bbox_2d co lại đúng phần thân thấy được
+    // (vd quai cốc xoay ra sau => bề ngang 2D thu hẹp về thân trụ).
+    if (_mesh_pts.size() >= 32) {
+        float mu0 = 1e9f, mv0 = 1e9f, mu1 = -1e9f, mv1 = -1e9f;
+        const size_t step = std::max<size_t>(1, _mesh_pts.size() / 1500);
+        int cnt = 0;
+        for (size_t i = 0; i < _mesh_pts.size(); i += step) {
+            const cv::Vec3d p = R * cv::Vec3d(_mesh_pts[i]) + t;
+            if (p[2] <= 0.05) continue;
+            const float u = static_cast<float>(fx * p[0] / p[2] + cx);
+            const float v = static_cast<float>(fy * p[1] / p[2] + cy);
+            mu0 = std::min(mu0, u); mu1 = std::max(mu1, u);
+            mv0 = std::min(mv0, v); mv1 = std::max(mv1, v);
+            ++cnt;
+        }
+        if (cnt >= 16 && mu1 > mu0 && mv1 > mv0) {
+            return cv::Rect2f(mu0, mv0, mu1 - mu0, mv1 - mv0);
+        }
     }
     return cv::Rect2f(min_u, min_v, max_u - min_u, max_v - min_v);
 }
