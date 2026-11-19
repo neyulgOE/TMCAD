@@ -7,85 +7,13 @@
 #include <future>
 #include <chrono>
 #include "RgbdFrame.h"
+#include "ObjectPose.h"
+#include "TemporalPoseTracker.h"
 #include "CADSceneSegmenter.h"
 #include "CADMaskMatcher.h"
 #include "CADTemplateDetector.h"
 
 namespace tmcad {
-
-struct FeatureEdge3D {
-    cv::Vec3f p0{0.0f, 0.0f, 0.0f};
-    cv::Vec3f p1{0.0f, 0.0f, 0.0f};
-    cv::Vec3f n0{0.0f, 0.0f, 1.0f};
-    cv::Vec3f n1{0.0f, 0.0f, 1.0f};
-    float length_m{0.0f};
-};
-
-struct ObjectPose {
-    bool valid{false};
-    bool face_detected{false};
-    float face_confidence{0.0f};
-    float confidence{0.0f};
-    int inliers_count{0};
-    double inlier_ratio{0.0};
-    int cluster_points_count{0};
-    double rmse_m{0.0};
-
-    // Diagnostic telemetry fields populated by UniversalPoseEstimator
-    int valid_depth_pts{0};
-    bool floor_locked{false};
-    double floor_pitch_deg{0.0};
-    bool sparse_depth_fallback{false};
-    bool rgb_sil_strong{false};
-
-    cv::Matx33d R = cv::Matx33d::eye();
-    cv::Vec3d t{0.0, 0.0, 0.0};
-    cv::Vec3d t_glass{0.0, 0.0, 0.0};
-
-    double roll_deg{0.0};
-    double pitch_deg{0.0};
-    double yaw_deg{0.0};
-
-    std::string model_name{"GENERIC_CAD"};
-    std::string method{"none"};
-    cv::Rect2f bbox_2d;
-    std::vector<cv::Point2f> corners_2d;
-    std::vector<cv::Point2f> face_corners_2d;
-    std::vector<cv::Vec3f> segmented_points;
-};
-
-struct DetectionAcceptancePolicy {
-    static bool isInWorkspace(const cv::Vec3d& t, double cad_diag, bool is_floor_standing) {
-        if (!std::isfinite(t[0]) || !std::isfinite(t[1]) || !std::isfinite(t[2])) return false;
-        if (is_floor_standing) {
-            return (t[0] >= -1.35 && t[0] <= 1.35) &&
-                   (t[1] >= -0.95 && t[1] <= 0.65) &&
-                   (t[2] >= 0.45 && t[2] <= 2.95);
-        }
-        const double max_z = std::clamp(std::max(0.05, cad_diag) * 3.8 + 0.15, 0.95, 2.50);
-        return (std::abs(t[0]) <= 1.20) &&
-               (std::abs(t[1]) <= 1.00) &&
-               (t[2] >= 0.15 && t[2] <= max_z);
-    }
-
-    static bool isAccepted(const ObjectPose& pose, double cad_diag, bool is_floor_standing) {
-        if (!pose.valid) return false;
-        if (pose.method == "pca_fallback_seed") return false;
-        if (!isInWorkspace(pose.t, cad_diag, is_floor_standing)) return false;
-        if (pose.bbox_2d.width > 0.0f && pose.bbox_2d.height > 0.0f) {
-            if (std::max(pose.bbox_2d.width, pose.bbox_2d.height) < 24.0f ||
-                std::min(pose.bbox_2d.width, pose.bbox_2d.height) < 12.0f) {
-                return false;
-            }
-        }
-        if (pose.confidence < 0.65f) return false;
-        if (pose.rmse_m <= 1e-5 || pose.inliers_count < 8) return false;
-        const double max_rmse = std::clamp(0.072 * std::max(0.05, cad_diag), 0.012, 0.025);
-        if (pose.rmse_m > max_rmse) return false;
-        if (!is_floor_standing && !pose.rgb_sil_strong && pose.inlier_ratio < 0.50) return false;
-        return true;
-    }
-};
 
 class UniversalPoseEstimator {
 public:
@@ -177,18 +105,11 @@ public:
     bool multiInstanceMode() const noexcept { return _multi_instance_enabled; }
 
     void setTemporalTrackingEnabled(bool enable) noexcept {
-        _temporal_tracking_enabled = enable;
-        if (!enable) resetTemporalTrack();
+        _tracker.setEnabled(enable);
     }
-    bool temporalTrackingEnabled() const noexcept { return _temporal_tracking_enabled; }
+    bool temporalTrackingEnabled() const noexcept { return _tracker.isEnabled(); }
     void resetTemporalTrack() noexcept {
-        _track_active = false;
-        _track_confirm_streak = 0;
-        _track_miss_streak = 0;
-        _track_weak_frames = 0;
-        _track_has_floor = false;
-        _track_pose = ObjectPose{};
-        _track_prev_global = ObjectPose{};
+        _tracker.reset();
     }
 
     const std::string& modelName() const noexcept { return _model_name; }
@@ -261,10 +182,7 @@ private:
     static cv::Vec3d rotationMatrixToEulerDeg(const cv::Matx33d& R, bool fold_c2_yaw = false);
 
 private:
-    bool trackFromWarmStart(const cv::Mat& rgb,
-                            const cv::Mat& depth_z16,
-                            const CameraIntrinsics& intr,
-                            ObjectPose& out_pose);
+    PoseRefinerCallbacks makeTrackerCallbacks() const;
 
     std::vector<ObjectPose> proposeDepthHoleSeeds(const cv::Mat& rgb,
                                                   const cv::Mat& depth_z16,
@@ -288,15 +206,7 @@ private:
     int _max_instances{4};
     int _symmetry_code{0};
 
-    bool _temporal_tracking_enabled{false};
-    bool _track_active{false};
-    int _track_confirm_streak{0};
-    int _track_miss_streak{0};
-    int _track_weak_frames{0};
-    bool _track_has_floor{false};
-    cv::Vec4d _track_floor_plane{0.0, -1.0, 0.0, 0.0};
-    ObjectPose _track_pose;
-    ObjectPose _track_prev_global;
+    TemporalPoseTracker _tracker;
 
     int _last_valid_depth_pts{0};
     bool _last_floor_locked{false};

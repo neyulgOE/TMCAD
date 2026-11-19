@@ -33,6 +33,9 @@ list(JOIN ORT_LINK_DIRS ";" ORT_RPATH)
 
 # Single-Source-of-Truth pose core shared by CadViewer and TMVis_Debug (no Open3D dependency)
 add_library(tmcad_pose_core STATIC
+    src/ObjectPose.h
+    src/TemporalPoseTracker.h
+    src/TemporalPoseTracker.cpp
     src/CADSceneSegmenter.h
     src/CADSceneSegmenter.cpp
     src/CADMaskMatcher.h

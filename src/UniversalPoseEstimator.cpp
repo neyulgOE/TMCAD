@@ -1836,6 +1836,7 @@ bool UniversalPoseEstimator::loadModelOnnx(const std::string& onnx_path)
             }
 
             filterCleanCadFeatureEdges(_cad_feature_edges, _cad_min, _cad_max, _is_floor_standing);
+            _tracker.configure(_real_bounding_diag_m, _cad_min, _cad_max, _is_floor_standing, _symmetry_matrices);
 
             _initialized = true;
             std::cout << "[UniversalPoseEstimator] Ready with Black-Box ONNX (" << _model_name
@@ -3878,86 +3879,24 @@ std::vector<ObjectPose> UniversalPoseEstimator::proposeDepthHoleSeeds(
     return seeds;
 }
 
-bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
-                                                const cv::Mat& depth_z16,
-                                                const CameraIntrinsics& intr,
-                                                ObjectPose& out_pose)
+PoseRefinerCallbacks UniversalPoseEstimator::makeTrackerCallbacks() const
 {
-    if (!_track_active || !_track_pose.valid || depth_z16.empty()) return false;
-    _last_fg_mask_2d.release();
-
-    const int w = depth_z16.cols;
-    const int h = depth_z16.rows;
-    const double fx = (intr.fx > 100.0) ? intr.fx : 608.215;
-    const double fy = (intr.fy > 100.0) ? intr.fy : 608.128;
-    const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * w);
-    const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * h);
-    const double scale = (intr.depth_scale > 0.0) ? intr.depth_scale : 0.001;
-    const double diag = std::max(0.05, _real_bounding_diag_m);
-    const double max_ws_z = _is_floor_standing ? 2.95 : std::clamp(diag * 3.8 + 0.15, 0.95, 2.50);
-
-    const cv::Rect2f& pb = _track_pose.bbox_2d;
-    const int pad_x = std::max(48, static_cast<int>(std::round(0.35f * pb.width)));
-    const int pad_y = std::max(48, static_cast<int>(std::round(0.35f * pb.height)));
-    const int x0 = (pb.width > 8.0f) ? std::max(0, static_cast<int>(std::floor(pb.x)) - pad_x) : 0;
-    const int y0 = (pb.height > 8.0f) ? std::max(0, static_cast<int>(std::floor(pb.y)) - pad_y) : 0;
-    const int x1 = (pb.width > 8.0f) ? std::min(w, static_cast<int>(std::ceil(pb.x + pb.width)) + pad_x) : w;
-    const int y1 = (pb.height > 8.0f) ? std::min(h, static_cast<int>(std::ceil(pb.y + pb.height)) + pad_y) : h;
-
-    const cv::Matx33d R_inv = _track_pose.R.t();
-    const double obb_pad = std::clamp(0.16 * diag, 0.022, 0.042);
-    const cv::Vec3d obb_min = _cad_min - cv::Vec3d(obb_pad, obb_pad, obb_pad);
-    const cv::Vec3d obb_max = _cad_max + cv::Vec3d(obb_pad, obb_pad, obb_pad);
-    const double floor_norm = cv::norm(cv::Vec3d(_track_floor_plane[0], _track_floor_plane[1], _track_floor_plane[2]));
-    const bool use_floor_filter = _track_has_floor && (floor_norm > 0.5);
-
-    std::vector<cv::Vec3f> local_fg;
-    local_fg.reserve(2048);
-    const long long area = static_cast<long long>(x1 - x0) * static_cast<long long>(y1 - y0);
-    const int stride = (area < 90000) ? 1 : 2;
-    for (int v = y0; v < y1; v += stride) {
-        const uint16_t* row = depth_z16.ptr<uint16_t>(v);
-        for (int u = x0; u < x1; u += stride) {
-            const uint16_t dr = row[u];
-            if (dr == 0) continue;
-            const double z = static_cast<double>(dr) * scale;
-            if (z < 0.15 || z > max_ws_z) continue;
-            const double x = (static_cast<double>(u) - cx) * z / fx;
-            const double y = (static_cast<double>(v) - cy) * z / fy;
-            if (use_floor_filter) {
-                const double signed_d = _track_floor_plane[0] * x + _track_floor_plane[1] * y +
-                                        _track_floor_plane[2] * z + _track_floor_plane[3];
-                if (std::abs(signed_d) <= 0.018) continue;
-                if (_track_floor_plane[1] < -0.5 && signed_d > 0.018) continue;
-            }
-            const cv::Vec3d pc = R_inv * (cv::Vec3d(x, y, z) - _track_pose.t);
-            if (pc[0] >= obb_min[0] && pc[0] <= obb_max[0] &&
-                pc[1] >= obb_min[1] && pc[1] <= obb_max[1] &&
-                pc[2] >= obb_min[2] && pc[2] <= obb_max[2]) {
-                local_fg.emplace_back(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-            }
+    PoseRefinerCallbacks cb;
+    cb.runLocalIcp = [this](const std::vector<cv::Vec3f>& local_fg, ObjectPose& cand, const CameraIntrinsics& intr) {
+        const size_t icp_step = std::max<size_t>(1, local_fg.size() / 600);
+        std::vector<cv::Vec3d> fg_icp;
+        fg_icp.reserve(local_fg.size() / icp_step + 1);
+        for (size_t i = 0; i < local_fg.size(); i += icp_step) {
+            fg_icp.emplace_back(local_fg[i][0], local_fg[i][1], local_fg[i][2]);
         }
-    }
-
-    if (local_fg.size() < 16) return false;
-    _last_valid_depth_pts = static_cast<int>(local_fg.size());
-    _last_sparse_depth_fallback = (local_fg.size() < 250);
-    _last_segmented_points = local_fg;
-
-    ObjectPose cand = _track_pose;
-    cand.valid = true;
-    cand.method = "warm_start_icp";
-    cand.valid_depth_pts = _last_valid_depth_pts;
-    cand.sparse_depth_fallback = _last_sparse_depth_fallback;
-
-    // Chặng A: 3D Point-to-Plane ICP cục bộ khởi tạo từ (_track_pose.R, _track_pose.t)
-    const size_t icp_step = std::max<size_t>(1, local_fg.size() / 600);
-    std::vector<cv::Vec3d> fg_icp;
-    fg_icp.reserve(local_fg.size() / icp_step + 1);
-    for (size_t i = 0; i < local_fg.size(); i += icp_step) {
-        fg_icp.emplace_back(local_fg[i][0], local_fg[i][1], local_fg[i][2]);
-    }
-    if (fg_icp.size() >= 20) {
+        if (fg_icp.size() < 20) return;
+        const double diag = std::max(0.05, _real_bounding_diag_m);
+        const double fx = (intr.fx > 100.0) ? intr.fx : 608.215;
+        const double fy = (intr.fy > 100.0) ? intr.fy : 608.128;
+        const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 320.0);
+        const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 240.0);
+        const int w = (intr.width > 0) ? intr.width : 640;
+        const int h = (intr.height > 0) ? intr.height : 480;
         cv::Matx33d R_icp = cand.R;
         cv::Vec3d t_icp = cand.t;
         const std::vector<double> tr_scales = {
@@ -3967,20 +3906,24 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
         runPointToPlaneIcpGeneric(cand.R, cand.t, _mesh_pts, _mesh_normals, fg_icp,
                                   1, std::max<size_t>(1, _mesh_pts.size() / 1600),
                                   tr_scales, 10, fx, fy, cx, cy, w, h, R_icp, t_icp);
-        if (isInTargetWorkspace(t_icp) && cv::norm(t_icp - _track_pose.t) <= std::clamp(0.20 * diag, 0.035, 0.080)) {
+        if (isInTargetWorkspace(t_icp) && cv::norm(t_icp - cand.t) <= std::clamp(0.20 * diag, 0.035, 0.080)) {
             cand.R = R_icp;
             cand.t = t_icp;
         }
-    }
+    };
 
-    // Chặng B: Tinh chỉnh Yaw & dịch chuyển mịn quanh Warm-Start theo tỷ lệ pixel/CAD
-    const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
-    double sil_cost = 0.0;
-    const double eta_track = (!_is_floor_standing)
-        ? computeProjectedDepthCoverage(cand.R, cand.t, _mesh_pts, _mesh_normals, depth_z16,
-                                        fx, fy, cx, cy, scale, diag)
-        : 1.0;
-    if (!_is_floor_standing && !rgb.empty() && eta_track < 0.65) {
+    cb.runLocalSilhouette = [this](const cv::Mat& rgb, const cv::Mat& depth_z16,
+                                   const cv::Vec4d& floor_plane, bool has_floor,
+                                   ObjectPose& cand, const CameraIntrinsics& intr) -> double {
+        const double diag = std::max(0.05, _real_bounding_diag_m);
+        const double fx = (intr.fx > 100.0) ? intr.fx : 608.215;
+        const double fy = (intr.fy > 100.0) ? intr.fy : 608.128;
+        const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * rgb.cols);
+        const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * rgb.rows);
+        const double scale = (intr.depth_scale > 0.0) ? intr.depth_scale : 0.001;
+        const double max_ws_z = _is_floor_standing ? 2.95 : std::clamp(diag * 3.8 + 0.15, 0.95, 2.50);
+        const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
+
         cv::Mat proj_mask = cv::Mat::zeros(rgb.rows, rgb.cols, CV_8UC1);
         const size_t m_step = std::max<size_t>(1, _mesh_pts.size() / 1200);
         int min_pu = rgb.cols, max_pu = -1, min_pv = rgb.rows, max_pv = -1;
@@ -3999,62 +3942,75 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
         }
         const float bbox_diag_px = (max_pu > min_pu && max_pv > min_pv)
             ? std::hypot(static_cast<float>(max_pu - min_pu), static_cast<float>(max_pv - min_pv))
-            : std::hypot(pb.width, pb.height);
+            : std::hypot(cand.bbox_2d.width, cand.bbox_2d.height);
         const int ksize = std::clamp(static_cast<int>(std::round(bbox_diag_px * 0.10f)) | 1, 9, 35);
         cv::dilate(proj_mask, proj_mask, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(ksize, ksize)));
         const RgbEdgeMaps dt_canny = buildRgbCannyDistanceTransform(
-            rgb, proj_mask, false, depth_z16, scale, _track_pose.t[2], diag);
-        if (!dt_canny.empty()) {
-            sil_cost = refineTranslationOnRgbSilhouette(
-                cand.R, cand.t, cand.R * cad_mid + cand.t, _cad_min, _cad_max,
-                _track_floor_plane, _track_has_floor,
-                _mesh_pts, _mesh_normals, dt_canny, depth_z16, fx, fy, cx, cy, max_ws_z, true);
-        }
-    }
+            rgb, proj_mask, false, depth_z16, scale, cand.t[2], diag);
+        if (dt_canny.empty()) return 0.0;
+        return refineTranslationOnRgbSilhouette(
+            cand.R, cand.t, cand.R * cad_mid + cand.t, _cad_min, _cad_max,
+            floor_plane, has_floor,
+            _mesh_pts, _mesh_normals, dt_canny, depth_z16, fx, fy, cx, cy, max_ws_z, true);
+    };
 
-    if (!isInTargetWorkspace(cand.t)) return false;
+    cb.computeDepthCoverage = [this](const cv::Mat& depth_z16, const ObjectPose& cand, const CameraIntrinsics& intr) -> double {
+        if (_is_floor_standing) return 1.0;
+        const double fx = (intr.fx > 100.0) ? intr.fx : 608.215;
+        const double fy = (intr.fy > 100.0) ? intr.fy : 608.128;
+        const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * depth_z16.cols);
+        const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * depth_z16.rows);
+        const double scale = (intr.depth_scale > 0.0) ? intr.depth_scale : 0.001;
+        return computeProjectedDepthCoverage(cand.R, cand.t, _mesh_pts, _mesh_normals, depth_z16,
+                                             fx, fy, cx, cy, scale, _real_bounding_diag_m);
+    };
 
-    // Kiểm tra liên tục vị trí & góc trục dài so với _track_pose
-    const double jump_m = cv::norm(cand.t - _track_pose.t);
-    const cv::Vec3d z_cur(cand.R(0, 2), cand.R(1, 2), cand.R(2, 2));
-    const cv::Vec3d z_prv(_track_pose.R(0, 2), _track_pose.R(1, 2), _track_pose.R(2, 2));
-    const double tilt_deg = std::acos(std::clamp(std::abs(z_cur.dot(z_prv)), 0.0, 1.0)) * 180.0 / kPi;
-    if (jump_m > std::max(0.15, 0.75 * diag) || tilt_deg > 30.0) return false;
+    cb.getVisibleCadPoints = [this](const ObjectPose& pose, const CameraIntrinsics& intr,
+                                    int w, int h, std::vector<cv::Vec3d>& out_pts) {
+        const double fx = (intr.fx > 100.0) ? intr.fx : 608.215;
+        const double fy = (intr.fy > 100.0) ? intr.fy : 608.128;
+        const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * w);
+        const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * h);
+        std::vector<cv::Vec3d> dummy_norms;
+        const size_t stride = std::max<size_t>(1, _mesh_pts.size() / 2400);
+        computeVisibleCadSubset(pose.R, pose.t, _mesh_pts, _mesh_normals,
+                                fx, fy, cx, cy, w, h, stride, out_pts, dummy_norms, _real_bounding_diag_m);
+    };
 
-    cand.t_glass = cand.t;
-    const cv::Vec3d euler = rotationMatrixToEulerDeg(cand.R, _is_floor_standing && _symmetry_code >= 1);
-    cand.roll_deg = euler[0];
-    cand.pitch_deg = euler[1];
-    cand.yaw_deg = euler[2];
-    cand.bbox_2d = projectCadBoundingBox(cand.R, cand.t, intr, w, h, &cand.corners_2d);
+    cb.finalizeGeometry = [this](ObjectPose& cand, const CameraIntrinsics& intr, int w, int h) {
+        cand.t_glass = cand.t;
+        const cv::Vec3d euler = rotationMatrixToEulerDeg(cand.R, _is_floor_standing && _symmetry_code >= 1);
+        cand.roll_deg = euler[0];
+        cand.pitch_deg = euler[1];
+        cand.yaw_deg = euler[2];
+        cand.bbox_2d = projectCadBoundingBox(cand.R, cand.t, intr, w, h, &cand.corners_2d);
+    };
 
-    // Chặng C: Hậu kiểm độc lập
-    const bool strict_ok = rescorePoseUnclipped(cand, local_fg, depth_z16, intr, w, h, true);
-    if (!strict_ok && !_is_floor_standing && sil_cost <= 8.0) {
-        const double z_hole = computeProjectedZeroDepthFraction(
-            cand.R, cand.t, _cad_min, _cad_max, depth_z16, fx, fy, cx, cy);
-        if (z_hole >= 0.25 || cand.inliers_count >= 25) {
-            rescorePoseUnclipped(cand, local_fg, depth_z16, intr, w, h, false);
-            if (sil_cost <= 6.2 && z_hole >= 0.25) {
-                cand.rgb_sil_strong = true;
-                cand.confidence = std::clamp(cand.confidence + 0.18f, 0.05f, 0.99f);
+    cb.evaluatePose = [this](const std::vector<cv::Vec3f>& local_fg, const cv::Mat& depth_z16,
+                             double sil_cost, ObjectPose& cand, const CameraIntrinsics& intr) -> bool {
+        if (!isInTargetWorkspace(cand.t)) return false;
+        const int w = depth_z16.cols;
+        const int h = depth_z16.rows;
+        const double fx = (intr.fx > 100.0) ? intr.fx : 608.215;
+        const double fy = (intr.fy > 100.0) ? intr.fy : 608.128;
+        const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * w);
+        const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * h);
+
+        const bool strict_ok = rescorePoseUnclipped(cand, local_fg, depth_z16, intr, w, h, true);
+        if (!strict_ok && !_is_floor_standing && sil_cost <= 8.0) {
+            const double z_hole = computeProjectedZeroDepthFraction(
+                cand.R, cand.t, _cad_min, _cad_max, depth_z16, fx, fy, cx, cy);
+            if (z_hole >= 0.25 || cand.inliers_count >= 25) {
+                rescorePoseUnclipped(cand, local_fg, depth_z16, intr, w, h, false);
+                if (sil_cost <= 6.2 && z_hole >= 0.25) {
+                    cand.rgb_sil_strong = true;
+                    cand.confidence = std::clamp(cand.confidence + 0.18f, 0.05f, 0.99f);
+                }
             }
         }
-    }
-    if (!DetectionAcceptancePolicy::isAccepted(cand, _real_bounding_diag_m, _is_floor_standing)) {
-        return false;
-    }
-
-    // Tracking Sanity Watchdog: thoát TRACKING -> SEARCHING nếu chất lượng suy giảm 3 frame liên tiếp
-    const bool weak_frame = (sil_cost > 6.8) || (cand.inliers_count < 24 && cand.confidence < 0.58f);
-    _track_weak_frames = weak_frame ? (_track_weak_frames + 1) : 0;
-    if (_track_weak_frames >= 3) {
-        resetTemporalTrack();
-        return false;
-    }
-
-    out_pose = std::move(cand);
-    return true;
+        return DetectionAcceptancePolicy::isAccepted(cand, _real_bounding_diag_m, _is_floor_standing);
+    };
+    return cb;
 }
 
 ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
@@ -4077,15 +4033,18 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
 
     if (!_initialized || depth_z16.empty()) return pose;
 
-    // Fast-path Warm-Start Tracking khi đã khóa 2 frame liên tiếp và không bật ROI thủ công
+    // Fast-path Hybrid 2D-3D Warm-Start Tracking khi đã khóa 2 frame liên tiếp và không bật ROI thủ công
+    const PoseRefinerCallbacks tracker_cb = makeTrackerCallbacks();
     bool has_tracked_fallback = false;
     ObjectPose tracked_fallback;
-    if (_temporal_tracking_enabled && !_multi_instance_enabled && roi_hint.empty() && _track_active) {
+    if (_tracker.isEnabled() && !_multi_instance_enabled && roi_hint.empty() && _tracker.isTrackingActive()) {
         ObjectPose tracked;
-        if (trackFromWarmStart(rgb, depth_z16, intr, tracked)) {
+        std::vector<cv::Vec3f> local_fg;
+        if (_tracker.trackFrame(rgb, depth_z16, intr, tracker_cb, tracked, local_fg)) {
+            _last_valid_depth_pts = static_cast<int>(local_fg.size());
+            _last_sparse_depth_fallback = (local_fg.size() < 250);
+            _last_segmented_points = std::move(local_fg);
             if (tracked.confidence >= 0.62f) {
-                _track_pose = tracked;
-                _track_miss_streak = 0;
                 auto t_end = std::chrono::steady_clock::now();
                 _last_ai_latency_ms = 0.0;
                 _last_total_latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -4469,23 +4428,24 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
     }
 
     // Chống nhảy cụm sai & lật góc đối xứng khi Global Detection chạy lại trong lúc đang track
-    if (_temporal_tracking_enabled && !_multi_instance_enabled && roi_hint.empty() &&
-        pose.valid && _track_pose.valid && _track_active) {
-        const double g_jump = cv::norm(pose.t - _track_pose.t);
+    const ObjectPose& prev_track = _tracker.currentPose();
+    if (_tracker.isEnabled() && !_multi_instance_enabled && roi_hint.empty() &&
+        pose.valid && prev_track.valid && _tracker.isTrackingActive()) {
+        const double g_jump = cv::norm(pose.t - prev_track.t);
         const bool bad_jump = (g_jump > std::max(0.055, 0.24 * _real_bounding_diag_m));
-        const bool worse_jump = (g_jump > 0.030 && pose.rmse_m > _track_pose.rmse_m + 0.0045);
+        const bool worse_jump = (g_jump > 0.030 && pose.rmse_m > prev_track.rmse_m + 0.0045);
         if (bad_jump || worse_jump) {
             pose = has_tracked_fallback ? std::move(tracked_fallback) : ObjectPose{};
         }
     }
-    if (_temporal_tracking_enabled && !_multi_instance_enabled && roi_hint.empty() &&
-        pose.valid && _track_pose.valid && !_is_floor_standing) {
+    if (_tracker.isEnabled() && !_multi_instance_enabled && roi_hint.empty() &&
+        pose.valid && prev_track.valid && !_is_floor_standing) {
         const cv::Vec3d span = _cad_max - _cad_min;
         int long_ax = 2;
         if (span[0] >= span[1] && span[0] >= span[2]) long_ax = 0;
         else if (span[1] >= span[0] && span[1] >= span[2]) long_ax = 1;
         for (int a = 0; a < 3; ++a) {
-            if (std::abs(_track_pose.R(1, a)) > 0.72) {
+            if (std::abs(prev_track.R(1, a)) > 0.72) {
                 long_ax = a;
                 break;
             }
@@ -4493,9 +4453,9 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
         const int ax1 = (long_ax + 1) % 3;
         const int ax2 = (long_ax + 2) % 3;
         const cv::Vec3d z_cur(pose.R(0, long_ax), pose.R(1, long_ax), pose.R(2, long_ax));
-        const cv::Vec3d z_prv(_track_pose.R(0, long_ax), _track_pose.R(1, long_ax), _track_pose.R(2, long_ax));
+        const cv::Vec3d z_prv(prev_track.R(0, long_ax), prev_track.R(1, long_ax), prev_track.R(2, long_ax));
         const cv::Vec3d x_cur(pose.R(0, ax1), pose.R(1, ax1), pose.R(2, ax1));
-        const cv::Vec3d x_prv(_track_pose.R(0, ax1), _track_pose.R(1, ax1), _track_pose.R(2, ax1));
+        const cv::Vec3d x_prv(prev_track.R(0, ax1), prev_track.R(1, ax1), prev_track.R(2, ax1));
         if (z_cur.dot(z_prv) > 0.70 && x_cur.dot(x_prv) < -0.50) {
             const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
             const cv::Vec3d win_c = pose.R * cad_mid + pose.t;
@@ -4519,7 +4479,7 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                 pose = std::move(unflipped);
             } else {
                 ObjectPose cont = pose;
-                cont.R = _track_pose.R;
+                cont.R = prev_track.R;
                 cont.t = win_c - cont.R * cad_mid;
                 cont.t_glass = cont.t;
                 if (rescorePoseUnclipped(cont, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false) &&
@@ -4534,11 +4494,10 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                 }
             }
         } else if (z_cur.dot(z_prv) > 0.85 && x_cur.dot(x_prv) < 0.94) {
-            // Nếu Global Re-check bị nhiễu xoay Yaw > 20 độ quanh trục dài, kiểm tra lại hướng _track_pose.R
             const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
             const cv::Vec3d win_c = pose.R * cad_mid + pose.t;
             ObjectPose cont = pose;
-            cont.R = _track_pose.R;
+            cont.R = prev_track.R;
             cont.t = win_c - cont.R * cad_mid;
             cont.t_glass = cont.t;
             if (rescorePoseUnclipped(cont, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false) &&
@@ -4554,45 +4513,9 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
         }
     }
 
-    // Cập nhật State Machine SEARCHING <-> TRACKING
-    if (_temporal_tracking_enabled && !_multi_instance_enabled && roi_hint.empty()) {
-        if (pose.valid) {
-            if (_track_active) {
-                _track_pose = pose;
-                _track_miss_streak = 0;
-            } else {
-                bool consistent = false;
-                if (_track_prev_global.valid) {
-                    const double dt = cv::norm(pose.t - _track_prev_global.t);
-                    const cv::Vec3d z_cur(pose.R(0, 2), pose.R(1, 2), pose.R(2, 2));
-                    const cv::Vec3d z_prv(_track_prev_global.R(0, 2), _track_prev_global.R(1, 2), _track_prev_global.R(2, 2));
-                    const double tilt = std::acos(std::clamp(std::abs(z_cur.dot(z_prv)), 0.0, 1.0)) * 180.0 / kPi;
-                    consistent = (dt <= std::max(0.12, 0.6 * _real_bounding_diag_m) && tilt <= 25.0);
-                }
-                _track_confirm_streak = consistent ? (_track_confirm_streak + 1) : 1;
-                _track_prev_global = pose;
-                if (_track_confirm_streak >= 2) {
-                    _track_active = true;
-                    _track_pose = pose;
-                    _track_miss_streak = 0;
-                }
-            }
-            if (seg_res.floor_detected) {
-                _track_has_floor = true;
-                _track_floor_plane = seg_res.floor_plane;
-            }
-        } else if (_track_active) {
-            ++_track_miss_streak;
-            if (_track_miss_streak <= 2 && _track_pose.valid) {
-                pose = _track_pose;
-                pose.method = "TRACKED/HOLD";
-            } else {
-                resetTemporalTrack();
-            }
-        } else {
-            _track_confirm_streak = 0;
-            _track_prev_global = ObjectPose{};
-        }
+    // Cập nhật State Machine SEARCHING <-> TRACKING <-> HOLD <-> LOST qua TemporalPoseTracker
+    if (_tracker.isEnabled() && !_multi_instance_enabled && roi_hint.empty()) {
+        _tracker.updateFromGlobal(pose, rgb, seg_res.floor_plane, seg_res.floor_detected, intr, tracker_cb);
     }
 
     auto t_end = std::chrono::steady_clock::now();
