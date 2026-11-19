@@ -1379,6 +1379,9 @@ void MainWindow::buildUi() {
         if (activeMuJoCoSim_) {
             activeMuJoCoSim_->setCameraOrbitPose(h, d, az, px);
         }
+        if (liveCppEstimator_) {
+            liveCppEstimator_->resetTemporalTrack();
+        }
     };
     connect(liveCamHeightSlider_, &QSlider::valueChanged, this, applyLiveCamOrbit);
     connect(liveCamDistSlider_, &QSlider::valueChanged, this, applyLiveCamOrbit);
@@ -1391,6 +1394,9 @@ void MainWindow::buildUi() {
             Eigen::Matrix3d R_new = Eigen::AngleAxisd(val * M_PI / 180.0, Eigen::Vector3d::UnitZ()).toRotationMatrix();
             activeMuJoCoSim_->setTargetPose(R_new, Eigen::Vector3d(0.0, 0.0, liveCamDistSlider_->value() / 100.0));
         }
+        if (liveCppEstimator_) {
+            liveCppEstimator_->resetTemporalTrack();
+        }
     });
 
     connect(liveSimOcclusionSlider_, &QSlider::valueChanged, this, [this](int val) {
@@ -1401,6 +1407,9 @@ void MainWindow::buildUi() {
                 double shiftX = 0.06 - (val / 100.0) * 0.06;
                 activeMuJoCoSim_->setOccluderPose(Eigen::Vector3d(shiftX, 0.015, (liveCamDistSlider_->value() / 100.0) - 0.06));
             }
+        }
+        if (liveCppEstimator_) {
+            liveCppEstimator_->resetTemporalTrack();
         }
     });
 
@@ -7268,6 +7277,9 @@ void MainWindow::onStartMuJoCoSimulation() {
     isMuJoCoInferencing_ = false;
     asyncWorkerBusy_.store(false);
     lastMuJoCoPose_ = tmcad::ObjectPose{};
+    if (liveCppEstimator_) {
+        liveCppEstimator_->resetTemporalTrack();
+    }
     muJoCoSimTimer_->start(16); // ~60 FPS render
 
     if (liveSimCamBox_) {
@@ -7399,22 +7411,24 @@ void MainWindow::onMuJoCoSimTick() {
     if (desiredOnnx != liveLoadedOnnxPath_) {
         if (liveCppEstimator_->loadModelOnnx(desiredOnnx)) {
             liveLoadedOnnxPath_ = desiredOnnx;
+            liveCppEstimator_->resetTemporalTrack();
         } else {
             return;
         }
     }
 
     cv::Mat rgbMat(h, w, CV_8UC3, simFrame.color->data_.data());
+    cv::Mat bgrCopy;
+    cv::cvtColor(rgbMat, bgrCopy, cv::COLOR_RGB2BGR);
     cv::Mat depthZ16(h, w, CV_16UC1, simFrame.depth->data_.data());
-    cv::Mat rgbCopy = rgbMat.clone();
     cv::Mat depthCopy = depthZ16.clone();
     lastAsyncIntr_ = intr;
 
     // Chạy suy luận C++ trên background thread (không khóa luồng giao diện Qt)
     asyncWorkerBusy_.store(true);
     asyncMuJoCoPoseFuture_ = std::async(std::launch::async,
-        [this, rgbCopy, depthCopy, intr]() -> tmcad::ObjectPose {
-            return liveCppEstimator_->estimate(rgbCopy, depthCopy, intr);
+        [this, bgrCopy, depthCopy, intr]() -> tmcad::ObjectPose {
+            return liveCppEstimator_->estimate(bgrCopy, depthCopy, intr);
         });
 }
 

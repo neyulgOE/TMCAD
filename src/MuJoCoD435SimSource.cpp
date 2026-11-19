@@ -758,6 +758,14 @@ bool MuJoCoD435SimSource::applyHardwareProfile(const CameraHardwareProfile& prof
     }
 
     impl_->activeIntrinsics = selected->toCameraIntrinsics();
+    // Đồng bộ tuyệt đối tâm quang học (cx, cy) & fx=fy với phép chiếu OpenGL của MuJoCo
+    impl_->activeIntrinsics.cx = 0.5 * static_cast<double>(selected->width);
+    impl_->activeIntrinsics.ppx = impl_->activeIntrinsics.cx;
+    impl_->activeIntrinsics.cy = 0.5 * static_cast<double>(selected->height);
+    impl_->activeIntrinsics.ppy = impl_->activeIntrinsics.cy;
+    if (impl_->activeIntrinsics.fy > 0.0) {
+        impl_->activeIntrinsics.fx = impl_->activeIntrinsics.fy;
+    }
     impl_->currentWidth = selected->width;
     impl_->currentHeight = selected->height;
 
@@ -785,6 +793,14 @@ bool MuJoCoD435SimSource::applyHardwareProfile(const CameraHardwareProfile& prof
 bool MuJoCoD435SimSource::setCustomResolution(int targetW, int targetH) {
     if (targetW <= 0 || targetH <= 0) return false;
     impl_->activeIntrinsics = impl_->hwProfile.interpolateIntrinsics(targetW, targetH);
+    // Đồng bộ tuyệt đối tâm quang học (cx, cy) & fx=fy với phép chiếu OpenGL của MuJoCo
+    impl_->activeIntrinsics.cx = 0.5 * static_cast<double>(targetW);
+    impl_->activeIntrinsics.ppx = impl_->activeIntrinsics.cx;
+    impl_->activeIntrinsics.cy = 0.5 * static_cast<double>(targetH);
+    impl_->activeIntrinsics.ppy = impl_->activeIntrinsics.cy;
+    if (impl_->activeIntrinsics.fy > 0.0) {
+        impl_->activeIntrinsics.fx = impl_->activeIntrinsics.fy;
+    }
     impl_->currentWidth = targetW;
     impl_->currentHeight = targetH;
     impl_->activeProfileId = -1; // Chế độ tùy biến
@@ -1008,10 +1024,13 @@ bool MuJoCoD435SimSource::loadTargetMesh(const std::string& objPath,
         Eigen::Vector3d bmin = mesh->GetMinBound();
         Eigen::Vector3d bmax = mesh->GetMaxBound();
 
-        // Tự động phát hiện CAD đã chuẩn hóa sang mét (ví dụ _mesh.ply hoặc extent [0.015m..4.0m])
+        // Tự động phát hiện đơn vị CAD 2 chiều (m <-> mm) dựa trên rawExtent
         Eigen::Vector3d effScale = scale;
         const double rawExtent = (bmax - bmin).norm();
-        if (rawExtent > 0.015 && rawExtent < 4.0 && scale.x() <= 0.0015) {
+        if (rawExtent > 5.0 && scale.x() > 0.5) {
+            effScale = Eigen::Vector3d(0.001, 0.001, 0.001);
+            impl_->cadScale = effScale;
+        } else if (rawExtent > 0.02 && rawExtent < 3.5 && scale.x() <= 0.0015) {
             effScale = Eigen::Vector3d(1.0, 1.0, 1.0);
             impl_->cadScale = effScale;
         }
