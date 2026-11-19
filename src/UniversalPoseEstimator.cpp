@@ -36,27 +36,24 @@ void computeVisibleCadSubset(const cv::Matx33d& R,
                              int img_h,
                              size_t mesh_stride,
                              std::vector<cv::Vec3d>& out_pts,
-                             std::vector<cv::Vec3d>& out_norms)
+                             std::vector<cv::Vec3d>& out_norms,
+                             double cad_diag_m = 0.20)
 {
     out_pts.clear();
     out_norms.clear();
     if (mesh_pts.empty()) return;
     mesh_stride = std::max<size_t>(1, mesh_stride);
 
-    // Lưới Z-buffer thô (8x8 pixel/ô) để loại bỏ các vách ngăn/hốc xi-lanh bị che khuất bên trong ruột CAD
-    const int grid_w = std::max(32, img_w / 8);
-    const int grid_h = std::max(24, img_h / 8);
-    std::vector<float> z_buf(static_cast<size_t>(grid_w) * grid_h, 1e6f);
-
     struct CandPt {
         size_t idx;
-        int gx;
-        int gy;
+        double u;
+        double v;
         float z;
     };
     std::vector<CandPt> cands;
     cands.reserve(mesh_pts.size() / mesh_stride + 1);
 
+    double u_min = 1e9, u_max = -1e9, v_min = 1e9, v_max = -1e9;
     for (size_t i = 0; i < mesh_pts.size(); i += mesh_stride) {
         cv::Vec3d p_cam = R * cv::Vec3d(mesh_pts[i]) + t;
         if (p_cam[2] <= 0.05) continue;
@@ -67,24 +64,81 @@ void computeVisibleCadSubset(const cv::Matx33d& R,
         double u = p_cam[0] * fx / p_cam[2] + cx;
         double v = p_cam[1] * fy / p_cam[2] + cy;
         if (u >= -32.0 && u < img_w + 32.0 && v >= -32.0 && v < img_h + 32.0) {
-            int gx = std::clamp(static_cast<int>(u / 8.0), 0, grid_w - 1);
-            int gy = std::clamp(static_cast<int>(v / 8.0), 0, grid_h - 1);
-            float zf = static_cast<float>(p_cam[2]);
-            float& cell_z = z_buf[static_cast<size_t>(gy) * grid_w + gx];
-            if (zf < cell_z) cell_z = zf;
-            cands.push_back(CandPt{i, gx, gy, zf});
+            if (u < u_min) u_min = u;
+            if (u > u_max) u_max = u;
+            if (v < v_min) v_min = v;
+            if (v > v_max) v_max = v;
+            cands.push_back(CandPt{i, u, v, static_cast<float>(p_cam[2])});
         }
     }
+    if (cands.empty()) return;
 
-    // Chỉ giữ các điểm nằm gần lớp vỏ ngoài cùng nhìn thấy (trong phạm vi 12mm tính từ z_buf mặt trước)
+    // Lưới Z-buffer cục bộ 48x48 phủ khít khung hình chiếu 2D của vật thể (bất biến theo kích thước/cự ly)
+    constexpr int kGrid = 48;
+    std::vector<float> z_buf(kGrid * kGrid, 1e6f);
+    const double u_span = std::max(1.0, u_max - u_min);
+    const double v_span = std::max(1.0, v_max - v_min);
+    const double inv_u = static_cast<double>(kGrid - 1) / u_span;
+    const double inv_v = static_cast<double>(kGrid - 1) / v_span;
+
+    for (const auto& c : cands) {
+        const int gx = std::clamp(static_cast<int>((c.u - u_min) * inv_u), 0, kGrid - 1);
+        const int gy = std::clamp(static_cast<int>((c.v - v_min) * inv_v), 0, kGrid - 1);
+        float& cell_z = z_buf[gy * kGrid + gx];
+        if (c.z < cell_z) cell_z = c.z;
+    }
+
+    const float z_tol = static_cast<float>(std::max(0.008, 0.04 * std::max(0.05, cad_diag_m)));
     out_pts.reserve(cands.size());
     out_norms.reserve(cands.size());
     for (const auto& c : cands) {
-        if (c.z <= z_buf[static_cast<size_t>(c.gy) * grid_w + c.gx] + 0.012f) {
+        const int gx = std::clamp(static_cast<int>((c.u - u_min) * inv_u), 0, kGrid - 1);
+        const int gy = std::clamp(static_cast<int>((c.v - v_min) * inv_v), 0, kGrid - 1);
+        if (c.z <= z_buf[gy * kGrid + gx] + z_tol) {
             out_pts.emplace_back(mesh_pts[c.idx]);
             out_norms.emplace_back(mesh_normals[c.idx]);
         }
     }
+}
+
+// Tính tỷ lệ phủ Depth hợp lệ bên trong hình chiếu CAD nhìn thấy (eta_depth trong [0, 1])
+// Dùng cho Adaptive Depth-Quality Gate: eta >= 0.65 => Depth sạch (khóa nhánh 2D RGB Canny)
+double computeProjectedDepthCoverage(const cv::Matx33d& R,
+                                     const cv::Vec3d& t,
+                                     const std::vector<cv::Vec3f>& mesh_pts,
+                                     const std::vector<cv::Vec3f>& mesh_normals,
+                                     const cv::Mat& depth_z16,
+                                     double fx, double fy, double cx, double cy,
+                                     double depth_scale,
+                                     double cad_diag_m)
+{
+    if (mesh_pts.empty() || depth_z16.empty() || depth_z16.type() != CV_16UC1) return 0.0;
+    std::vector<cv::Vec3d> vis_pts, vis_norms;
+    const size_t stride = std::max<size_t>(1, mesh_pts.size() / 1600);
+    computeVisibleCadSubset(R, t, mesh_pts, mesh_normals, fx, fy, cx, cy,
+                            depth_z16.cols, depth_z16.rows, stride, vis_pts, vis_norms, cad_diag_m);
+    if (vis_pts.size() < 16) return 0.0;
+
+    const double d_scale = (depth_scale > 1e-6) ? depth_scale : 0.001;
+    const double z_near_tol = std::max(0.04, 0.25 * std::max(0.05, cad_diag_m));
+    int total_proj = 0;
+    int valid_near = 0;
+    for (const auto& vp : vis_pts) {
+        const cv::Vec3d p_cam = R * vp + t;
+        if (p_cam[2] <= 0.10) continue;
+        const int u = static_cast<int>(std::round(fx * p_cam[0] / p_cam[2] + cx));
+        const int v = static_cast<int>(std::round(fy * p_cam[1] / p_cam[2] + cy));
+        if (u < 0 || u >= depth_z16.cols || v < 0 || v >= depth_z16.rows) continue;
+        ++total_proj;
+        const uint16_t raw_d = depth_z16.at<uint16_t>(v, u);
+        if (raw_d > 0) {
+            const double z_obs = static_cast<double>(raw_d) * d_scale;
+            if (std::abs(z_obs - p_cam[2]) <= z_near_tol) {
+                ++valid_near;
+            }
+        }
+    }
+    return (total_proj >= 12) ? (static_cast<double>(valid_near) / static_cast<double>(total_proj)) : 0.0;
 }
 
 struct RgbEdgeMaps {
@@ -933,17 +987,19 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
     BidirectionalConsensus res;
     if (mesh_pts.empty() || scene_fg_pts.empty()) return res;
 
-    const size_t vis_stride = std::max<size_t>(1, mesh_pts.size() / 1600);
+    const size_t vis_stride = std::max<size_t>(1, mesh_pts.size() / 3600);
     std::vector<cv::Vec3d> vis_pts, vis_norms;
-    computeVisibleCadSubset(R, t, mesh_pts, mesh_normals, fx, fy, cx, cy, img_w, img_h, vis_stride, vis_pts, vis_norms);
+    computeVisibleCadSubset(R, t, mesh_pts, mesh_normals, fx, fy, cx, cy, img_w, img_h, vis_stride, vis_pts, vis_norms, cad_diag);
     if (vis_pts.size() < 20) {
         // Retry without frustum margin clamp in case coarse estimate was shifted
         vis_pts.clear();
+        vis_norms.clear();
         for (size_t i = 0; i < mesh_pts.size(); i += vis_stride) {
             cv::Vec3d p_cam = R * cv::Vec3d(mesh_pts[i]) + t;
             cv::Vec3d n_cam = R * cv::Vec3d(mesh_normals[i]);
             if (p_cam[2] > 0.05 && n_cam.dot(p_cam) <= 0.15 * cv::norm(p_cam)) {
                 vis_pts.emplace_back(mesh_pts[i]);
+                vis_norms.emplace_back(mesh_normals[i]);
             }
         }
         if (vis_pts.size() < 20) return res;
@@ -951,6 +1007,10 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
 
     const double tol = std::clamp(cad_diag * 0.055, 0.008, 0.020);
     const double tol_sq = tol * tol;
+    // Chỉ khử sai số rời rạc Point-to-Plane trong bán kính khoảng cách lưới điểm (<= 8mm),
+    // giữ nguyên khoảng cách Euclidean cho các điểm lệch quai/nắp (> 8mm) để không phá phân biệt góc xoay.
+    const double p2pl_rad = std::min(0.008, 0.65 * tol);
+    const double max_p2pl_sq = p2pl_rad * p2pl_rad;
     const double sigma = std::clamp(cad_diag * 0.045, 0.007, 0.016);
     const double inv_2sig2 = 0.5 / (sigma * sigma);
     const double clamp_fwd = (3.0 * tol) * (3.0 * tol);
@@ -967,14 +1027,27 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
     for (size_t i = 0; i < scene_fg_pts.size(); i += fg_step) {
         const cv::Vec3d p_cad = R_inv * (scene_fg_pts[i] - t);
         double min_dsq = 1e10;
-        for (const auto& vp : vis_pts) {
-            const cv::Vec3d d = p_cad - vp;
+        size_t best_j = 0;
+        for (size_t j = 0; j < vis_pts.size(); ++j) {
+            const cv::Vec3d d = p_cad - vis_pts[j];
             const double dsq = d.dot(d);
-            if (dsq < min_dsq) min_dsq = dsq;
+            if (dsq < min_dsq) {
+                min_dsq = dsq;
+                best_j = j;
+            }
         }
-        fwd_kern_sum += std::exp(-min_dsq * inv_2sig2);
-        dsq_sum += std::min(min_dsq, clamp_fwd);
-        if (min_dsq <= tol_sq) ++fwd_inliers;
+        double eff_dsq = min_dsq;
+        if (min_dsq < max_p2pl_sq && best_j < vis_norms.size()) {
+            const cv::Vec3d d = p_cad - vis_pts[best_j];
+            const double d_euc = std::sqrt(min_dsq);
+            const double d_p2pl = std::abs(d.dot(vis_norms[best_j]));
+            const double d_tan = std::sqrt(std::max(0.0, min_dsq - d_p2pl * d_p2pl));
+            const double d_eff = std::min(d_euc, d_p2pl + 0.15 * d_tan);
+            eff_dsq = d_eff * d_eff;
+        }
+        fwd_kern_sum += std::exp(-eff_dsq * inv_2sig2);
+        dsq_sum += std::min(eff_dsq, clamp_fwd);
+        if (eff_dsq <= tol_sq) ++fwd_inliers;
         ++fwd_total;
     }
 
@@ -985,13 +1058,27 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
     for (size_t j = 0; j < vis_pts.size(); j += cad_step) {
         const cv::Vec3d p_cam = R * vis_pts[j] + t;
         double min_dsq = 1e10;
+        size_t best_i = 0;
         for (size_t i = 0; i < scene_fg_pts.size(); i += fg_step) {
             const cv::Vec3d d = p_cam - scene_fg_pts[i];
             const double dsq = d.dot(d);
-            if (dsq < min_dsq) min_dsq = dsq;
+            if (dsq < min_dsq) {
+                min_dsq = dsq;
+                best_i = i;
+            }
         }
-        bwd_kern_sum += std::exp(-min_dsq * inv_2sig2);
-        bwd_dsq_sum += std::min(min_dsq, clamp_bwd);
+        double eff_dsq = min_dsq;
+        if (min_dsq < max_p2pl_sq && j < vis_norms.size()) {
+            const cv::Vec3d vn_cam = R * vis_norms[j];
+            const cv::Vec3d d = p_cam - scene_fg_pts[best_i];
+            const double d_euc = std::sqrt(min_dsq);
+            const double d_p2pl = std::abs(d.dot(vn_cam));
+            const double d_tan = std::sqrt(std::max(0.0, min_dsq - d_p2pl * d_p2pl));
+            const double d_eff = std::min(d_euc, d_p2pl + 0.15 * d_tan);
+            eff_dsq = d_eff * d_eff;
+        }
+        bwd_kern_sum += std::exp(-eff_dsq * inv_2sig2);
+        bwd_dsq_sum += std::min(eff_dsq, clamp_bwd);
         ++bwd_total;
     }
 
@@ -3889,7 +3976,11 @@ bool UniversalPoseEstimator::trackFromWarmStart(const cv::Mat& rgb,
     // Chặng B: Tinh chỉnh Yaw & dịch chuyển mịn quanh Warm-Start theo tỷ lệ pixel/CAD
     const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
     double sil_cost = 0.0;
-    if (!_is_floor_standing && !rgb.empty()) {
+    const double eta_track = (!_is_floor_standing)
+        ? computeProjectedDepthCoverage(cand.R, cand.t, _mesh_pts, _mesh_normals, depth_z16,
+                                        fx, fy, cx, cy, scale, diag)
+        : 1.0;
+    if (!_is_floor_standing && !rgb.empty() && eta_track < 0.65) {
         cv::Mat proj_mask = cv::Mat::zeros(rgb.rows, rgb.cols, CV_8UC1);
         const size_t m_step = std::max<size_t>(1, _mesh_pts.size() / 1200);
         int min_pu = rgb.cols, max_pu = -1, min_pv = rgb.rows, max_pv = -1;
@@ -4069,14 +4160,20 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
             if (cl.points.size() < 20) continue;
             const std::vector<cv::Vec3f>& dense_cl = cl.dense_points.empty() ? cl.points : cl.dense_points;
             double c_ai = 0.0;
-            ObjectPose cand = estimateSingleCluster(cl.points, dense_cl, seg_res.floor_plane, false,
+            ObjectPose cand = estimateSingleCluster(cl.points, dense_cl, seg_res.floor_plane, seg_res.floor_detected,
                                                     seg_res.floor_pitch_deg, rgb, intr, depth_z16.cols, depth_z16.rows, &c_ai);
             ai_ms += c_ai;
             if (!cand.valid) continue;
 
+            // Adaptive Depth-Quality Gate: eta_depth >= 0.65 => Depth sạch (khóa nhánh Canny 2D RGB)
+            const double eta_depth = computeProjectedDepthCoverage(
+                cand.R, cand.t, _mesh_pts, _mesh_normals, depth_z16,
+                sil_fx, sil_fy, sil_cx, sil_cy, d_scale_est, _real_bounding_diag_m);
+            const bool clean_depth_mode = (eta_depth >= 0.65);
+
             double sil_cost = 0.0;
             double z_hole_frac = 0.0;
-            if (!dt_canny.empty()) {
+            if (!clean_depth_mode && !dt_canny.empty()) {
                 const double max_ws_z = std::clamp(_real_bounding_diag_m * 3.8 + 0.15, 0.95, 2.50);
                 sil_cost = refineTranslationOnRgbSilhouette(
                     cand.R, cand.t, cv::Vec3d(cl.centroid), _cad_min, _cad_max, seg_res.floor_plane, seg_res.floor_detected,
@@ -4093,13 +4190,13 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
             }
 
             ObjectPose strict_cand = cand;
-            const bool strong_rgb_sil = (!dt_canny.empty() && sil_cost <= 5.5 && z_hole_frac >= 0.35 &&
+            const bool strong_rgb_sil = (!clean_depth_mode && !dt_canny.empty() && sil_cost <= 5.5 && z_hole_frac >= 0.35 &&
                                          cand.inliers_count >= 12 && cand.rmse_m <= 0.016);
-            const bool acceptable_rgb_sil = (dt_canny.empty() || sil_cost <= 9.5);
+            const bool acceptable_rgb_sil = (clean_depth_mode || dt_canny.empty() || sil_cost <= 9.5);
             const bool passed_unclipped = acceptable_rgb_sil &&
                 rescorePoseUnclipped(strict_cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, true);
             if (passed_unclipped || strong_rgb_sil) {
-                if (passed_unclipped && !dt_canny.empty() && sil_cost <= 6.2) {
+                if (passed_unclipped && !clean_depth_mode && !dt_canny.empty() && sil_cost <= 6.2) {
                     strict_cand.confidence = std::clamp(strict_cand.confidence + 0.12f, 0.05f, 0.99f);
                 } else if (!passed_unclipped && strong_rgb_sil) {
                     strict_cand = cand;
@@ -4111,15 +4208,15 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                 }
                 double rank = static_cast<double>(strict_cand.confidence)
                             - 2.0 * std::max(0.0, strict_cand.rmse_m - 0.015)
-                            - 0.04 * sil_cost
+                            - (clean_depth_mode ? 0.0 : (0.04 * sil_cost))
                             - 0.22 * strict_cand.t[2];
                 if (rank > best_strict_rank) {
                     best_strict_rank = rank;
                     pose = std::move(strict_cand);
                 }
-            } else if (dt_canny.empty() || sil_cost <= 6.5) {
+            } else if (clean_depth_mode || dt_canny.empty() || sil_cost <= 6.5) {
                 if (rescorePoseUnclipped(cand, seg_res.foreground_points, depth_z16, intr, depth_z16.cols, depth_z16.rows, false)) {
-                    double rank = static_cast<double>(cand.confidence) - 2.0 * std::max(0.0, cand.rmse_m - 0.015) - 0.06 * sil_cost;
+                    double rank = static_cast<double>(cand.confidence) - 2.0 * std::max(0.0, cand.rmse_m - 0.015) - (clean_depth_mode ? 0.0 : (0.06 * sil_cost));
                     if (rank > best_fb_rank) {
                         best_fb_rank = rank;
                         best_fb_pose = std::move(cand);
@@ -4143,7 +4240,11 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                                      seg_res.floor_detected,
                                      seg_res.floor_pitch_deg,
                                      rgb, intr, depth_z16.cols, depth_z16.rows, &ai_ms);
-        if (pose.valid && !_is_floor_standing && !dt_canny.empty()) {
+        const double eta_single = (pose.valid && !_is_floor_standing)
+            ? computeProjectedDepthCoverage(pose.R, pose.t, _mesh_pts, _mesh_normals, depth_z16,
+                                            sil_fx, sil_fy, sil_cx, sil_cy, d_scale_est, _real_bounding_diag_m)
+            : 0.0;
+        if (pose.valid && !_is_floor_standing && !dt_canny.empty() && eta_single < 0.65) {
             int vert_ax_est = 2;
             for (int a = 0; a < 3; ++a) {
                 if (std::abs(pose.R(1, a)) > 0.72) { vert_ax_est = a; break; }
