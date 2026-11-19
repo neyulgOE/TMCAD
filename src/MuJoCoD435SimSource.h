@@ -7,6 +7,20 @@
 #include <vector>
 #include <Eigen/Dense>
 
+struct MuJoCoSimConfig {
+    std::string cadPath;
+    std::string texPath;
+    Eigen::Vector3d cadScale = Eigen::Vector3d(0.001, 0.001, 0.001);
+    double distanceMeters = 0.58;
+    double camHeightMeters = 0.42;
+    double yawDeg = 0.0;
+    double pitchDeg = 0.0;
+    double rollDeg = 0.0;
+    bool occluderEnabled = false;
+    double occlusionPercent = 0.0;
+    int profileId = 1;
+};
+
 class MuJoCoD435SimSource : public IRGBDSource {
 public:
     MuJoCoD435SimSource();

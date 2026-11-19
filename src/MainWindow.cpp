@@ -62,7 +62,6 @@
 #include "SyntheticRGBDSource.h"
 #include "SyntheticDatasetGenerator.h"
 #include "CameraProfileDialog.h"
-#include "MuJoCoSimDialog.h"
 #include "MuJoCoD435SimSource.h"
 #include "CADHierarchy.h"
 #include <open3d/t/io/NumpyIO.h>

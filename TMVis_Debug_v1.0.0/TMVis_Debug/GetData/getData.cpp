@@ -1,5 +1,5 @@
 #include "getData.h"
-#include "TablePoseEstimator.h"
+#include "UniversalPoseEstimator.h"
 
 #include <opencv2/opencv.hpp>
 
@@ -299,7 +299,7 @@ void GetData::run()
     cv::resizeWindow("Depth", 960, 540);
 
     // Initialize V2.5 CAD Pose Table Estimator
-    TablePoseEstimator estimator;
+    tmcad::UniversalPoseEstimator estimator;
     estimator.initialize();
 
     cv::Mat latestDepth16;
@@ -329,7 +329,7 @@ void GetData::run()
     cv::Mat snapshotDepthForRefine;
     CameraIntrinsics snapshotIntrForRefine;
     float snapshotDepthScaleForRefine = 0.001f;
-    TablePose snapshotPose;
+    tmcad::ObjectPose snapshotPose;
 
     std::cout << "\n======================================================\n"
               << "🎥 [TMVis_Debug] Cho khoi dong cac luong cam bien...\n"

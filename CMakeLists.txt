@@ -40,11 +40,8 @@ add_library(tmcad_pose_core STATIC
     src/CADSceneSegmenter.cpp
     src/CADMaskMatcher.h
     src/CADMaskMatcher.cpp
-    src/CADTemplateDetector.h
-    src/CADTemplateDetector.cpp
     src/UniversalPoseEstimator.h
     src/UniversalPoseEstimator.cpp
-    src/TablePoseEstimator.h
     src/CameraIntrinsics.h
     src/RgbdFrame.h
 )
@@ -85,6 +82,8 @@ add_executable(CadViewer
     src/CameraStreamWidget.cpp
     src/SyntheticRGBDSource.cpp
     src/SyntheticDatasetGenerator.cpp
+    src/CADTemplateDetector.h
+    src/CADTemplateDetector.cpp
     src/ImageDetectionDialog.h
     src/ImageDetectionDialog.cpp
     src/CameraHardwareProfile.h
@@ -94,8 +93,6 @@ add_executable(CadViewer
     src/MuJoCoD435SimSource.cpp
     src/CameraProfileDialog.h
     src/CameraProfileDialog.cpp
-    src/MuJoCoSimDialog.h
-    src/MuJoCoSimDialog.cpp
     src/StudioUxControls.h
 )
 

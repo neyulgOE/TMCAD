@@ -11,7 +11,6 @@
 #include "TemporalPoseTracker.h"
 #include "CADSceneSegmenter.h"
 #include "CADMaskMatcher.h"
-#include "CADTemplateDetector.h"
 
 namespace tmcad {
 
@@ -241,12 +240,7 @@ private:
 
     CADSceneSegmenter _scene_segmenter;
     CADMaskMatcher _mask_matcher;
-    CADTemplateDetector _template_detector;
 };
-
-// Backward-compatible aliases so existing MainWindow / TMVis code compiles without breaking
-using TablePose = ObjectPose;
-using TablePoseEstimator = UniversalPoseEstimator;
 
 } // namespace tmcad
 
