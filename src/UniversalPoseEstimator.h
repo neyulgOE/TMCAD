@@ -160,7 +160,13 @@ private:
                                  ObjectPose& pose,
                                  const CameraIntrinsics& intr,
                                  const cv::Mat& depth_z16 = cv::Mat(),
-                                 const cv::Vec4d* floor_plane = nullptr) const;
+                                 const cv::Vec4d* floor_plane = nullptr,
+                                 bool has_floor = false) const;
+
+    void runTranslationAndYawOnlyIcp(const std::vector<cv::Vec3f>& scene_pts,
+                                     ObjectPose& pose,
+                                     const cv::Vec4d& floor_plane,
+                                     int max_iters = 6) const;
 
     void refinePoseUniversalCrease2D3D(ObjectPose& pose,
                                        const cv::Mat& rgb,

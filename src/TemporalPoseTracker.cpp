@@ -255,7 +255,9 @@ bool TemporalPoseTracker::trackFrame(const cv::Mat& rgb,
     if (x1 <= x0 + 8 || y1 <= y0 + 8) return false;
 
     const cv::Matx33d R_inv = _track_pose.R.t();
-    const double obb_pad = std::clamp(0.16 * diag, 0.022, 0.12);
+    const double obb_pad = _is_floor_standing
+        ? std::clamp(0.16 * diag, 0.040, 0.120)
+        : std::clamp(0.075 * diag, 0.010, 0.018);
     const cv::Vec3d obb_min = _cad_min - cv::Vec3d(obb_pad, obb_pad, obb_pad);
     const cv::Vec3d obb_max = _cad_max + cv::Vec3d(obb_pad, obb_pad, obb_pad);
     const double floor_norm = cv::norm(cv::Vec3d(_floor_plane[0], _floor_plane[1], _floor_plane[2]));
@@ -430,7 +432,8 @@ void TemporalPoseTracker::updateFromGlobal(ObjectPose& global_pose,
             }
             _confirm_streak = consistent ? (_confirm_streak + 1) : 1;
             _prev_global_pose = global_pose;
-            if (_confirm_streak >= 2) {
+            const bool strong_first = (global_pose.confidence >= 0.72f && global_pose.inliers_count >= 100);
+            if (_confirm_streak >= 2 || strong_first) {
                 _state = TrackState::TRACKING;
                 _track_pose = global_pose;
                 _lost_streak = 0;

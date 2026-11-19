@@ -1058,6 +1058,61 @@ inline double computeNormalConsistencyWeight(const cv::Vec3f& n_obs,
     return (cos_ang - kCosReject) / (kCosFull - kCosReject);
 }
 
+// Công thức Rodrigues: tạo ma trận xoay 3x3 quanh trục đơn vị u với góc theta (rad)
+cv::Matx33d axisAngleToMat33(const cv::Vec3d& unit_axis, double theta)
+{
+    const double c = std::cos(theta);
+    const double s = std::sin(theta);
+    const double t = 1.0 - c;
+    const double x = unit_axis[0];
+    const double y = unit_axis[1];
+    const double z = unit_axis[2];
+    return cv::Matx33d(
+        t * x * x + c,     t * x * y - s * z, t * x * z + s * y,
+        t * x * y + s * z, t * y * y + c,     t * y * z - s * x,
+        t * x * z - s * y, t * y * z + s * x, t * z * z + c
+    );
+}
+
+// Tạo bản sao ứng viên có trục +Z căn chỉnh theo pháp tuyến mặt sàn (không ghi đè pose gốc)
+ObjectPose makeFloorAlignedCandidate(const ObjectPose& base_pose,
+                                     const cv::Vec4d& floor_plane,
+                                     const cv::Vec3d& cad_min,
+                                     const cv::Vec3d& cad_max)
+{
+    ObjectPose cand = base_pose;
+    cv::Vec3d z_axis(floor_plane[0], floor_plane[1], floor_plane[2]);
+    const double n_len = cv::norm(z_axis);
+    if (n_len < 1e-6) return cand;
+    z_axis *= (1.0 / n_len);
+    if (z_axis[1] > 0.0) z_axis = -z_axis;
+
+    cv::Vec3d y_axis(base_pose.R(0, 1), base_pose.R(1, 1), base_pose.R(2, 1));
+    y_axis -= z_axis * z_axis.dot(y_axis);
+    const double y_len = cv::norm(y_axis);
+    if (y_len < 1e-5) {
+        cv::Vec3d x_old(base_pose.R(0, 0), base_pose.R(1, 0), base_pose.R(2, 0));
+        y_axis = z_axis.cross(x_old);
+        y_axis *= (1.0 / std::max(1e-6, cv::norm(y_axis)));
+    } else {
+        y_axis *= (1.0 / y_len);
+    }
+
+    cv::Vec3d x_axis = y_axis.cross(z_axis);
+    x_axis *= (1.0 / std::max(1e-6, cv::norm(x_axis)));
+
+    const cv::Vec3d cad_center = 0.5 * (cad_min + cad_max);
+    const cv::Vec3d world_center = base_pose.R * cad_center + base_pose.t;
+
+    cand.R = cv::Matx33d(
+        x_axis[0], y_axis[0], z_axis[0],
+        x_axis[1], y_axis[1], z_axis[1],
+        x_axis[2], y_axis[2], z_axis[2]
+    );
+    cand.t = world_center - cand.R * cad_center;
+    return cand;
+}
+
 BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
                                                      const cv::Vec3d& t,
                                                      double cad_diag,
@@ -1860,6 +1915,7 @@ bool UniversalPoseEstimator::loadModelOnnx(const std::string& onnx_path)
         _cad_foot_centers.clear();
         _meta_unpacked = false;
         _symmetry_code = 0;
+        _real_bounding_diag_m = 0.0;
         _is_floor_standing = false;
         _enable_2d_frame_anchor = false;
         _initialized = false;
@@ -1953,7 +2009,8 @@ bool UniversalPoseEstimator::loadModelOnnx(const std::string& onnx_path)
                       << " | Diag: " << _real_bounding_diag_m << " m"
                       << " | CAD Pts: " << _cad_centroids.size()
                       << " | Surf Pts: " << _mesh_pts.size()
-                      << " | Edges: " << _cad_feature_edges.size() << std::endl;
+                      << " | Edges: " << _cad_feature_edges.size()
+                      << " | SymMats: " << _symmetry_matrices.size() << std::endl;
             return true;
         }
     } catch (const std::exception& e) {
@@ -2170,6 +2227,47 @@ bool UniversalPoseEstimator::unpackBlackBoxOnnx()
         }
     }
 
+    // Optional symmetry_matrices output (K, 3, 3) or (K, 4, 4); fallback synthesize from _symmetry_code
+    _symmetry_matrices.clear();
+    if (const Ort::Value* vsym = findOut("symmetry_matrices")) {
+        auto s_shape = vsym->GetTensorTypeAndShapeInfo().GetShape();
+        auto s_count = vsym->GetTensorTypeAndShapeInfo().GetElementCount();
+        const float* sp = vsym->GetTensorData<float>();
+        if (sp && s_count >= 9) {
+            const size_t stride = (s_shape.size() >= 3 && s_shape[1] == 4 && s_shape[2] == 4) ? 16 : 9;
+            const size_t K = static_cast<size_t>(s_count) / stride;
+            for (size_t k = 0; k < K; ++k) {
+                const float* m = sp + k * stride;
+                if (stride == 16) {
+                    _symmetry_matrices.emplace_back(
+                        m[0], m[1], m[2],
+                        m[4], m[5], m[6],
+                        m[8], m[9], m[10]);
+                } else {
+                    _symmetry_matrices.emplace_back(
+                        m[0], m[1], m[2],
+                        m[3], m[4], m[5],
+                        m[6], m[7], m[8]);
+                }
+            }
+        }
+    }
+    if (_symmetry_matrices.empty()) {
+        _symmetry_matrices.push_back(cv::Matx33d::eye());
+        if (_symmetry_code == 1 || _symmetry_code == 4) { // C2 or D2: Rz(180)
+            _symmetry_matrices.emplace_back(-1, 0, 0, 0, -1, 0, 0, 0, 1);
+        }
+        if (_symmetry_code == 2) { // C4: Rz(90, 180, 270)
+            _symmetry_matrices.emplace_back(0, -1, 0, 1, 0, 0, 0, 0, 1);
+            _symmetry_matrices.emplace_back(-1, 0, 0, 0, -1, 0, 0, 0, 1);
+            _symmetry_matrices.emplace_back(0, 1, 0, -1, 0, 0, 0, 0, 1);
+        }
+        if (_symmetry_code == 4) { // D2: Rx(180), Ry(180)
+            _symmetry_matrices.emplace_back(1, 0, 0, 0, -1, 0, 0, 0, -1);
+            _symmetry_matrices.emplace_back(-1, 0, 0, 0, 1, 0, 0, 0, -1);
+        }
+    }
+
     return (!_cad_descriptors.empty() && !_cad_centroids.empty());
 }
 
@@ -2203,7 +2301,9 @@ bool UniversalPoseEstimator::unpackBlackBoxOnnxMetadata()
     _half_l = 0.5 * (_cad_max[1] - _cad_min[1]);
     _bot_z  = _cad_min[2];
     _top_z  = _cad_max[2];
-    _real_bounding_diag_m = std::max(0.05, cv::norm(_cad_max - _cad_min));
+    if (_real_bounding_diag_m <= 0.01) {
+        _real_bounding_diag_m = std::max(0.05, cv::norm(_cad_max - _cad_min));
+    }
 
     float length_m = static_cast<float>(std::max(_cad_max[0] - _cad_min[0], _cad_max[1] - _cad_min[1]));
     float width_m  = static_cast<float>(std::min(_cad_max[0] - _cad_min[0], _cad_max[1] - _cad_min[1]));
@@ -2255,14 +2355,8 @@ bool UniversalPoseEstimator::isInTargetWorkspace(const cv::Vec3d& t) const
 
 bool UniversalPoseEstimator::isCandidateRotationValid(const cv::Matx33d& R_candidate) const
 {
-    if (_is_floor_standing) {
-        // Hỗ trợ camera đặt từ thấp (0.12m) tới cao (1.85m, góc chúc tới ~78 độ):
-        if (R_candidate(1, 2) > -0.18 ||
-            std::abs(R_candidate(0, 2)) > 0.55 ||
-            std::abs(R_candidate(2, 2)) > 0.98) {
-            return false;
-        }
-    }
+    // Không cấm góc nghiêng để hỗ trợ vật đặt dốc, nhấc lên hoặc cầm tay (Plane-Free mặc định).
+    (void)R_candidate;
     return true;
 }
 
@@ -2567,10 +2661,6 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
         }
 
         if (!isCandidateRotationValid(R_cand)) continue;
-        if (_is_floor_standing && valid_floor) {
-            cv::Vec3d cad_z_cand(R_cand(0, 2), R_cand(1, 2), R_cand(2, 2));
-            if (cad_z_cand.dot(n_fl) < 0.70) continue;
-        }
 
         cv::Vec3d t_cand = p_mean - R_cand * q_mean;
         if (!isInTargetWorkspace(t_cand)) continue;
@@ -2702,31 +2792,7 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
         return best_pose;
     }
 
-    // 6. Floor upright gravity lock ONLY for FLOOR_STANDING archetypes (tables, racks, pallets)
-    if (best_pose.valid && _is_floor_standing && valid_floor) {
-        best_pose.floor_locked = true;
-        cv::Vec3d z_axis = n_fl;
-        z_axis *= (1.0 / std::max(1e-6, cv::norm(z_axis)));
-        cv::Vec3d y_axis(best_pose.R(0, 1), best_pose.R(1, 1), best_pose.R(2, 1));
-        y_axis -= z_axis * z_axis.dot(y_axis);
-        if (cv::norm(y_axis) > 1e-6) {
-            y_axis *= (1.0 / cv::norm(y_axis));
-            cv::Vec3d x_axis = y_axis.cross(z_axis);
-            x_axis *= (1.0 / std::max(1e-6, cv::norm(x_axis)));
-
-            cv::Vec3d cad_center(
-                0.5 * (_cad_min[0] + _cad_max[0]),
-                0.5 * (_cad_min[1] + _cad_max[1]),
-                0.5 * (_cad_min[2] + _cad_max[2]));
-            cv::Vec3d world_center = best_pose.R * cad_center + best_pose.t;
-
-            best_pose.R = cv::Matx33d(
-                x_axis[0], y_axis[0], z_axis[0],
-                x_axis[1], y_axis[1], z_axis[1],
-                x_axis[2], y_axis[2], z_axis[2]);
-            best_pose.t = world_center - best_pose.R * cad_center;
-        }
-    }
+    // Giữ nguyên nghiệm 6DoF tự do từ RANSAC (Soft Floor Prior sẽ cạnh tranh ở bước refineMultiScaleMeshICP)
 
     if (best_pose.valid) {
         best_pose.inliers_count = best_inliers;
@@ -2745,11 +2811,142 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
     return best_pose;
 }
 
+void UniversalPoseEstimator::runTranslationAndYawOnlyIcp(const std::vector<cv::Vec3f>& scene_pts,
+                                                         ObjectPose& pose,
+                                                         const cv::Vec4d& floor_plane,
+                                                         int max_iters) const
+{
+    if (!pose.valid || _mesh_pts.empty() || _mesh_pts.size() != _mesh_normals.size() || scene_pts.size() < 16) {
+        return;
+    }
+
+    cv::Vec3d u_axis(floor_plane[0], floor_plane[1], floor_plane[2]);
+    const double u_norm = cv::norm(u_axis);
+    if (u_norm < 1e-6) return;
+    u_axis *= (1.0 / u_norm);
+    if (u_axis[1] > 0.0) u_axis = -u_axis;
+
+    const cv::Vec3d cad_center = 0.5 * (_cad_min + _cad_max);
+    const double diag = std::max(0.05, _real_bounding_diag_m);
+
+    const size_t obs_step  = std::max<size_t>(1, scene_pts.size() / 240);
+    const size_t mesh_step = std::max<size_t>(1, _mesh_pts.size() / 600);
+
+    const double coarse_r = std::clamp(0.055 * diag, 0.015, 0.075);
+    const double fine_r   = std::clamp(0.025 * diag, 0.008, 0.035);
+    const double huber_k  = std::clamp(0.015 * diag, 0.005, 0.020);
+
+    std::vector<cv::Vec3d> vis_pts_cam;
+    std::vector<cv::Vec3d> vis_norms_cam;
+    vis_pts_cam.reserve(_mesh_pts.size() / mesh_step + 1);
+    vis_norms_cam.reserve(_mesh_pts.size() / mesh_step + 1);
+
+    for (int iter = 0; iter < max_iters; ++iter) {
+        const double max_corr = (iter < max_iters / 2) ? coarse_r : fine_r;
+        const double max_corr_sq = max_corr * max_corr;
+
+        vis_pts_cam.clear();
+        vis_norms_cam.clear();
+        for (size_t j = 0; j < _mesh_pts.size(); j += mesh_step) {
+            const cv::Vec3d q_cam = pose.R * cv::Vec3d(_mesh_pts[j]) + pose.t;
+            const cv::Vec3d n_cam = pose.R * cv::Vec3d(_mesh_normals[j]);
+            if (n_cam.dot(q_cam) >= -0.05 * cv::norm(q_cam)) continue;
+            vis_pts_cam.push_back(q_cam);
+            vis_norms_cam.push_back(n_cam);
+        }
+        if (vis_pts_cam.size() < 16) break;
+
+        const cv::Vec3d world_center = pose.R * cad_center + pose.t;
+
+        cv::Matx44d H = cv::Matx44d::zeros();
+        cv::Vec4d b(0.0, 0.0, 0.0, 0.0);
+        int inliers = 0;
+
+        for (size_t i = 0; i < scene_pts.size(); i += obs_step) {
+            const cv::Vec3d p_obs(scene_pts[i]);
+            double best_d2 = max_corr_sq;
+            int best_j = -1;
+
+            for (size_t j = 0; j < vis_pts_cam.size(); ++j) {
+                const cv::Vec3d diff = p_obs - vis_pts_cam[j];
+                const double d2 = diff.dot(diff);
+                if (d2 < best_d2) {
+                    best_d2 = d2;
+                    best_j = static_cast<int>(j);
+                }
+            }
+            if (best_j < 0) continue;
+
+            const cv::Vec3d& q = vis_pts_cam[best_j];
+            const cv::Vec3d& n = vis_norms_cam[best_j];
+
+            const double res = (p_obs - q).dot(n);
+            const double abs_res = std::abs(res);
+            const double w = (abs_res <= huber_k) ? 1.0 : (huber_k / std::max(1e-9, abs_res));
+
+            const cv::Vec3d r_vec = q - world_center;
+            const double j_yaw = (u_axis.cross(r_vec)).dot(n);
+            const double J[4] = {j_yaw, n[0], n[1], n[2]};
+
+            for (int r = 0; r < 4; ++r) {
+                const double wJr = w * J[r];
+                b[r] += wJr * res;
+                for (int c = r; c < 4; ++c) {
+                    H(r, c) += wJr * J[c];
+                }
+            }
+            ++inliers;
+        }
+
+        if (inliers < 12) break;
+
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < r; ++c) {
+                H(r, c) = H(c, r);
+            }
+        }
+        const double damp_rot = 0.05 * static_cast<double>(inliers) * (diag * diag);
+        const double damp_tr  = 0.02 * static_cast<double>(inliers);
+        H(0, 0) += std::max(1e-3, damp_rot);
+        H(1, 1) += std::max(1e-3, damp_tr);
+        H(2, 2) += std::max(1e-3, damp_tr);
+        H(3, 3) += std::max(1e-3, damp_tr);
+
+        cv::Vec4d dx(0.0, 0.0, 0.0, 0.0);
+        if (!cv::solve(H, b, dx, cv::DECOMP_CHOLESKY)) {
+            if (!cv::solve(H, b, dx, cv::DECOMP_SVD)) break;
+        }
+
+        const double d_yaw = std::clamp(dx[0], -0.22, 0.22);
+        cv::Vec3d d_t(dx[1], dx[2], dx[3]);
+        const double max_dt = std::clamp(0.08 * diag, 0.015, 0.080);
+        const double dt_norm = cv::norm(d_t);
+        if (dt_norm > max_dt) {
+            d_t *= (max_dt / dt_norm);
+        }
+
+        const cv::Matx33d R_yaw = axisAngleToMat33(u_axis, d_yaw);
+        pose.R = R_yaw * pose.R;
+        pose.t = (world_center + d_t) - pose.R * cad_center;
+
+        if (std::abs(d_yaw) < 1e-3 && dt_norm < 5e-4) {
+            break;
+        }
+    }
+
+    const bool fold_c2 = (_is_floor_standing && _symmetry_code >= 1);
+    const cv::Vec3d euler = rotationMatrixToEulerDeg(pose.R, fold_c2);
+    pose.roll_deg  = euler[0];
+    pose.pitch_deg = euler[1];
+    pose.yaw_deg   = euler[2];
+}
+
 void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f>& scene_pts,
                                                      ObjectPose& pose,
                                                      const CameraIntrinsics& intr,
                                                      const cv::Mat& depth_z16,
-                                                     const cv::Vec4d* floor_plane) const
+                                                     const cv::Vec4d* floor_plane,
+                                                     bool has_floor) const
 {
     if (!pose.valid || _mesh_pts.empty() || scene_pts.size() < 24) return;
 
@@ -2891,70 +3088,130 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         cv::Matx33d R_final = R_icp.t();
         cv::Vec3d t_final = -R_final * t_icp;
 
-        // Giữ chặt trục đứng Z của vật thể FLOOR_STANDING song song với pháp tuyến mặt sàn đã khóa
-        // (tránh ICP 6-DoF tự nghiêng Roll/Pitch khi một bên chân bàn bị khuyết Depth).
-        if (pose.floor_locked) {
-            cv::Vec3d n_fl(R_curr(0, 2), R_curr(1, 2), R_curr(2, 2));
-            const double n_norm = cv::norm(n_fl);
-            if (n_norm > 1e-6) {
-                n_fl *= (1.0 / n_norm);
-                cv::Vec3d y_ax(R_final(0, 1), R_final(1, 1), R_final(2, 1));
-                y_ax -= n_fl * n_fl.dot(y_ax);
-                if (cv::norm(y_ax) > 1e-6) {
-                    y_ax *= (1.0 / cv::norm(y_ax));
-                    cv::Vec3d x_ax = y_ax.cross(n_fl);
-                    x_ax *= (1.0 / std::max(1e-6, cv::norm(x_ax)));
-                    const cv::Vec3d cad_center(
-                        0.5 * (_cad_min[0] + _cad_max[0]),
-                        0.5 * (_cad_min[1] + _cad_max[1]),
-                        0.5 * (_cad_min[2] + _cad_max[2]));
-                    const cv::Vec3d world_center = R_final * cad_center + t_final;
-                    R_final = cv::Matx33d(
-                        x_ax[0], y_ax[0], n_fl[0],
-                        x_ax[1], y_ax[1], n_fl[1],
-                        x_ax[2], y_ax[2], n_fl[2]);
-                    t_final = world_center - R_final * cad_center;
-                }
-                if (floor_plane != nullptr) {
-                    const cv::Vec3d fl_raw((*floor_plane)[0], (*floor_plane)[1], (*floor_plane)[2]);
-                    const double fl_norm = cv::norm(fl_raw);
-                    if (fl_norm > 1e-6) {
-                        const double sign = (fl_raw.dot(n_fl) >= 0.0) ? 1.0 : -1.0;
-                        const cv::Vec3d p_bot = R_final * cv::Vec3d(
-                            0.5 * (_cad_min[0] + _cad_max[0]),
-                            0.5 * (_cad_min[1] + _cad_max[1]),
-                            _cad_min[2]) + t_final;
-                        const double signed_h = sign * (fl_raw.dot(p_bot) + (*floor_plane)[3]) / fl_norm;
-                        if (std::abs(signed_h) < 0.12) {
-                            t_final -= n_fl * signed_h;
-                        }
-                    }
-                }
-            }
-        }
-
         const double max_drift = std::clamp(_real_bounding_diag_m * 0.35, 0.08, 0.40);
         if (cv::norm(t_final - pose.t) > max_drift || !isInTargetWorkspace(t_final)) {
             return;
         }
 
-        pose.R = R_final;
-        pose.t = t_final;
+        // Nhánh A: Nghiệm 6DoF tự do (Plane-Free) đã hội tụ từ Multi-Scale ICP
+        ObjectPose pose_free = pose;
+        pose_free.R = R_final;
+        pose_free.t = t_final;
+        pose_free.t_glass = t_final;
+        pose_free.floor_locked = false;
+        pose_free.method = "icp_free_6dof";
+
+        // Đám mây điểm quan sát đầy đủ (chưa bị cắt bởi R_curr ban đầu) để chấm điểm công bằng giữa Nhánh A & Nhánh B
+        std::vector<cv::Vec3d> scene_eval_pts;
+        const size_t eval_step = std::max<size_t>(1, scene_pts.size() / 600);
+        scene_eval_pts.reserve(scene_pts.size() / eval_step + 1);
+        for (size_t i = 0; i < scene_pts.size(); i += eval_step) {
+            scene_eval_pts.emplace_back(scene_pts[i]);
+        }
+
+        const double diag_fs = std::max(0.05, _real_bounding_diag_m);
+        const BidirectionalConsensus cons_free = evaluateBidirectionalConsensus(
+            pose_free.R, pose_free.t, diag_fs, _mesh_pts, _mesh_normals,
+            scene_eval_pts, fx, fy, cx, cy, img_w, img_h, false);
+
+        // Nhánh B: Ứng viên Soft Floor Prior (cạnh tranh công bằng với Nhánh A trên CÙNG scene_eval_pts)
+        const bool floor_normal_ok =
+            has_floor &&
+            (floor_plane != nullptr) &&
+            (cv::norm(cv::Vec3d((*floor_plane)[0], (*floor_plane)[1], (*floor_plane)[2])) > 0.9);
+
+        if (floor_normal_ok) {
+            ObjectPose pose_floor = makeFloorAlignedCandidate(pose_free, *floor_plane, _cad_min, _cad_max);
+            runTranslationAndYawOnlyIcp(scene_pts, pose_floor, *floor_plane, 6);
+            BidirectionalConsensus cons_floor = evaluateBidirectionalConsensus(
+                pose_floor.R, pose_floor.t, diag_fs, _mesh_pts, _mesh_normals,
+                scene_eval_pts, fx, fy, cx, cy, img_w, img_h, false);
+
+            // Cạnh tranh thêm hạt giống Floor-PCA (0°/180°) trên scene_eval_pts đầy đủ để cứu khi RANSAC tự do bị xoay lệch 90°
+            if (scene_eval_pts.size() >= 24) {
+                cv::Vec3d u_fl((*floor_plane)[0], (*floor_plane)[1], (*floor_plane)[2]);
+                u_fl *= (1.0 / std::max(1e-6, cv::norm(u_fl)));
+                if (u_fl[1] > 0.0) u_fl = -u_fl;
+
+                cv::Vec3d mu(0.0, 0.0, 0.0);
+                for (const auto& p : scene_eval_pts) mu += p;
+                mu *= (1.0 / static_cast<double>(scene_eval_pts.size()));
+                cv::Matx33d cov = cv::Matx33d::zeros();
+                for (const auto& p : scene_eval_pts) {
+                    cv::Vec3d d = p - mu;
+                    d -= u_fl * d.dot(u_fl);
+                    cov += d * d.t();
+                }
+                cv::Matx33d U_c, Vt_c;
+                cv::Vec3d W_c;
+                cv::SVD::compute(cov, W_c, U_c, Vt_c);
+                cv::Vec3d y_pca(Vt_c(0, 0), Vt_c(0, 1), Vt_c(0, 2));
+                y_pca -= u_fl * y_pca.dot(u_fl);
+                if (cv::norm(y_pca) > 1e-6) {
+                    y_pca *= (1.0 / cv::norm(y_pca));
+                    const cv::Vec3d cad_mid = 0.5 * (_cad_min + _cad_max);
+                    for (int flip = 0; flip < 2; ++flip) {
+                        cv::Vec3d y_try = (flip == 0) ? y_pca : -y_pca;
+                        cv::Vec3d x_try = y_try.cross(u_fl);
+                        x_try *= (1.0 / std::max(1e-6, cv::norm(x_try)));
+                        ObjectPose cand_pca = pose_free;
+                        cand_pca.R = cv::Matx33d(
+                            x_try[0], y_try[0], u_fl[0],
+                            x_try[1], y_try[1], u_fl[1],
+                            x_try[2], y_try[2], u_fl[2]);
+                        cand_pca.t = mu - cand_pca.R * cad_mid;
+                        runTranslationAndYawOnlyIcp(scene_pts, cand_pca, *floor_plane, 8);
+                        const BidirectionalConsensus c_pca = evaluateBidirectionalConsensus(
+                            cand_pca.R, cand_pca.t, diag_fs, _mesh_pts, _mesh_normals,
+                            scene_eval_pts, fx, fy, cx, cy, img_w, img_h, false);
+                        if (c_pca.score > cons_floor.score) {
+                            pose_floor = std::move(cand_pca);
+                            cons_floor = c_pca;
+                        }
+                    }
+                }
+            }
+
+            constexpr double kFloorPriorBonus = 0.025;
+            const bool rmse_not_degraded =
+                (cons_floor.rmse_m <= cons_free.rmse_m * 1.15 + 0.002);
+
+            if (isInTargetWorkspace(pose_floor.t) &&
+                rmse_not_degraded &&
+                (cons_floor.score + kFloorPriorBonus > cons_free.score)) {
+                pose = std::move(pose_floor);
+                pose.floor_locked = true;
+                pose.method = "icp_soft_floor_prior";
+            } else {
+                pose = std::move(pose_free);
+                pose.floor_locked = false;
+                pose.method = "icp_free_6dof";
+            }
+        } else {
+            pose = std::move(pose_free);
+            pose.floor_locked = false;
+            pose.method = "icp_free_6dof";
+        }
+
+        R_final = pose.R;
+        t_final = pose.t;
         pose.t_glass = t_final;
         const bool fold_c2 = (_symmetry_code >= 1);
         cv::Vec3d euler = rotationMatrixToEulerDeg(pose.R, fold_c2);
         pose.roll_deg = euler[0];
         pose.pitch_deg = euler[1];
         pose.yaw_deg = euler[2];
-        pose.method = "universal_mesh_icp";
 
+        computeVisibleCadSubset(R_final, t_final, _mesh_pts, _mesh_normals,
+                                fx, fy, cx, cy, img_w, img_h, mesh_stride,
+                                cad_vis_pts, cad_vis_norms, _real_bounding_diag_m);
         const cv::Matx33d R_check_inv = R_final.t();
         const double fit_thresh = std::clamp(_real_bounding_diag_m * 0.025, 0.006, 0.025);
         const double fit_thresh_sq = fit_thresh * fit_thresh;
         const size_t vis_step = (cad_vis_pts.size() > 1500) ? 2 : 1;
         int surf_inliers = 0;
         double inlier_dsq_sum = 0.0;
-        for (const auto& p_sc : fg_pts) {
+        for (const auto& p_sc : scene_eval_pts) {
             const cv::Vec3d p_cad = R_check_inv * (p_sc - t_final);
             double min_dsq = 1e10;
             for (size_t j = 0; j < cad_vis_pts.size(); j += vis_step) {
@@ -2969,7 +3226,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         }
         if (surf_inliers >= 12) {
             const double icp_rmse = std::sqrt(inlier_dsq_sum / static_cast<double>(surf_inliers));
-            const double icp_fitness = static_cast<double>(surf_inliers) / static_cast<double>(fg_pts.size());
+            const double icp_fitness = static_cast<double>(surf_inliers) / static_cast<double>(scene_eval_pts.size());
             const double sigma = std::clamp(_real_bounding_diag_m * 0.022, 0.008, 0.028);
             const double surf_qual = std::exp(-(icp_rmse * icp_rmse) / (2.0 * sigma * sigma));
             const double mesh_conf = 0.65 * icp_fitness + 0.35 * (icp_fitness * surf_qual);
@@ -3472,7 +3729,8 @@ void UniversalPoseEstimator::refinePoseUniversalCrease2D3D(ObjectPose& pose,
     if (!pose.valid) return pose;
 
     const std::vector<cv::Vec3f>& icp_cloud = dense_pts.empty() ? sampled_pts : dense_pts;
-    refineMultiScaleMeshICP(icp_cloud, pose, intr, depth_z16, floor_detected ? &floor_plane : nullptr);
+    refineMultiScaleMeshICP(icp_cloud, pose, intr, depth_z16,
+                            floor_detected ? &floor_plane : nullptr, floor_detected);
 
     // Kiểm tra đối xứng 180 độ (Azimuthal quanh trục đứng vert_ax & Polar đầu-đáy) bằng biên dạng cạnh 2D trên ảnh RGB
     if (!_is_floor_standing && !rgb.empty() && !_mesh_pts.empty()) {
@@ -3570,7 +3828,7 @@ void UniversalPoseEstimator::refinePoseUniversalCrease2D3D(ObjectPose& pose,
 
     pose.cluster_points_count = static_cast<int>(icp_cloud.size());
     pose.valid_depth_pts = static_cast<int>(icp_cloud.size());
-    pose.floor_locked = (_is_floor_standing && floor_detected);
+    pose.floor_locked = (_is_floor_standing && floor_detected && pose.method == "icp_soft_floor_prior");
     pose.floor_pitch_deg = floor_pitch_deg;
     pose.sparse_depth_fallback = (pose.valid_depth_pts < 250);
     pose.segmented_points = icp_cloud;
@@ -4073,11 +4331,16 @@ PoseRefinerCallbacks UniversalPoseEstimator::makeTrackerCallbacks() const
         const int h = (intr.height > 0) ? intr.height : 480;
         cv::Matx33d R_icp = cand.R;
         cv::Vec3d t_icp = cand.t;
-        const std::vector<double> tr_scales = {
-            std::clamp(0.100 * diag, 0.015, 0.100),
-            std::clamp(0.045 * diag, 0.008, 0.040),
-            std::clamp(0.020 * diag, 0.005, 0.018)
-        };
+        const std::vector<double> tr_scales = _is_floor_standing
+            ? std::vector<double>{
+                std::clamp(0.100 * diag, 0.030, 0.100),
+                std::clamp(0.045 * diag, 0.015, 0.040),
+                std::clamp(0.020 * diag, 0.008, 0.018)
+              }
+            : std::vector<double>{
+                std::clamp(0.045 * diag, 0.007, 0.018),
+                std::clamp(0.020 * diag, 0.004, 0.009)
+              };
         runPointToPlaneIcpGeneric(cand.R, cand.t, _mesh_pts, _mesh_normals, fg_icp,
                                   1, std::max<size_t>(1, _mesh_pts.size() / 1600),
                                   tr_scales, 10, fx, fy, cx, cy, w, h, R_icp, t_icp);
@@ -5085,15 +5348,16 @@ void UniversalPoseEstimator::drawOverlay(cv::Mat& img,
         projectCadBoundingBox(pose.R, pose.t, intr, img.cols, img.rows, &c2d);
     }
     if (c2d.size() == 8) {
+        const int box_thick = (pose.bbox_2d.width > 0.0f && pose.bbox_2d.width < 120.0f) ? 1 : 2;
         for (int i = 0; i < 4; ++i) {
-            cv::line(img, to_pt(c2d[i]), to_pt(c2d[(i + 1) % 4]), GREEN, 2, cv::LINE_AA);
-            cv::line(img, to_pt(c2d[i + 4]), to_pt(c2d[((i + 1) % 4) + 4]), CYAN, 2, cv::LINE_AA);
-            cv::line(img, to_pt(c2d[i]), to_pt(c2d[i + 4]), YELLOW, 2, cv::LINE_AA);
+            cv::line(img, to_pt(c2d[i]), to_pt(c2d[(i + 1) % 4]), GREEN, box_thick, cv::LINE_AA);
+            cv::line(img, to_pt(c2d[i + 4]), to_pt(c2d[((i + 1) % 4) + 4]), CYAN, box_thick, cv::LINE_AA);
+            cv::line(img, to_pt(c2d[i]), to_pt(c2d[i + 4]), YELLOW, box_thick, cv::LINE_AA);
         }
     }
 
     // 3. Scale-adaptive 3D Coordinate Axes at object center
-    const double axis_len = std::clamp(_real_bounding_diag_m * 0.16, 0.04, 0.16);
+    const double axis_len = std::clamp(_real_bounding_diag_m * 0.28, 0.025, 0.15);
     cv::Point2f p_c = proj_f(0, 0, 0);
     cv::Point2f p_x = proj_f(axis_len, 0, 0);
     cv::Point2f p_y = proj_f(0, axis_len, 0);

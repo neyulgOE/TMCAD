@@ -375,10 +375,10 @@ bool CADSceneSegmenter::loadProfileConfig(const std::string& profile_json_path) 
 
     // Automatically adapt depth range for small tabletop/handheld objects vs floor-standing frames
     if (!_floor_standing_mode && _bounding_diag_m < 0.45f) {
-        _min_depth_m = 0.25f;
-        _max_depth_m = 1.85f;
-        _left_margin_ratio = 0.02f;
-        _right_margin_ratio = 0.02f;
+        _min_depth_m = 0.18f;
+        _max_depth_m = std::clamp(4.2f * _bounding_diag_m + 0.25f, 0.85f, 1.85f);
+        _left_margin_ratio = 0.01f;
+        _right_margin_ratio = 0.01f;
     } else if (!_floor_standing_mode) {
         _min_depth_m = 0.30f;
         _max_depth_m = 2.50f;
@@ -411,10 +411,10 @@ void CADSceneSegmenter::setExpectedObjectDimensions(float length_m, float width_
     _floor_standing_mode = floor_standing;
 
     if (!_floor_standing_mode && _bounding_diag_m < 0.45f) {
-        _min_depth_m = 0.25f;
-        _max_depth_m = 1.85f;
-        _left_margin_ratio = 0.02f;
-        _right_margin_ratio = 0.02f;
+        _min_depth_m = 0.18f;
+        _max_depth_m = std::clamp(4.2f * _bounding_diag_m + 0.25f, 0.85f, 1.85f);
+        _left_margin_ratio = 0.01f;
+        _right_margin_ratio = 0.01f;
     } else if (!_floor_standing_mode) {
         _min_depth_m = 0.30f;
         _max_depth_m = 2.50f;
@@ -662,7 +662,7 @@ bool CADSceneSegmenter::fitSupportPlaneRANSAC(const std::vector<cv::Vec3f>& pts,
     std::vector<cv::Vec3f> rem = pts;
     std::mt19937 rng(42);
     const bool wide_full_scene = (!has_roi_hint && pts.size() > 60000);
-    const double dist_thresh = 0.009;
+    const double dist_thresh = std::clamp(0.06 * static_cast<double>(_expected_height_m), 0.006, 0.009);
     bool found_horizontal = false;
     size_t best_horiz_count = 0;
 
