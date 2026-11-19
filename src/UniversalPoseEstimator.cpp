@@ -3060,9 +3060,30 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         std::sort(cand_pool.begin(), cand_pool.end(),
                   [](const RankedSeed& a, const RankedSeed& b) { return a.pre > b.pre; });
 
-        const size_t take_top = std::min<size_t>(6, cand_pool.size());
+        // Chạy nhanh 3 vòng Coarse ICP trên top 16 hạt giống để không loại oan hướng đúng của khối lập phương/nhiều hốc
+        const size_t n_coarse = std::min<size_t>(16, cand_pool.size());
+        const std::vector<double> coarse_scales = { std::clamp(0.08 * diag, 0.015, 0.045) };
+        std::vector<RankedSeed> coarse_refined;
+        coarse_refined.reserve(n_coarse);
+        for (size_t k = 0; k < n_coarse; ++k) {
+            cv::Matx33d R_c = cand_pool[k].R;
+            cv::Vec3d t_c = cand_pool[k].t;
+            runPointToPlaneIcpGeneric(cand_pool[k].R, cand_pool[k].t, _mesh_pts, _mesh_normals, fg_pts,
+                                      std::max<size_t>(1, search_fg_stride * 2),
+                                      std::max<size_t>(1, search_mesh_stride * 2),
+                                      coarse_scales, 3, fx, fy, cx, cy, img_w, img_h, R_c, t_c);
+            auto sc = evaluateBidirectionalConsensus(
+                R_c, t_c, diag, _mesh_pts, _mesh_normals,
+                fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+            const double inv_z_pen = (R_c(1, 2) > 0.35) ? -0.025 : 0.0;
+            coarse_refined.push_back(RankedSeed{sc.score + inv_z_pen, R_c, t_c});
+        }
+        std::sort(coarse_refined.begin(), coarse_refined.end(),
+                  [](const RankedSeed& a, const RankedSeed& b) { return a.pre > b.pre; });
+
+        const size_t take_top = std::min<size_t>(8, coarse_refined.size());
         for (size_t k = 0; k < take_top; ++k) {
-            seeds.push_back(PoseSeed{cand_pool[k].R, cand_pool[k].t, 0.0});
+            seeds.push_back(PoseSeed{coarse_refined[k].R, coarse_refined[k].t, 0.0});
         }
     }
 
