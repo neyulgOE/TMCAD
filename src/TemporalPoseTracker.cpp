@@ -255,7 +255,7 @@ bool TemporalPoseTracker::trackFrame(const cv::Mat& rgb,
     if (x1 <= x0 + 8 || y1 <= y0 + 8) return false;
 
     const cv::Matx33d R_inv = _track_pose.R.t();
-    const double obb_pad = std::clamp(0.16 * diag, 0.022, 0.042);
+    const double obb_pad = std::clamp(0.16 * diag, 0.022, 0.12);
     const cv::Vec3d obb_min = _cad_min - cv::Vec3d(obb_pad, obb_pad, obb_pad);
     const cv::Vec3d obb_max = _cad_max + cv::Vec3d(obb_pad, obb_pad, obb_pad);
     const double floor_norm = cv::norm(cv::Vec3d(_floor_plane[0], _floor_plane[1], _floor_plane[2]));
@@ -325,7 +325,8 @@ bool TemporalPoseTracker::trackFrame(const cv::Mat& rgb,
         }
     }
 
-    if (out_local_fg.size() < 16) return false;
+    const size_t min_fg_pts = _is_floor_standing ? 48 : 24;
+    if (out_local_fg.size() < min_fg_pts) return false;
 
     // 2. Sparse 2D Keypoint Tracking (PyrLK + FB < 1.5 px + solvePnPRansac)
     cv::Mat curr_gray;

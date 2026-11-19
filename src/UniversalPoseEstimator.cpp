@@ -2704,6 +2704,7 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
 
     // 6. Floor upright gravity lock ONLY for FLOOR_STANDING archetypes (tables, racks, pallets)
     if (best_pose.valid && _is_floor_standing && valid_floor) {
+        best_pose.floor_locked = true;
         cv::Vec3d z_axis = n_fl;
         z_axis *= (1.0 / std::max(1e-6, cv::norm(z_axis)));
         cv::Vec3d y_axis(best_pose.R(0, 1), best_pose.R(1, 1), best_pose.R(2, 1));
@@ -2747,7 +2748,8 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
 void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f>& scene_pts,
                                                      ObjectPose& pose,
                                                      const CameraIntrinsics& intr,
-                                                     const cv::Mat& depth_z16) const
+                                                     const cv::Mat& depth_z16,
+                                                     const cv::Vec4d* floor_plane) const
 {
     if (!pose.valid || _mesh_pts.empty() || scene_pts.size() < 24) return;
 
@@ -2888,6 +2890,48 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
 
         cv::Matx33d R_final = R_icp.t();
         cv::Vec3d t_final = -R_final * t_icp;
+
+        // Giữ chặt trục đứng Z của vật thể FLOOR_STANDING song song với pháp tuyến mặt sàn đã khóa
+        // (tránh ICP 6-DoF tự nghiêng Roll/Pitch khi một bên chân bàn bị khuyết Depth).
+        if (pose.floor_locked) {
+            cv::Vec3d n_fl(R_curr(0, 2), R_curr(1, 2), R_curr(2, 2));
+            const double n_norm = cv::norm(n_fl);
+            if (n_norm > 1e-6) {
+                n_fl *= (1.0 / n_norm);
+                cv::Vec3d y_ax(R_final(0, 1), R_final(1, 1), R_final(2, 1));
+                y_ax -= n_fl * n_fl.dot(y_ax);
+                if (cv::norm(y_ax) > 1e-6) {
+                    y_ax *= (1.0 / cv::norm(y_ax));
+                    cv::Vec3d x_ax = y_ax.cross(n_fl);
+                    x_ax *= (1.0 / std::max(1e-6, cv::norm(x_ax)));
+                    const cv::Vec3d cad_center(
+                        0.5 * (_cad_min[0] + _cad_max[0]),
+                        0.5 * (_cad_min[1] + _cad_max[1]),
+                        0.5 * (_cad_min[2] + _cad_max[2]));
+                    const cv::Vec3d world_center = R_final * cad_center + t_final;
+                    R_final = cv::Matx33d(
+                        x_ax[0], y_ax[0], n_fl[0],
+                        x_ax[1], y_ax[1], n_fl[1],
+                        x_ax[2], y_ax[2], n_fl[2]);
+                    t_final = world_center - R_final * cad_center;
+                }
+                if (floor_plane != nullptr) {
+                    const cv::Vec3d fl_raw((*floor_plane)[0], (*floor_plane)[1], (*floor_plane)[2]);
+                    const double fl_norm = cv::norm(fl_raw);
+                    if (fl_norm > 1e-6) {
+                        const double sign = (fl_raw.dot(n_fl) >= 0.0) ? 1.0 : -1.0;
+                        const cv::Vec3d p_bot = R_final * cv::Vec3d(
+                            0.5 * (_cad_min[0] + _cad_max[0]),
+                            0.5 * (_cad_min[1] + _cad_max[1]),
+                            _cad_min[2]) + t_final;
+                        const double signed_h = sign * (fl_raw.dot(p_bot) + (*floor_plane)[3]) / fl_norm;
+                        if (std::abs(signed_h) < 0.12) {
+                            t_final -= n_fl * signed_h;
+                        }
+                    }
+                }
+            }
+        }
 
         const double max_drift = std::clamp(_real_bounding_diag_m * 0.35, 0.08, 0.40);
         if (cv::norm(t_final - pose.t) > max_drift || !isInTargetWorkspace(t_final)) {
@@ -3405,19 +3449,11 @@ void UniversalPoseEstimator::refinePoseUniversalCrease2D3D(ObjectPose& pose,
         const float cx_pt = static_cast<float>(sx) * inv_n;
         const float cy_pt = static_cast<float>(sy) * inv_n;
         const float cz_pt = static_cast<float>(sz) * inv_n;
-        if (_is_floor_standing) {
-            for (auto& p : ai_input_pts) {
-                p[0] -= cx_pt;
-                p[1] -= cy_pt;
-                p[2] -= cz_pt;
-            }
-        } else {
-            const float inv_diag = 1.0f / std::max(0.05f, static_cast<float>(_real_bounding_diag_m));
-            for (auto& p : ai_input_pts) {
-                p[0] = (p[0] - cx_pt) * inv_diag;
-                p[1] = (p[1] - cy_pt) * inv_diag;
-                p[2] = (p[2] - cz_pt) * inv_diag;
-            }
+        const float inv_diag = 1.0f / std::max(0.05f, static_cast<float>(_real_bounding_diag_m));
+        for (auto& p : ai_input_pts) {
+            p[0] = (p[0] - cx_pt) * inv_diag;
+            p[1] = (p[1] - cy_pt) * inv_diag;
+            p[2] = (p[2] - cz_pt) * inv_diag;
         }
     }
 
@@ -3436,7 +3472,7 @@ void UniversalPoseEstimator::refinePoseUniversalCrease2D3D(ObjectPose& pose,
     if (!pose.valid) return pose;
 
     const std::vector<cv::Vec3f>& icp_cloud = dense_pts.empty() ? sampled_pts : dense_pts;
-    refineMultiScaleMeshICP(icp_cloud, pose, intr, depth_z16);
+    refineMultiScaleMeshICP(icp_cloud, pose, intr, depth_z16, floor_detected ? &floor_plane : nullptr);
 
     // Kiểm tra đối xứng 180 độ (Azimuthal quanh trục đứng vert_ax & Polar đầu-đáy) bằng biên dạng cạnh 2D trên ảnh RGB
     if (!_is_floor_standing && !rgb.empty() && !_mesh_pts.empty()) {
@@ -4038,13 +4074,38 @@ PoseRefinerCallbacks UniversalPoseEstimator::makeTrackerCallbacks() const
         cv::Matx33d R_icp = cand.R;
         cv::Vec3d t_icp = cand.t;
         const std::vector<double> tr_scales = {
-            std::clamp(0.050 * diag, 0.010, 0.040),
-            std::clamp(0.025 * diag, 0.006, 0.020)
+            std::clamp(0.100 * diag, 0.015, 0.100),
+            std::clamp(0.045 * diag, 0.008, 0.040),
+            std::clamp(0.020 * diag, 0.005, 0.018)
         };
         runPointToPlaneIcpGeneric(cand.R, cand.t, _mesh_pts, _mesh_normals, fg_icp,
                                   1, std::max<size_t>(1, _mesh_pts.size() / 1600),
                                   tr_scales, 10, fx, fy, cx, cy, w, h, R_icp, t_icp);
-        if (isInTargetWorkspace(t_icp) && cv::norm(t_icp - cand.t) <= std::clamp(0.20 * diag, 0.035, 0.080)) {
+        if (_is_floor_standing && cand.floor_locked) {
+            cv::Vec3d n_fl(cand.R(0, 2), cand.R(1, 2), cand.R(2, 2));
+            const double n_norm = cv::norm(n_fl);
+            if (n_norm > 1e-6) {
+                n_fl *= (1.0 / n_norm);
+                cv::Vec3d y_ax(R_icp(0, 1), R_icp(1, 1), R_icp(2, 1));
+                y_ax -= n_fl * n_fl.dot(y_ax);
+                if (cv::norm(y_ax) > 1e-6) {
+                    y_ax *= (1.0 / cv::norm(y_ax));
+                    cv::Vec3d x_ax = y_ax.cross(n_fl);
+                    x_ax *= (1.0 / std::max(1e-6, cv::norm(x_ax)));
+                    const cv::Vec3d cad_center(
+                        0.5 * (_cad_min[0] + _cad_max[0]),
+                        0.5 * (_cad_min[1] + _cad_max[1]),
+                        0.5 * (_cad_min[2] + _cad_max[2]));
+                    const cv::Vec3d world_center = R_icp * cad_center + t_icp;
+                    R_icp = cv::Matx33d(
+                        x_ax[0], y_ax[0], n_fl[0],
+                        x_ax[1], y_ax[1], n_fl[1],
+                        x_ax[2], y_ax[2], n_fl[2]);
+                    t_icp = world_center - R_icp * cad_center;
+                }
+            }
+        }
+        if (isInTargetWorkspace(t_icp) && cv::norm(t_icp - cand.t) <= std::clamp(0.22 * diag, 0.045, 0.160)) {
             cand.R = R_icp;
             cand.t = t_icp;
         }
@@ -4134,6 +4195,46 @@ PoseRefinerCallbacks UniversalPoseEstimator::makeTrackerCallbacks() const
         const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * w);
         const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * h);
 
+        if (_is_floor_standing && !local_fg.empty() && !_mesh_pts.empty()) {
+            std::vector<cv::Vec3d> vis_pts, vis_norms;
+            const size_t m_stride = std::max<size_t>(1, _mesh_pts.size() / 1600);
+            computeVisibleCadSubset(cand.R, cand.t, _mesh_pts, _mesh_normals,
+                                    fx, fy, cx, cy, w, h, m_stride, vis_pts, vis_norms, _real_bounding_diag_m);
+            if (vis_pts.size() >= 20) {
+                const cv::Matx33d R_inv = cand.R.t();
+                const double fit_thresh = std::clamp(_real_bounding_diag_m * 0.025, 0.006, 0.025);
+                const double fit_thresh_sq = fit_thresh * fit_thresh;
+                const size_t fg_step = std::max<size_t>(1, local_fg.size() / 300);
+                int inl = 0, tot = 0;
+                double dsq_sum = 0.0;
+                for (size_t i = 0; i < local_fg.size(); i += fg_step) {
+                    const cv::Vec3d p_cad = R_inv * (cv::Vec3d(local_fg[i]) - cand.t);
+                    double min_dsq = 1e10;
+                    for (size_t j = 0; j < vis_pts.size(); j += 2) {
+                        const cv::Vec3d d = p_cad - vis_pts[j];
+                        const double dsq = d.dot(d);
+                        if (dsq < min_dsq) min_dsq = dsq;
+                    }
+                    ++tot;
+                    if (min_dsq <= fit_thresh_sq) {
+                        ++inl;
+                        dsq_sum += min_dsq;
+                    }
+                }
+                if (tot >= 16 && inl >= 8) {
+                    const double rmse = std::sqrt(dsq_sum / static_cast<double>(inl));
+                    const double fit = static_cast<double>(inl) / static_cast<double>(tot);
+                    const double sigma = std::clamp(_real_bounding_diag_m * 0.022, 0.008, 0.028);
+                    const double qual = std::exp(-(rmse * rmse) / (2.0 * sigma * sigma));
+                    cand.rmse_m = rmse;
+                    cand.inlier_ratio = fit;
+                    cand.inliers_count = inl;
+                    cand.confidence = std::clamp(static_cast<float>(0.65 * fit + 0.35 * (fit * qual)), 0.05f, 0.99f);
+                } else {
+                    cand.confidence = 0.15f;
+                }
+            }
+        }
         const bool strict_ok = rescorePoseUnclipped(cand, local_fg, depth_z16, intr, w, h, true);
         if (!strict_ok && !_is_floor_standing && sil_cost <= 8.0) {
             const double z_hole = computeProjectedZeroDepthFraction(

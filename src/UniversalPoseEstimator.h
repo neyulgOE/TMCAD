@@ -148,7 +148,8 @@ private:
                                      const CameraIntrinsics& intr,
                                      int img_w,
                                      int img_h,
-                                     double* out_ai_ms = nullptr) const;
+                                     double* out_ai_ms = nullptr,
+                                     const cv::Mat& depth_z16 = cv::Mat()) const;
 
     ObjectPose solveRansacKabsch(const std::vector<cv::Vec3f>& obs_pts,
                                  const std::vector<float>& obs_desc,
@@ -157,7 +158,9 @@ private:
 
     void refineMultiScaleMeshICP(const std::vector<cv::Vec3f>& scene_pts,
                                  ObjectPose& pose,
-                                 const CameraIntrinsics& intr) const;
+                                 const CameraIntrinsics& intr,
+                                 const cv::Mat& depth_z16 = cv::Mat(),
+                                 const cv::Vec4d* floor_plane = nullptr) const;
 
     void refinePoseUniversalCrease2D3D(ObjectPose& pose,
                                        const cv::Mat& rgb,

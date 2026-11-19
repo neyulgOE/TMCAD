@@ -1379,6 +1379,9 @@ void MainWindow::buildUi() {
         if (liveCppEstimator_) {
             liveCppEstimator_->resetTemporalTrack();
         }
+        hasLastAcceptedPose_ = false;
+        temporalMissStreak_ = 0;
+        autoTrackRoi_ = cv::Rect();
     };
     connect(liveCamHeightSlider_, &QSlider::valueChanged, this, applyLiveCamOrbit);
     connect(liveCamDistSlider_, &QSlider::valueChanged, this, applyLiveCamOrbit);
@@ -1394,6 +1397,9 @@ void MainWindow::buildUi() {
         if (liveCppEstimator_) {
             liveCppEstimator_->resetTemporalTrack();
         }
+        hasLastAcceptedPose_ = false;
+        temporalMissStreak_ = 0;
+        autoTrackRoi_ = cv::Rect();
     });
 
     connect(liveSimOcclusionSlider_, &QSlider::valueChanged, this, [this](int val) {
