@@ -396,6 +396,49 @@ def _random_so3_matrix(rng: np.random.Generator) -> np.ndarray:
     ], dtype=np.float32)
 
 
+def fps_sampling_np(pts: np.ndarray, num_samples: int, seed: int = 42) -> np.ndarray:
+    """Farthest Point Sampling 3D trên tập tâm tam giác (có lọc ứng viên khi M > 20k)."""
+    n = len(pts)
+    if n <= num_samples:
+        return np.arange(n, dtype=np.int64)
+    if n > 20000:
+        rng = np.random.default_rng(seed)
+        cand_idx = rng.choice(n, size=20000, replace=False)
+        sub = pts[cand_idx].astype(np.float32)
+    else:
+        cand_idx = np.arange(n, dtype=np.int64)
+        sub = pts.astype(np.float32)
+
+    m = len(sub)
+    selected = np.zeros(num_samples, dtype=np.int64)
+    dists = np.full(m, np.inf, dtype=np.float32)
+    farthest = 0
+    for i in range(num_samples):
+        selected[i] = farthest
+        diff = sub - sub[farthest]
+        d = np.einsum("ij,ij->i", diff, diff)
+        dists = np.minimum(dists, d)
+        farthest = int(np.argmax(dists))
+    return cand_idx[selected].astype(np.int64)
+
+
+def _sphere_view_with_roll(az: float, el: float, roll_rad: float, dist: float,
+                           target: np.ndarray, cad_center: np.ndarray):
+    """Sinh pose camera nhìn vào target từ (az, el) trên mặt cầu kèm góc Roll giới hạn quanh trục Z camera."""
+    cos_el = math.cos(el)
+    cam_dir = np.array([cos_el * math.cos(az), cos_el * math.sin(az), math.sin(el)], dtype=np.float32)
+    cam_pos = cad_center + dist * cam_dir
+    R0, _ = _look_at_camera_from_object(cam_pos, target, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+    if abs(roll_rad) > 1e-6:
+        c, s = math.cos(roll_rad), math.sin(roll_rad)
+        Rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        R = (Rz @ R0).astype(np.float32)
+    else:
+        R = R0
+    t = (-R @ cam_pos).astype(np.float32)
+    return R, t
+
+
 def _look_at_camera_from_object(cam_pos: np.ndarray, target: np.ndarray, up_hint: np.ndarray):
     """Trả về (R_cam_obj, t_cam_obj) chuẩn OpenCV (+X phải, +Y xuống, +Z nhìn vào vật)."""
     z_cam = target - cam_pos
@@ -557,7 +600,11 @@ class OnTheFlyTriangleDataset(Dataset):
         if os.path.isfile(key_path):
             key_idx = np.clip(np.load(key_path).astype(np.int64), 0, M_total - 1)
         elif M_total >= self.num_cad_samples:
-            key_idx = np.linspace(0, M_total - 1, self.num_cad_samples, dtype=np.int64)
+            key_idx = fps_sampling_np(self.tri_centers, self.num_cad_samples, seed=42)
+            try:
+                np.save(key_path, key_idx)
+            except OSError:
+                pass
         else:
             rng_k = np.random.default_rng(1337)
             key_idx = rng_k.choice(M_total, size=self.num_cad_samples, replace=True).astype(np.int64)
@@ -592,7 +639,7 @@ class OnTheFlyTriangleDataset(Dataset):
         for i in range(N):
             if self.is_floor_standing:
                 az = 2.0 * math.pi * (i / max(1, N))
-                cam_h = 0.20 + 0.95 * ((i % 7) / 6.0)
+                cam_h = 0.25 + 1.55 * ((i % 7) / 6.0)
                 dist = self.real_bounding_diag_m * (1.2 + 1.0 * ((i % 5) / 4.0))
                 cam_pos = np.array([
                     self.cad_center[0] + dist * math.cos(az),
@@ -601,14 +648,12 @@ class OnTheFlyTriangleDataset(Dataset):
                 ], dtype=np.float32)
                 R, t = _look_at_camera_from_object(cam_pos, self.cad_center, np.array([0, 0, 1], dtype=np.float32))
             else:
-                y = 1.0 - (i / max(1, N - 1)) * 2.0
-                r = math.sqrt(max(0.0, 1.0 - y * y))
-                theta = golden * i
-                dist = self.real_bounding_diag_m * rng.uniform(2.2, 4.5)
-                cam_pos = self.cad_center + dist * np.array([math.cos(theta) * r, math.sin(theta) * r, y], dtype=np.float32)
-                up = rng.normal(size=3).astype(np.float32)
-                up = up / (np.linalg.norm(up) + 1e-8)
-                R, t = _look_at_camera_from_object(cam_pos, self.cad_center, up)
+                az = (golden * i) % (2.0 * math.pi)
+                sin_el = math.sin(math.radians(-20.0)) + (i / max(1, N - 1)) * (math.sin(math.radians(85.0)) - math.sin(math.radians(-20.0)))
+                el = math.asin(max(-1.0, min(1.0, sin_el)))
+                roll_rad = math.radians(float(rng.uniform(-20.0, 20.0)))
+                dist = self.real_bounding_diag_m * float(rng.uniform(2.2, 4.5))
+                R, t = _sphere_view_with_roll(az, el, roll_rad, dist, self.cad_center, self.cad_center)
             self.val_poses.append((R, t))
 
     def __len__(self) -> int:
@@ -619,7 +664,7 @@ class OnTheFlyTriangleDataset(Dataset):
             return self.val_poses[idx]
         if self.is_floor_standing:
             az = rng.uniform(0.0, 2.0 * math.pi)
-            cam_h = rng.uniform(0.15, 1.25)
+            cam_h = rng.uniform(0.20, 1.85)
             dist = rng.uniform(max(0.65, 1.1 * self.real_bounding_diag_m), max(2.2, 2.6 * self.real_bounding_diag_m))
             cam_pos = np.array([
                 self.cad_center[0] + dist * math.cos(az),
@@ -629,14 +674,13 @@ class OnTheFlyTriangleDataset(Dataset):
             target = self.cad_center + rng.normal(0.0, 0.03 * self.real_bounding_diag_m, size=3).astype(np.float32)
             return _look_at_camera_from_object(cam_pos, target, np.array([0.0, 0.0, 1.0], dtype=np.float32))
 
-        R = _random_so3_matrix(rng)
-        dist = rng.uniform(max(0.28, 1.8 * self.real_bounding_diag_m), max(0.85, 5.5 * self.real_bounding_diag_m))
-        t = np.array([
-            rng.uniform(-0.12, 0.12) * dist,
-            rng.uniform(-0.12, 0.12) * dist,
-            dist,
-        ], dtype=np.float32) - (R @ self.cad_center)
-        return R, t
+        az = float(rng.uniform(0.0, 2.0 * math.pi))
+        sin_el = float(rng.uniform(math.sin(math.radians(-20.0)), math.sin(math.radians(85.0))))
+        el = math.asin(max(-1.0, min(1.0, sin_el)))
+        roll_rad = math.radians(float(rng.uniform(-20.0, 20.0)))
+        dist = float(rng.uniform(max(0.28, 1.8 * self.real_bounding_diag_m), max(0.85, 5.5 * self.real_bounding_diag_m)))
+        target = self.cad_center + rng.normal(0.0, 0.02 * self.real_bounding_diag_m, size=3).astype(np.float32)
+        return _sphere_view_with_roll(az, el, roll_rad, dist, target, self.cad_center)
 
     def _sample_visible_surface(self, R: np.ndarray, t: np.ndarray, rng: np.random.Generator):
         n_raw = max(4096, self.num_obs_points * 4)

@@ -969,6 +969,95 @@ struct BidirectionalConsensus {
     double score{-1e9};
 };
 
+// Tính pháp tuyến bề mặt 3D (hướng về phía camera) cho từng điểm obs_pts từ ảnh depth_z16.
+// Điểm sát mép hoặc vùng thủng Depth trả về (0, 0, 0) để tự động bỏ qua kiểm tra pháp tuyến.
+std::vector<cv::Vec3f> computeObsNormalsFromDepth(const std::vector<cv::Vec3d>& obs_pts,
+                                                  const cv::Mat& depth_z16,
+                                                  const CameraIntrinsics& intr,
+                                                  int step_px = 2)
+{
+    std::vector<cv::Vec3f> normals(obs_pts.size(), cv::Vec3f(0.0f, 0.0f, 0.0f));
+    if (obs_pts.empty() || depth_z16.empty() || depth_z16.type() != CV_16UC1) {
+        return normals;
+    }
+
+    const int w = depth_z16.cols;
+    const int h = depth_z16.rows;
+    const float fx = (intr.fx > 100.0) ? static_cast<float>(intr.fx) : (0.95f * w);
+    const float fy = (intr.fy > 100.0) ? static_cast<float>(intr.fy) : fx;
+    const float cx = (intr.ppx > 10.0) ? static_cast<float>(intr.ppx)
+                   : ((intr.cx > 10.0) ? static_cast<float>(intr.cx) : (0.5f * w));
+    const float cy = (intr.ppy > 10.0) ? static_cast<float>(intr.ppy)
+                   : ((intr.cy > 10.0) ? static_cast<float>(intr.cy) : (0.5f * h));
+    const float scale = (intr.depth_scale > 0.0) ? static_cast<float>(intr.depth_scale) : 0.001f;
+    const int s = std::max(1, step_px);
+
+    auto backproject = [&](int u, int v, float z_ref, float max_dz, cv::Vec3f& out_p) -> bool {
+        if (u < 0 || u >= w || v < 0 || v >= h) return false;
+        const uint16_t raw = depth_z16.at<uint16_t>(v, u);
+        if (raw == 0) return false;
+        const float z = static_cast<float>(raw) * scale;
+        if (z <= 0.08f || std::abs(z - z_ref) > max_dz) return false;
+        out_p = cv::Vec3f((static_cast<float>(u) - cx) * z / fx,
+                          (static_cast<float>(v) - cy) * z / fy,
+                          z);
+        return true;
+    };
+
+    for (size_t i = 0; i < obs_pts.size(); ++i) {
+        const cv::Vec3f pc(static_cast<float>(obs_pts[i][0]),
+                           static_cast<float>(obs_pts[i][1]),
+                           static_cast<float>(obs_pts[i][2]));
+        if (pc[2] <= 0.08f) continue;
+
+        const int u = static_cast<int>(std::round(fx * pc[0] / pc[2] + cx));
+        const int v = static_cast<int>(std::round(fy * pc[1] / pc[2] + cy));
+        if (u < s || u >= w - s || v < s || v >= h - s) continue;
+
+        const float max_dz = std::max(0.010f, 0.022f * pc[2]);
+        cv::Vec3f p_l, p_r, p_u, p_d;
+        const bool ok_l = backproject(u - s, v, pc[2], max_dz, p_l);
+        const bool ok_r = backproject(u + s, v, pc[2], max_dz, p_r);
+        const bool ok_u = backproject(u, v - s, pc[2], max_dz, p_u);
+        const bool ok_d = backproject(u, v + s, pc[2], max_dz, p_d);
+
+        cv::Vec3f du, dv;
+        if (ok_l && ok_r)      du = p_r - p_l;
+        else if (ok_r)         du = p_r - pc;
+        else if (ok_l)         du = pc - p_l;
+        else                   continue;
+
+        if (ok_u && ok_d)      dv = p_d - p_u;
+        else if (ok_d)         dv = p_d - pc;
+        else if (ok_u)         dv = pc - p_u;
+        else                   continue;
+
+        cv::Vec3f n = dv.cross(du);
+        const float n_len = cv::norm(n);
+        if (n_len < 1e-7f) continue;
+        n *= (1.0f / n_len);
+        if (n.dot(pc) > 0.0f) n = -n;
+        normals[i] = n;
+    }
+    return normals;
+}
+
+inline double computeNormalConsistencyWeight(const cv::Vec3f& n_obs,
+                                             const cv::Vec3d& n_vis_cam)
+{
+    if (n_obs.dot(n_obs) < 0.25f) return 1.0;
+    const double n_vis_len = cv::norm(n_vis_cam);
+    if (n_vis_len < 1e-6) return 1.0;
+    const double cos_ang = (static_cast<double>(n_obs[0]) * n_vis_cam[0] +
+                            static_cast<double>(n_obs[1]) * n_vis_cam[1] +
+                            static_cast<double>(n_obs[2]) * n_vis_cam[2]) / n_vis_len;
+    constexpr double kCosReject = 0.35; // ~69.5°
+    constexpr double kCosFull   = 0.90; // ~25.8°
+    if (cos_ang <= kCosReject) return 0.0;
+    if (cos_ang >= kCosFull)   return 1.0;
+    return (cos_ang - kCosReject) / (kCosFull - kCosReject);
+}
+
 BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
                                                      const cv::Vec3d& t,
                                                      double cad_diag,
@@ -981,7 +1070,8 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
                                                      double cy,
                                                      int img_w,
                                                      int img_h,
-                                                     bool fast_search = false)
+                                                     bool fast_search = false,
+                                                     const std::vector<cv::Vec3f>* obs_normals = nullptr)
 {
     (void)fast_search;
     BidirectionalConsensus res;
@@ -1005,13 +1095,15 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
         if (vis_pts.size() < 20) return res;
     }
 
+    const bool use_obs_normals = (obs_normals != nullptr && obs_normals->size() == scene_fg_pts.size());
+
     const double tol = std::clamp(cad_diag * 0.055, 0.008, 0.020);
     const double tol_sq = tol * tol;
     // Chỉ khử sai số rời rạc Point-to-Plane trong bán kính khoảng cách lưới điểm (<= 8mm),
     // giữ nguyên khoảng cách Euclidean cho các điểm lệch quai/nắp (> 8mm) để không phá phân biệt góc xoay.
     const double p2pl_rad = std::min(0.008, 0.65 * tol);
     const double max_p2pl_sq = p2pl_rad * p2pl_rad;
-    const double sigma = std::clamp(cad_diag * 0.045, 0.007, 0.016);
+    const double sigma = std::clamp(cad_diag * 0.022, 0.008, 0.028);
     const double inv_2sig2 = 0.5 / (sigma * sigma);
     const double clamp_fwd = (3.0 * tol) * (3.0 * tol);
     const double clamp_bwd = (5.0 * tol) * (5.0 * tol);
@@ -1026,28 +1118,41 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
 
     for (size_t i = 0; i < scene_fg_pts.size(); i += fg_step) {
         const cv::Vec3d p_cad = R_inv * (scene_fg_pts[i] - t);
-        double min_dsq = 1e10;
+        const cv::Vec3f n_obs = use_obs_normals ? (*obs_normals)[i] : cv::Vec3f(0.0f, 0.0f, 0.0f);
+        const bool has_n_obs = (n_obs.dot(n_obs) > 0.25f);
+        const cv::Vec3f n_obs_cad_f = has_n_obs ? cv::Vec3f(R_inv * cv::Vec3d(n_obs)) : cv::Vec3f(0.0f, 0.0f, 0.0f);
+
+        double min_score_dsq = 1e10;
+        double best_min_dsq = 1e10;
         size_t best_j = 0;
+        double best_w_n = 1.0;
         for (size_t j = 0; j < vis_pts.size(); ++j) {
             const cv::Vec3d d = p_cad - vis_pts[j];
             const double dsq = d.dot(d);
-            if (dsq < min_dsq) {
-                min_dsq = dsq;
+            const double w_n = (has_n_obs && j < vis_norms.size())
+                ? computeNormalConsistencyWeight(n_obs_cad_f, vis_norms[j])
+                : 1.0;
+            const double pen_dsq = dsq * (1.0 + 1.5 * (1.0 - w_n));
+            if (pen_dsq < min_score_dsq) {
+                min_score_dsq = pen_dsq;
+                best_min_dsq = dsq;
                 best_j = j;
+                best_w_n = w_n;
             }
         }
-        double eff_dsq = min_dsq;
-        if (min_dsq < max_p2pl_sq && best_j < vis_norms.size()) {
+        double eff_dsq = best_min_dsq;
+        if (best_min_dsq < max_p2pl_sq && best_j < vis_norms.size()) {
             const cv::Vec3d d = p_cad - vis_pts[best_j];
-            const double d_euc = std::sqrt(min_dsq);
+            const double d_euc = std::sqrt(best_min_dsq);
             const double d_p2pl = std::abs(d.dot(vis_norms[best_j]));
-            const double d_tan = std::sqrt(std::max(0.0, min_dsq - d_p2pl * d_p2pl));
+            const double d_tan = std::sqrt(std::max(0.0, best_min_dsq - d_p2pl * d_p2pl));
             const double d_eff = std::min(d_euc, d_p2pl + 0.15 * d_tan);
             eff_dsq = d_eff * d_eff;
         }
-        fwd_kern_sum += std::exp(-eff_dsq * inv_2sig2);
+        const double w_k = has_n_obs ? (0.15 + 0.85 * best_w_n) : 1.0;
+        fwd_kern_sum += std::exp(-eff_dsq * inv_2sig2) * w_k;
         dsq_sum += std::min(eff_dsq, clamp_fwd);
-        if (eff_dsq <= tol_sq) ++fwd_inliers;
+        if (eff_dsq <= tol_sq && (!has_n_obs || best_w_n >= 0.35)) ++fwd_inliers;
         ++fwd_total;
     }
 
@@ -1068,8 +1173,8 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
             }
         }
         double eff_dsq = min_dsq;
+        const cv::Vec3d vn_cam = (j < vis_norms.size()) ? (R * vis_norms[j]) : cv::Vec3d(0.0, 0.0, 0.0);
         if (min_dsq < max_p2pl_sq && j < vis_norms.size()) {
-            const cv::Vec3d vn_cam = R * vis_norms[j];
             const cv::Vec3d d = p_cam - scene_fg_pts[best_i];
             const double d_euc = std::sqrt(min_dsq);
             const double d_p2pl = std::abs(d.dot(vn_cam));
@@ -1077,7 +1182,11 @@ BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
             const double d_eff = std::min(d_euc, d_p2pl + 0.15 * d_tan);
             eff_dsq = d_eff * d_eff;
         }
-        bwd_kern_sum += std::exp(-eff_dsq * inv_2sig2);
+        double w_bwd = 1.0;
+        if (use_obs_normals && j < vis_norms.size() && (*obs_normals)[best_i].dot((*obs_normals)[best_i]) > 0.25f) {
+            w_bwd = 0.15 + 0.85 * computeNormalConsistencyWeight((*obs_normals)[best_i], vn_cam);
+        }
+        bwd_kern_sum += std::exp(-eff_dsq * inv_2sig2) * w_bwd;
         bwd_dsq_sum += std::min(eff_dsq, clamp_bwd);
         ++bwd_total;
     }
@@ -2637,7 +2746,8 @@ ObjectPose UniversalPoseEstimator::solveRansacKabsch(const std::vector<cv::Vec3f
 
 void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f>& scene_pts,
                                                      ObjectPose& pose,
-                                                     const CameraIntrinsics& intr) const
+                                                     const CameraIntrinsics& intr,
+                                                     const cv::Mat& depth_z16) const
 {
     if (!pose.valid || _mesh_pts.empty() || scene_pts.size() < 24) return;
 
@@ -2816,11 +2926,14 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         if (surf_inliers >= 12) {
             const double icp_rmse = std::sqrt(inlier_dsq_sum / static_cast<double>(surf_inliers));
             const double icp_fitness = static_cast<double>(surf_inliers) / static_cast<double>(fg_pts.size());
+            const double sigma = std::clamp(_real_bounding_diag_m * 0.022, 0.008, 0.028);
+            const double surf_qual = std::exp(-(icp_rmse * icp_rmse) / (2.0 * sigma * sigma));
+            const double mesh_conf = 0.65 * icp_fitness + 0.35 * (icp_fitness * surf_qual);
             pose.rmse_m = icp_rmse;
             pose.inlier_ratio = icp_fitness;
             pose.inliers_count = std::max(pose.inliers_count, surf_inliers);
             pose.confidence = std::clamp(
-                static_cast<float>(0.65 * icp_fitness + 0.35 * static_cast<double>(pose.confidence)),
+                static_cast<float>(std::max(mesh_conf, 0.65 * icp_fitness + 0.35 * static_cast<double>(pose.confidence))),
                 0.10f, 0.99f);
         }
         return;
@@ -2912,6 +3025,8 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
     const size_t polish_fg_stride = 1;
     const size_t polish_mesh_stride = (_mesh_pts.size() > 6000) ? 2 : 1;
 
+    const std::vector<cv::Vec3f> fg_normals = computeObsNormalsFromDepth(fg_pts, depth_z16, intr, 2);
+
     struct PoseSeed {
         cv::Matx33d R;
         cv::Vec3d t;
@@ -2933,8 +3048,8 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         runPointToPlaneIcpGeneric(pose.R, t_recentered0, _mesh_pts, _mesh_normals, fg_pts,
                                   search_fg_stride, search_mesh_stride, search_scales, 8,
                                   fx, fy, cx, cy, img_w, img_h, R_b, t_b);
-        auto sa = evaluateBidirectionalConsensus(R_a, t_a, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true);
-        auto sb = evaluateBidirectionalConsensus(R_b, t_b, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+        auto sa = evaluateBidirectionalConsensus(R_a, t_a, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true, &fg_normals);
+        auto sb = evaluateBidirectionalConsensus(R_b, t_b, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true, &fg_normals);
         if (sb.score > sa.score) { R_cand0 = R_b; t_cand0 = t_b; }
         else { R_cand0 = R_a; t_cand0 = t_a; }
     } else {
@@ -2943,7 +3058,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
                                   fx, fy, cx, cy, img_w, img_h, R_cand0, t_cand0);
     }
 
-    auto score_cand0 = evaluateBidirectionalConsensus(R_cand0, t_cand0, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+    auto score_cand0 = evaluateBidirectionalConsensus(R_cand0, t_cand0, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true, &fg_normals);
 
     double best_total = -1e9;
     cv::Matx33d best_R = pose.R;
@@ -3033,7 +3148,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
             cv::Vec3d t_try = computeVisibleSurfaceOffset(R_try, c_fg, cad_mid, _mesh_pts, _mesh_normals);
             auto sc = evaluateBidirectionalConsensus(
                 R_try, t_try, diag, _mesh_pts, _mesh_normals,
-                fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+                fg_pts, fx, fy, cx, cy, img_w, img_h, true, &fg_normals);
             const double inv_z_pen = (R_try(1, 2) > 0.35) ? -0.025 : 0.0;
             cand_pool.push_back(RankedSeed{sc.score + inv_z_pen, R_try, t_try});
         }
@@ -3051,7 +3166,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
                 cv::Vec3d t_try = computeVisibleSurfaceOffset(R_try, c_fg, cad_mid, _mesh_pts, _mesh_normals);
                 auto sc = evaluateBidirectionalConsensus(
                     R_try, t_try, diag, _mesh_pts, _mesh_normals,
-                    fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+                    fg_pts, fx, fy, cx, cy, img_w, img_h, true, &fg_normals);
                 const double inv_z_pen = (R_try(1, 2) > 0.35) ? -0.025 : 0.0;
                 cand_pool.push_back(RankedSeed{sc.score + inv_z_pen, R_try, t_try});
             }
@@ -3074,7 +3189,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
                                       coarse_scales, 3, fx, fy, cx, cy, img_w, img_h, R_c, t_c);
             auto sc = evaluateBidirectionalConsensus(
                 R_c, t_c, diag, _mesh_pts, _mesh_normals,
-                fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+                fg_pts, fx, fy, cx, cy, img_w, img_h, true, &fg_normals);
             const double inv_z_pen = (R_c(1, 2) > 0.35) ? -0.025 : 0.0;
             coarse_refined.push_back(RankedSeed{sc.score + inv_z_pen, R_c, t_c});
         }
@@ -3093,7 +3208,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
         runPointToPlaneIcpGeneric(sd.R, sd.t, _mesh_pts, _mesh_normals, fg_pts,
                                   search_fg_stride, search_mesh_stride, search_scales, 8,
                                   fx, fy, cx, cy, img_w, img_h, R_out, t_out);
-        auto sc = evaluateBidirectionalConsensus(R_out, t_out, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true);
+        auto sc = evaluateBidirectionalConsensus(R_out, t_out, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, true, &fg_normals);
         considerSolution(R_out, t_out, sc, sd.bonus);
     }
 
@@ -3110,7 +3225,7 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
                                   polish_fg_stride, polish_mesh_stride, polish_scales, 15,
                                   fx, fy, cx, cy, img_w, img_h, R_pol, t_pol);
         if (isInTargetWorkspace(t_pol) && cv::norm((R_pol * cad_mid + t_pol) - c_fg) <= max_center_drift + 0.35 * diag) {
-            auto pol_cons = evaluateBidirectionalConsensus(R_pol, t_pol, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h);
+            auto pol_cons = evaluateBidirectionalConsensus(R_pol, t_pol, diag, _mesh_pts, _mesh_normals, fg_pts, fx, fy, cx, cy, img_w, img_h, false, &fg_normals);
             if (pol_cons.score >= best_cons.score - 0.005) {
                 R_final = R_pol;
                 t_final = t_pol;
@@ -3259,7 +3374,7 @@ void UniversalPoseEstimator::refinePoseUniversalCrease2D3D(ObjectPose& pose,
     }
 }
 
-ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::Vec3f>& sampled_pts,
+    ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::Vec3f>& sampled_pts,
                                                          const std::vector<cv::Vec3f>& dense_pts,
                                                          const cv::Vec4d& floor_plane,
                                                          bool floor_detected,
@@ -3268,7 +3383,8 @@ ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::V
                                                          const CameraIntrinsics& intr,
                                                          int img_w,
                                                          int img_h,
-                                                         double* out_ai_ms) const
+                                                         double* out_ai_ms,
+                                                         const cv::Mat& depth_z16) const
 {
     ObjectPose pose;
     pose.model_name = _model_name;
@@ -3320,7 +3436,7 @@ ObjectPose UniversalPoseEstimator::estimateSingleCluster(const std::vector<cv::V
     if (!pose.valid) return pose;
 
     const std::vector<cv::Vec3f>& icp_cloud = dense_pts.empty() ? sampled_pts : dense_pts;
-    refineMultiScaleMeshICP(icp_cloud, pose, intr);
+    refineMultiScaleMeshICP(icp_cloud, pose, intr, depth_z16);
 
     // Kiểm tra đối xứng 180 độ (Azimuthal quanh trục đứng vert_ax & Polar đầu-đáy) bằng biên dạng cạnh 2D trên ảnh RGB
     if (!_is_floor_standing && !rgb.empty() && !_mesh_pts.empty()) {
@@ -3468,9 +3584,10 @@ bool UniversalPoseEstimator::rescorePoseUnclipped(ObjectPose& pose,
     const double cx = (intr.ppx > 10.0) ? intr.ppx : ((intr.cx > 10.0) ? intr.cx : 0.5 * img_w);
     const double cy = (intr.ppy > 10.0) ? intr.ppy : ((intr.cy > 10.0) ? intr.cy : 0.5 * img_h);
 
+    const std::vector<cv::Vec3f> unclipped_normals = computeObsNormalsFromDepth(unclipped, depth_z16, intr, 2);
     auto cons = evaluateBidirectionalConsensus(pose.R, pose.t, diag,
                                              _mesh_pts, _mesh_normals, unclipped,
-                                             fx, fy, cx, cy, img_w, img_h);
+                                             fx, fy, cx, cy, img_w, img_h, false, &unclipped_normals);
 
     if (cons.score > -100.0) {
         pose.confidence = std::clamp(static_cast<float>(cons.score + 0.05), 0.05f, 0.99f);
@@ -4029,7 +4146,7 @@ PoseRefinerCallbacks UniversalPoseEstimator::makeTrackerCallbacks() const
                 }
             }
         }
-        return DetectionAcceptancePolicy::isAccepted(cand, _real_bounding_diag_m, _is_floor_standing);
+        return DetectionAcceptancePolicy::isAccepted(cand, _real_bounding_diag_m, _is_floor_standing, _tracker.isTrackingActive());
     };
     return cb;
 }
@@ -4141,7 +4258,7 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
             const std::vector<cv::Vec3f>& dense_cl = cl.dense_points.empty() ? cl.points : cl.dense_points;
             double c_ai = 0.0;
             ObjectPose cand = estimateSingleCluster(cl.points, dense_cl, seg_res.floor_plane, seg_res.floor_detected,
-                                                    seg_res.floor_pitch_deg, rgb, intr, depth_z16.cols, depth_z16.rows, &c_ai);
+                                                    seg_res.floor_pitch_deg, rgb, intr, depth_z16.cols, depth_z16.rows, &c_ai, depth_z16);
             ai_ms += c_ai;
             if (!cand.valid) continue;
 
@@ -4219,7 +4336,7 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
                                      seg_res.floor_plane,
                                      seg_res.floor_detected,
                                      seg_res.floor_pitch_deg,
-                                     rgb, intr, depth_z16.cols, depth_z16.rows, &ai_ms);
+                                     rgb, intr, depth_z16.cols, depth_z16.rows, &ai_ms, depth_z16);
         const double eta_single = (pose.valid && !_is_floor_standing)
             ? computeProjectedDepthCoverage(pose.R, pose.t, _mesh_pts, _mesh_normals, depth_z16,
                                             sil_fx, sil_fy, sil_cx, sil_cy, d_scale_est, _real_bounding_diag_m)
@@ -4297,7 +4414,7 @@ ObjectPose UniversalPoseEstimator::estimate(const cv::Mat& rgb,
         }
     }
 
-    if (pose.valid && !DetectionAcceptancePolicy::isAccepted(pose, _real_bounding_diag_m, _is_floor_standing)) {
+    if (pose.valid && !DetectionAcceptancePolicy::isAccepted(pose, _real_bounding_diag_m, _is_floor_standing, _tracker.isTrackingActive() || has_tracked_fallback)) {
         pose.valid = false;
     }
 

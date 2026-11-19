@@ -3325,8 +3325,9 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
 
         const double cadDiagM = universalPoseEstimator_->realBoundingDiagM();
         const bool isFloorStanding = universalPoseEstimator_->isFloorStanding();
+        const bool trackingHold = (useContinuousTemporal && !multiMode && hasLastAcceptedPose_ && temporalMissStreak_ < 3);
         poses.erase(std::remove_if(poses.begin(), poses.end(), [&](const tmcad::ObjectPose& p) {
-            return !tmcad::DetectionAcceptancePolicy::isAccepted(p, cadDiagM, isFloorStanding);
+            return !tmcad::DetectionAcceptancePolicy::isAccepted(p, cadDiagM, isFloorStanding, trackingHold);
         }), poses.end());
 
         auto updateAutoRoiFromPose = [&](const tmcad::ObjectPose& p) {

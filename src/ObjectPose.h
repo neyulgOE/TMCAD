@@ -63,7 +63,10 @@ struct DetectionAcceptancePolicy {
                (t[2] >= 0.15 && t[2] <= max_z);
     }
 
-    static bool isAccepted(const ObjectPose& pose, double cad_diag, bool is_floor_standing) {
+    static bool isAccepted(const ObjectPose& pose,
+                           double cad_diag,
+                           bool is_floor_standing,
+                           bool is_tracking_hold = false) {
         if (!pose.valid) return false;
         if (pose.method == "pca_fallback_seed") return false;
         if (!isInWorkspace(pose.t, cad_diag, is_floor_standing)) return false;
@@ -73,7 +76,8 @@ struct DetectionAcceptancePolicy {
                 return false;
             }
         }
-        if (pose.confidence < 0.65f) return false;
+        const float min_conf = is_tracking_hold ? 0.55f : 0.65f;
+        if (pose.confidence < min_conf) return false;
         if (pose.rmse_m <= 1e-5 || pose.inliers_count < 8) return false;
         const double max_rmse = std::clamp(0.072 * std::max(0.05, cad_diag), 0.012, 0.025);
         if (pose.rmse_m > max_rmse) return false;
