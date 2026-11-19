@@ -1,8 +1,6 @@
 #include "MainWindow.h"
 #include "RealSenseRecorderDialog.h"
 #include "CameraStreamWidget.h"
-#include "CADTemplateDetector.h"
-#include "ImageDetectionDialog.h"
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <QApplication>
@@ -1623,25 +1621,9 @@ MainWindow::~MainWindow() {
         autoBuildProcess_->deleteLater();
         autoBuildProcess_ = nullptr;
     }
-    stopAiDaemon();
     if (warmRealSense_) {
         warmRealSense_->close();
     }
-}
-
-void MainWindow::stopAiDaemon() {
-    if (aiDaemonProcess_) {
-        if (aiDaemonProcess_->state() == QProcess::Running) {
-            aiDaemonProcess_->write("QUIT\n");
-            if (!aiDaemonProcess_->waitForFinished(1000)) {
-                aiDaemonProcess_->kill();
-            }
-        }
-        aiDaemonProcess_.reset();
-    }
-    currentDaemonCadPath_.clear();
-    currentDaemonCkptPath_.clear();
-    currentDaemonScriptMTime_ = QDateTime();
 }
 
 // ---------------------------------------------------------------------------
@@ -1792,7 +1774,6 @@ void MainWindow::onActiveOnnxModelSwitched(const QString& onnxPath) {
         universalPoseEstimator_ = std::make_unique<tmcad::UniversalPoseEstimator>();
     }
     liveLoadedOnnxPath_.clear();
-    stopAiDaemon();
 
     const bool ok = universalPoseEstimator_->loadModelOnnx(onnxPath.toStdString());
     const bool multiMode = uxToolbar_ ? uxToolbar_->renderFlags().multi_instance_mode : lastMultiInstanceFlag_;
@@ -3777,261 +3758,12 @@ bool MainWindow::runPoseEstimationAI(const RGBDFrame& frame,
         return true;
     }
 
-    // =========================================================================
-    // LEGACY .PTH FALLBACK (only used when no .onnx model exists yet)
-    // =========================================================================
-    QString ckptPath = tmcadDir.absoluteFilePath("deep_learning/checkpoints/" + cadName + "/best_hierarchy_model.pth");
-    if (!QFile::exists(ckptPath)) {
-        ckptPath = tmcadDir.absoluteFilePath("deep_learning/checkpoints/" + cadName + "/best_model.pth");
+    if (!suppressDialogs) {
+        QMessageBox::warning(this, "AI Pose Error",
+                             QString("Chưa tìm thấy model .onnx cho '%1'.\nHãy nhấn '1-Click Auto-Build (CAD -> ONNX)'.").arg(cadName));
     }
-    if (!QFile::exists(ckptPath)) {
-        if (!suppressDialogs) {
-            QMessageBox::warning(this, "AI Pose Error",
-                                 QString("Chưa tìm thấy model .onnx hoặc checkpoint .pth cho '%1'.\nHãy nhấn '1-Click Auto-Build (CAD -> ONNX)'.").arg(cadName));
-        }
-        statusBar()->clearMessage();
-        return false;
-    }
-
-    auto rawScene = ClassicalPoseEstimator::pointCloudFromRGBD(frame, intrinsics);
-    if (!rawScene || rawScene->points_.empty()) {
-        if (!suppressDialogs) {
-            pipelineLog("  [ERROR] Empty scene cloud from RGBD frame.");
-            QMessageBox::warning(this, "Estimate Pose", "Failed to generate point cloud from frame.");
-            statusBar()->clearMessage();
-        }
-        return false;
-    }
-
-    auto sceneCloud = rawScene->VoxelDownSample(0.005);
-    if (!sceneCloud || sceneCloud->points_.size() < 128) {
-        sceneCloud = rawScene;
-    }
-
-    QDir debugDir(tmcadDir.absoluteFilePath("debug"));
-    if (!debugDir.exists()) debugDir.mkpath(".");
-
-    QString tempScenePath = debugDir.absoluteFilePath("temp_scene_ai.ply");
-    QString jsonOutputPath = debugDir.absoluteFilePath("pose_output_ai.json");
-    QString overlayCloudPath = debugDir.absoluteFilePath("aligned_scene_overlay.ply");
-    QFile::remove(jsonOutputPath);
-    open3d::io::WritePointCloud(tempScenePath.toStdString(), *sceneCloud);
-
-    QString pyScript = tmcadDir.absoluteFilePath("scripts/infer_hierarchy.py");
-    bool isRealSensor = !runLabel.startsWith("synthetic");
-    bool daemonReady = false;
-
-    QDateTime scriptMTime = QFileInfo(pyScript).lastModified();
-    if (aiDaemonProcess_ && aiDaemonProcess_->state() == QProcess::Running &&
-        currentDaemonCadPath_ == cadPath && currentDaemonCkptPath_ == ckptPath &&
-        currentDaemonScriptMTime_ == scriptMTime) {
-        daemonReady = true;
-    } else {
-        stopAiDaemon();
-        currentDaemonScriptMTime_ = scriptMTime;
-        pipelineLog(QString("  [PyTorch Fallback] Khởi tạo worker cho: %1...").arg(cadName));
-        aiDaemonProcess_ = std::make_unique<QProcess>();
-        aiDaemonProcess_->setWorkingDirectory(tmcadDir.absolutePath());
-        QStringList daemonArgs;
-        daemonArgs << "-u"
-                   << pyScript
-                   << "--cad" << cadPath
-                   << "--checkpoint" << ckptPath
-                   << "--daemon";
-        aiDaemonProcess_->start("python3", daemonArgs);
-
-        if (aiDaemonProcess_->waitForStarted(3000)) {
-            int waitMs = 0;
-            while (waitMs < 6000) {
-                if (aiDaemonProcess_->waitForReadyRead(200)) {
-                    QByteArray out = aiDaemonProcess_->readAllStandardOutput();
-                    if (out.contains("READY")) {
-                        daemonReady = true;
-                        currentDaemonCadPath_ = cadPath;
-                        currentDaemonCkptPath_ = ckptPath;
-                        break;
-                    }
-                }
-                waitMs += 200;
-            }
-        }
-    }
-
-    if (daemonReady) {
-        QJsonObject req;
-        req["input"] = tempScenePath;
-        req["output_json"] = jsonOutputPath;
-        req["output_cloud"] = overlayCloudPath;
-        req["real_sensor"] = isRealSensor;
-        req["fixed_height"] = -1.0;
-        req["max_depth"] = 3.5;
-        req["fx"] = intrinsics.fx;
-        req["fy"] = intrinsics.fy;
-        req["cx"] = intrinsics.cx;
-        req["cy"] = intrinsics.cy;
-        req["width"] = intrinsics.width;
-        req["height"] = intrinsics.height;
-
-        QJsonDocument doc(req);
-        aiDaemonProcess_->write(doc.toJson(QJsonDocument::Compact) + "\n");
-
-        bool finished = false;
-        int elapsedMs = 0;
-        while (elapsedMs < 6000) {
-            if (aiDaemonProcess_->waitForReadyRead(50)) {
-                QByteArray out = aiDaemonProcess_->readAllStandardOutput();
-                if (out.contains("DONE")) {
-                    finished = true;
-                    break;
-                }
-                if (out.contains("ERROR")) {
-                    pipelineLog(QString("  [AI Worker] Error: %1").arg(QString::fromUtf8(out)));
-                    break;
-                }
-            }
-            elapsedMs += 50;
-        }
-        if (!finished) stopAiDaemon();
-    }
-
-    if (!QFile::exists(jsonOutputPath)) {
-        QProcess process;
-        process.setWorkingDirectory(tmcadDir.absolutePath());
-        QStringList args;
-        args << pyScript
-             << "--input" << tempScenePath
-             << "--cad" << cadPath
-             << "--checkpoint" << ckptPath
-             << "--output-json" << jsonOutputPath
-             << "--output-cloud" << overlayCloudPath
-             << "--fx" << QString::number(intrinsics.fx)
-             << "--fy" << QString::number(intrinsics.fy)
-             << "--cx" << QString::number(intrinsics.cx)
-             << "--cy" << QString::number(intrinsics.cy)
-             << "--width" << QString::number(intrinsics.width)
-             << "--height" << QString::number(intrinsics.height);
-        if (isRealSensor) {
-            args << "--real-sensor" << "--fixed-height" << "-1" << "--max-depth" << "3.5";
-        }
-        process.start("python3", args);
-        if (!process.waitForFinished(15000)) {
-            if (!suppressDialogs) QMessageBox::warning(this, "AI Pose Error", "Inference timed out.");
-            statusBar()->clearMessage();
-            return false;
-        }
-        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-            QString err = process.readAllStandardError();
-            pipelineLog(QString("  [ERROR] Inference failed:\n%1").arg(err));
-            if (!suppressDialogs) QMessageBox::warning(this, "AI Pose Error", "AI Inference failed:\n" + err);
-            statusBar()->clearMessage();
-            return false;
-        }
-    }
-
-    QFile jsonFile(jsonOutputPath);
-    if (!jsonFile.open(QIODevice::ReadOnly)) return false;
-    QJsonDocument doc = QJsonDocument::fromJson(jsonFile.readAll());
-    jsonFile.close();
-    if (!doc.isObject()) return false;
-
-    lastAiTelemetry_ = LastAiTelemetry();
-    lastAiTelemetry_.fromCppNative = false;
-
-    QJsonObject root = doc.object();
-    if (!root["valid"].toBool()) {
-        QString errMsg = root["error"].toString();
-        int inliers = root["ransac_inliers"].toInt();
-        if (errMsg.isEmpty()) {
-            errMsg = QString("RANSAC inliers thấp (%1/1024), không nhận diện được đối tượng.").arg(inliers);
-        }
-        pipelineLog("  [ERROR] Pose invalid: " + errMsg);
-        if (livePoseResultCard_) {
-            livePoseResultCard_->setText(QString(
-                "<div style='font-size:11px; line-height: 1.4; color: #ff80ab;'>"
-                "<b>⚠️ CHƯA TÌM THẤY VẬT THỂ (%1 inliers)</b><br>"
-                "<span style='color:#eceff1;'>%2</span>"
-                "</div>"
-            ).arg(inliers).arg(errMsg));
-        }
-        if (!suppressDialogs) QMessageBox::warning(this, "AI Pose Error", "Pose estimation failed:\n" + errMsg);
-        return false;
-    }
-
-    QJsonArray matArray = root["transformation_matrix"].toArray();
-    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-    for (int r = 0; r < 4; ++r) {
-        QJsonArray rowArr = matArray[r].toArray();
-        for (int c = 0; c < 4; ++c) T(r, c) = rowArr[c].toDouble();
-    }
-    Eigen::Matrix3d R = T.block<3, 3>(0, 0);
-    Eigen::Vector3d t = T.block<3, 1>(0, 3);
-    QJsonObject eulerObj = root["euler_deg"].toObject();
-    double roll = eulerObj["roll"].toDouble();
-    double pitch = eulerObj["pitch"].toDouble();
-    double yaw = eulerObj["yaw"].toDouble();
-    QJsonObject latencyObj = root["latency"].toObject();
-    double aiLat = latencyObj["ai_latency_ms"].toDouble();
-    double icpLat = latencyObj["icp_latency_ms"].toDouble();
-    double totLat = latencyObj["total_latency_ms"].toDouble();
-    double fitness = root["fitness"].toDouble();
-    double rmseMm = root["inlier_rmse_mm"].toDouble();
-    QJsonObject physObj = root["camera_physical_world"].toObject();
-    double physPitch = physObj["pitch_deg"].toDouble();
-    double physRoll = physObj["roll_deg"].toDouble();
-    double physAzimuth = physObj["azimuth_deg"].toDouble();
-    double physHeight = physObj["height_m"].toDouble();
-    double physDist = physObj["distance_m"].toDouble();
-
-    lastAiTelemetry_.valid = true;
-    lastAiTelemetry_.aiMs = aiLat;
-    lastAiTelemetry_.solveMs = icpLat;
-    lastAiTelemetry_.totalMs = totLat;
-    lastAiTelemetry_.tx = t.x();
-    lastAiTelemetry_.ty = t.y();
-    lastAiTelemetry_.tz = t.z();
-    lastAiTelemetry_.roll = roll;
-    lastAiTelemetry_.pitch = pitch;
-    lastAiTelemetry_.yaw = yaw;
-    lastAiTelemetry_.fitness = fitness;
-    lastAiTelemetry_.rmseMm = rmseMm;
-    lastAiTelemetry_.inliers = root["ransac_inliers"].toInt();
-    lastAiTelemetry_.numInstances = 1;
-
-    if (!isLiveMode) {
-        viewport_->update();
-        syncPropertiesUi();
-    }
-    if (liveCameraStreamWidget_) {
-        QString cadLabel = QString("[OK] CAD MODEL DETECTED (6DoF)");
-        QString poseBanner = QString("X:%1m Y:%2m Z:%3m | Yaw:%4° [Fit:%5%]")
-            .arg(t.x(), 0, 'f', 2).arg(t.y(), 0, 'f', 2).arg(t.z(), 0, 'f', 2)
-            .arg(yaw >= 0.0 ? QString("+%1").arg(yaw, 0, 'f', 1) : QString::number(yaw, 'f', 1))
-            .arg(fitness * 100.0, 0, 'f', 0);
-        Eigen::Vector3d cMin = Eigen::Vector3d::Zero(), cMax = Eigen::Vector3d::Zero();
-        if (obj) {
-            const CADAsset& cadAsset = scene_->getOrProcessCADAsset(obj->filePath());
-            if (cadAsset.valid() && cadAsset.normalizedMesh) {
-                cMin = cadAsset.normalizedMesh->GetMinBound() * cadAsset.realBoundingDiag;
-                cMax = cadAsset.normalizedMesh->GetMaxBound() * cadAsset.realBoundingDiag;
-            }
-        }
-        QImage qColor, qDepth;
-        float centerDist = 0.0f;
-        makeDisplayImages(frame, qColor, qDepth, centerDist);
-        if (toggleCamViewAct_) {
-            QSignalBlocker b(toggleCamViewAct_);
-            toggleCamViewAct_->setChecked(true);
-        }
-        liveCameraStreamWidget_->show();
-        liveCameraStreamWidget_->displayStaticRGBDFrame(qColor, qDepth, centerDist);
-        liveCameraStreamWidget_->setPoseOverlay3D(R, t, intrinsics, cadLabel, poseBanner, fitness, cMin, cMax);
-        liveCameraStreamWidget_->redrawCurrentFrame();
-    }
-    statusBar()->showMessage(
-        QString("AI Pose Estimated: t=(%1, %2, %3)m, latency=%4ms")
-            .arg(t.x(), 0, 'f', 3).arg(t.y(), 0, 'f', 3).arg(t.z(), 0, 'f', 3).arg(totLat, 0, 'f', 1),
-        10000);
-    return true;
+    statusBar()->clearMessage();
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -4576,163 +4308,6 @@ void MainWindow::onEstimatePoseFromFile() {
 // ---------------------------------------------------------------------------
 // 2D Object Detection on Image (PNG, JPG, BMP, WEBP...) — Pure 2D Detection
 // ---------------------------------------------------------------------------
-
-void MainWindow::onDetectOnImage() {
-    // 1. Identify target CAD object
-    QString cadName = "TABLE-DEMO";
-    QString cadDir;
-    double half_w = 0.220, half_l = 0.415, top_z = 0.1665, bot_z = -0.3355;
-    std::vector<cv::Vec3f> cadVertices;
-
-    QListWidgetItem* item = objectList_->currentItem();
-    if (!item && objectList_->count() > 0) {
-        item = objectList_->item(objectList_->count() - 1);
-        objectList_->setCurrentItem(item);
-    }
-
-    if (item) {
-        int id = item->data(Qt::UserRole).toInt();
-        SceneObject* obj = scene_->getObject(id);
-        if (obj && obj->type() == SceneObjectType::Mesh) {
-            cadName = QFileInfo(QString::fromStdString(obj->filePath())).completeBaseName();
-            cadDir = QFileInfo(QString::fromStdString(obj->filePath())).absolutePath();
-            auto meshObj = dynamic_cast<MeshObject*>(obj);
-            if (meshObj) {
-                const auto& mesh = meshObj->mesh();
-                if (!mesh.vertices_.empty()) {
-                    auto min_b = mesh.GetMinBound();
-                    auto max_b = mesh.GetMaxBound();
-                    half_w = (max_b.x() - min_b.x()) * 0.5;
-                    half_l = (max_b.y() - min_b.y()) * 0.5;
-                    top_z = max_b.z();
-                    bot_z = min_b.z();
-
-                    size_t step = std::max<size_t>(1, mesh.vertices_.size() / 512);
-                    for (size_t i = 0; i < mesh.vertices_.size(); i += step) {
-                        cadVertices.emplace_back(mesh.vertices_[i].x(), mesh.vertices_[i].y(), mesh.vertices_[i].z());
-                    }
-                }
-            }
-        }
-    }
-
-    QDir tmcadDir(QCoreApplication::applicationDirPath());
-    if (tmcadDir.dirName() == "build") tmcadDir.cdUp();
-    if (cadDir.isEmpty()) {
-        cadDir = tmcadDir.absoluteFilePath("CAD_DATA");
-    }
-
-    // 2. Open File Dialog for Image Selection
-    QString filter = "Images (*.png *.jpg *.jpeg *.bmp *.webp *.tiff *.pbm *.pgm *.ppm);;All Files (*)";
-    QString initDir = lastImageDir_.isEmpty() ? tmcadDir.absolutePath() : lastImageDir_;
-    QString imgPath = QFileDialog::getOpenFileName(
-        this, "Chọn tệp ảnh để nhận diện (PNG, JPG, BMP, WEBP...)",
-        initDir, filter);
-
-    if (imgPath.isEmpty()) return;
-    lastImageDir_ = QFileInfo(imgPath).absolutePath();
-
-    pipelineLog("==================================================================");
-    pipelineLog(QString("🎯 [DETECT ON IMAGE] Khởi chạy nhận diện 2D trên tệp ảnh: %1").arg(QFileInfo(imgPath).fileName()));
-    pipelineLog(QString("  Đường dẫn: %1").arg(imgPath));
-    pipelineLog(QString("  Mô hình mục tiêu: %1 (half_w=%2 m, half_l=%3 m)").arg(cadName).arg(half_w, 0, 'f', 3).arg(half_l, 0, 'f', 3));
-
-    // 3. Initialize or reuse CADTemplateDetector
-    if (!imageDetector_) {
-        imageDetector_ = std::make_shared<CADTemplateDetector>();
-    }
-
-    std::string err;
-    if (!imageDetector_->isInitialized() || imageDetector_->templateCount() == 0) {
-        pipelineLog("  [Detector] Đang nạp mô hình CAD template detector...");
-        statusBar()->showMessage("Đang nạp CAD template detector...");
-        QApplication::processEvents();
-
-        bool ok = imageDetector_->initialize(
-            cadDir.toStdString(), cadName.toStdString(), cadVertices,
-            half_w, half_l, top_z, bot_z, err);
-
-        if (!ok) {
-            pipelineLog(QString("  [ERROR] Khởi tạo template detector thất bại: %1").arg(QString::fromStdString(err)));
-            QMessageBox::warning(this, "Detection Error", "Không thể khởi tạo CAD detector:\n" + QString::fromStdString(err));
-            statusBar()->clearMessage();
-            return;
-        }
-        pipelineLog(QString("  [Detector] Khởi tạo thành công (%1 templates)").arg(imageDetector_->templateCount()));
-    }
-
-    // 4. Load Image
-    cv::Mat img = cv::imread(imgPath.toStdString(), cv::IMREAD_COLOR);
-    if (img.empty()) {
-        QImage qimg(imgPath);
-        if (!qimg.isNull()) {
-            qimg = qimg.convertToFormat(QImage::Format_RGB888);
-            img = cv::Mat(qimg.height(), qimg.width(), CV_8UC3,
-                          const_cast<uchar*>(qimg.bits()), qimg.bytesPerLine()).clone();
-            cv::cvtColor(img, img, cv::COLOR_RGB2BGR);
-        }
-    }
-
-    if (img.empty()) {
-        pipelineLog("  [ERROR] Không thể mở hoặc giải mã tệp ảnh: " + imgPath);
-        QMessageBox::warning(this, "Detection Error", "Không thể đọc tệp ảnh: " + imgPath);
-        statusBar()->clearMessage();
-        return;
-    }
-
-    pipelineLog(QString("  Độ phân giải ảnh: %1 x %2 px (Kênh màu: %3)").arg(img.cols).arg(img.rows).arg(img.channels()));
-
-    // 5. Run Pure 2D Detection ("chỉ detect thôi")
-    statusBar()->showMessage("Đang thực hiện nhận diện 2D...");
-    QApplication::processEvents();
-
-    auto match = imageDetector_->detect(img);
-
-    if (match.valid) {
-        pipelineLog(QString("  ✅ PHÁT HIỆN THÀNH CÔNG (%1 ms):").arg(match.latency_ms, 0, 'f', 1));
-        pipelineLog(QString("    - Bounding Box 2D: [x=%1, y=%2, w=%3, h=%4]")
-            .arg(static_cast<int>(match.roi.x)).arg(static_cast<int>(match.roi.y))
-            .arg(static_cast<int>(match.roi.width)).arg(static_cast<int>(match.roi.height)));
-        pipelineLog(QString("    - Độ tin cậy (Confidence): %1%").arg(match.match_score * 100.0f, 0, 'f', 1));
-        pipelineLog(QString("    - Góc xoay ước tính (Yaw): ~%1°").arg(match.estimated_yaw_deg, 0, 'f', 1));
-        pipelineLog(QString("    - Điểm đặc trưng: %1 matches (%2 inliers RANSAC)").arg(match.good_matches).arg(match.ransac_inliers));
-        pipelineLog(QString("    - Giải thuật: %1").arg(QString::fromStdString(match.method)));
-
-        statusBar()->showMessage(
-            QString("🎯 Nhận diện thành công: %1 (Score: %2%, Latency: %3 ms)")
-                .arg(cadName).arg(match.match_score * 100.0f, 0, 'f', 1).arg(match.latency_ms, 0, 'f', 1),
-            10000);
-    } else {
-        pipelineLog(QString("  ❌ KHÔNG TÌM THẤY ĐỐI TƯỢNG (%1 ms):").arg(match.latency_ms, 0, 'f', 1));
-        pipelineLog(QString("    - Điểm đặc trưng: %1 matches (dưới ngưỡng)").arg(match.good_matches));
-        statusBar()->showMessage("❌ Không tìm thấy đối tượng trong ảnh.", 5000);
-    }
-
-    // 6. Generate Annotated Preview and update CameraStreamWidget
-    cv::Mat annotated = CADTemplateDetector::annotate(img, match, cadName.toStdString(), true, true);
-    cv::Mat rawRgb, annRgb;
-    cv::cvtColor(img, rawRgb, cv::COLOR_BGR2RGB);
-    cv::cvtColor(annotated, annRgb, cv::COLOR_BGR2RGB);
-
-    QImage qRaw(rawRgb.data, rawRgb.cols, rawRgb.rows, static_cast<int>(rawRgb.step), QImage::Format_RGB888);
-    QImage qAnn(annRgb.data, annRgb.cols, annRgb.rows, static_cast<int>(annRgb.step), QImage::Format_RGB888);
-
-    if (liveCameraStreamWidget_) {
-        QRectF qbox(match.roi.x, match.roi.y, match.roi.width, match.roi.height);
-        QString statusText = match.valid ?
-            QString("Score:%1% | Yaw:%2° | %3ms").arg(match.match_score * 100.0f, 0, 'f', 0).arg(match.estimated_yaw_deg, 0, 'f', 1).arg(match.latency_ms, 0, 'f', 1) :
-            QString("Not Found | %1ms").arg(match.latency_ms, 0, 'f', 1);
-
-        liveCameraStreamWidget_->setStaticImageDetection(qRaw, qAnn, qbox, cadName, statusText);
-    }
-
-    // 7. Show Interactive Image Detection Dialog
-    auto* dlg = new ImageDetectionDialog(this);
-    dlg->setAttribute(Qt::WA_DeleteOnClose);
-    dlg->setDetector(imageDetector_, cadName);
-    dlg->processImage(imgPath);
-    dlg->show();
-}
 
 // ---------------------------------------------------------------------------
 // Phase 2 — synthetic ray-cast path (no camera or pre-captured images;
@@ -7497,7 +7072,6 @@ void MainWindow::onRemoveSelectedCadObject() {
 
     const int id = item->data(Qt::UserRole).toInt();
     const QString name = item->text();
-    stopAiDaemon();
 
     viewport_->makeCurrent();
     scene_->clearInferenceOverlays();
@@ -7524,7 +7098,6 @@ void MainWindow::onReplaceActiveCadObject() {
     if (path.isEmpty()) return;
 
     stopMuJoCoSimulation();
-    stopAiDaemon();
 
     viewport_->makeCurrent();
     scene_->clearAllAndResetCache();
@@ -7543,7 +7116,6 @@ void MainWindow::onReplaceActiveCadObject() {
 
 void MainWindow::onResetAllTasksAndSession() {
     stopMuJoCoSimulation();
-    stopAiDaemon();
 
     if (liveCppEstimator_) {
         liveCppEstimator_.reset();

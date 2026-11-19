@@ -82,10 +82,6 @@ add_executable(CadViewer
     src/CameraStreamWidget.cpp
     src/SyntheticRGBDSource.cpp
     src/SyntheticDatasetGenerator.cpp
-    src/CADTemplateDetector.h
-    src/CADTemplateDetector.cpp
-    src/ImageDetectionDialog.h
-    src/ImageDetectionDialog.cpp
     src/CameraHardwareProfile.h
     src/CameraProfileParser.h
     src/CameraProfileParser.cpp

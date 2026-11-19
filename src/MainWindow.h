@@ -27,8 +27,6 @@ class QSplitter;
 class RealSenseSource;
 class RealSenseBagSource;
 class CameraStreamWidget;
-class CADTemplateDetector;
-class ImageDetectionDialog;
 class MuJoCoD435SimSource;
 class CameraProfileDialog;
 #include "CameraHardwareProfile.h"
@@ -243,7 +241,6 @@ private slots:
     void onEstimatePoseRealSenseBag(); // Phase 8 — from recorded .bag file
     void onRecordRealSense();         // Phase 8 — launch D435if recording tool
     void onEstimatePoseFromFile();    // Phase 2 — file-based (no camera needed)
-    void onDetectOnImage();           // 2D Object Detection on Image (PNG, JPG, BMP, WEBP...)
     void onEstimatePoseSynthetic();   // Phase 2 — ray-cast synthetic scene, known ground truth
     void onGenerateSyntheticDataset(); // Phase 3/5 — batch dataset (SyntheticDatasetGenerator)
     void onSelectDatasetFile();        // Explicitly choose dataset file (train.txt / dataset_manifest.json)
@@ -407,12 +404,8 @@ private:
     QPushButton* estimatePoseBagBtn_ = nullptr;     // Phase 8: test path from recorded RealSense .bag file
     QPushButton* recordRealSenseBtn_ = nullptr;     // Phase 8: launch D435if recording tool
     QPushButton* estimatePoseFileBtn_ = nullptr; // test path: file-based RGBD
-    QPushButton* detectOnImageBtn_ = nullptr;    // 2D Object Detection on Image (PNG, JPG, BMP, WEBP...)
     QPushButton* estimatePoseSyntheticBtn_ = nullptr; // test path: ray-cast synthetic RGBD, known ground truth
     QLabel*      poseResultSummaryLabel_ = nullptr;
-
-    QString      lastImageDir_;
-    std::shared_ptr<CADTemplateDetector> imageDetector_;
 
     QProcess*    trainProcess_ = nullptr;
     QProgressDialog* trainProgressDlg_ = nullptr;
@@ -465,11 +458,6 @@ private:
     void stopMuJoCoSimulation();
     CameraHardwareProfile currentCamProfile_;
     int currentCamProfileId_ = 1;
-    std::unique_ptr<QProcess> aiDaemonProcess_;
-    QString currentDaemonCadPath_;
-    QString currentDaemonCkptPath_;
-    QDateTime currentDaemonScriptMTime_;
-    void stopAiDaemon();
 
     struct LastAiTelemetry {
         bool valid = false;
