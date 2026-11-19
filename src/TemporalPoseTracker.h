@@ -16,7 +16,7 @@ enum class TrackState {
 };
 
 struct PoseRefinerCallbacks {
-    std::function<void(const std::vector<cv::Vec3f>&, ObjectPose&, const CameraIntrinsics&)> runLocalIcp;
+    std::function<void(const cv::Mat&, const cv::Mat&, const std::vector<cv::Vec3f>&, ObjectPose&, const CameraIntrinsics&)> runLocalIcp;
     std::function<double(const cv::Mat&, const cv::Mat&, const cv::Vec4d&, bool, ObjectPose&, const CameraIntrinsics&)> runLocalSilhouette;
     std::function<bool(const std::vector<cv::Vec3f>&, const cv::Mat&, double, ObjectPose&, const CameraIntrinsics&)> evaluatePose;
     std::function<double(const cv::Mat&, const ObjectPose&, const CameraIntrinsics&)> computeDepthCoverage;

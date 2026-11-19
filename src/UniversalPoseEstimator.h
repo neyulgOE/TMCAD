@@ -109,6 +109,9 @@ public:
     bool temporalTrackingEnabled() const noexcept { return _tracker.isEnabled(); }
     void resetTemporalTrack() noexcept {
         _tracker.reset();
+        _baseline_rmse_m = 0.0;
+        _rmse_drift_streak = 0;
+        _weak_recheck_cooldown = 0;
     }
 
     const std::string& modelName() const noexcept { return _model_name; }
@@ -249,6 +252,9 @@ private:
 
     CADSceneSegmenter _scene_segmenter;
     CADMaskMatcher _mask_matcher;
+    mutable double _baseline_rmse_m{0.0};
+    mutable int _rmse_drift_streak{0};
+    mutable int _weak_recheck_cooldown{0};
 };
 
 } // namespace tmcad

@@ -1058,6 +1058,28 @@ inline double computeNormalConsistencyWeight(const cv::Vec3f& n_obs,
     return (cos_ang - kCosReject) / (kCosFull - kCosReject);
 }
 
+struct IcpObservabilityInfo {
+    bool has_weak_rot_axis{false};
+    double rot_cond_ratio{1.0};
+    cv::Vec3d weak_axis_cam{0.0, -1.0, 0.0};
+};
+
+// Ánh xạ Log trên SO(3): chuyển ma trận xoay dR sang vector trục-góc (rad)
+cv::Vec3d so3Log(const cv::Matx33d& dR)
+{
+    const double tr = dR(0, 0) + dR(1, 1) + dR(2, 2);
+    const double cos_theta = std::clamp(0.5 * (tr - 1.0), -1.0, 1.0);
+    const double theta = std::acos(cos_theta);
+    const cv::Vec3d v(
+        dR(2, 1) - dR(1, 2),
+        dR(0, 2) - dR(2, 0),
+        dR(1, 0) - dR(0, 1));
+    if (theta < 1e-5) return 0.5 * v;
+    const double sin_theta = std::sin(theta);
+    if (std::abs(sin_theta) < 1e-6) return 0.5 * v;
+    return (0.5 * theta / sin_theta) * v;
+}
+
 // Công thức Rodrigues: tạo ma trận xoay 3x3 quanh trục đơn vị u với góc theta (rad)
 cv::Matx33d axisAngleToMat33(const cv::Vec3d& unit_axis, double theta)
 {
@@ -1111,6 +1133,86 @@ ObjectPose makeFloorAlignedCandidate(const ObjectPose& base_pose,
     );
     cand.t = world_center - cand.R * cad_center;
     return cand;
+}
+
+// Tinh chỉnh góc xoay 1 chiều quanh đúng trục xoay yếu (weak_axis_cam) bằng viền 2D RGB.
+// Tự động bám theo quai cốc/chi tiết viền khi xoay tại chỗ; giữ nguyên deg = 0° khi vật là trụ tròn trơn.
+double refineWeakAxisWithRgbContour(cv::Matx33d& R,
+                                    cv::Vec3d& t,
+                                    const cv::Vec3d& weak_axis_cam,
+                                    const cv::Vec3d& cad_min,
+                                    const cv::Vec3d& cad_max,
+                                    const std::vector<cv::Vec3f>& mesh_pts,
+                                    const std::vector<cv::Vec3f>& mesh_normals,
+                                    const RgbEdgeMaps& edge_maps,
+                                    double fx, double fy, double cx, double cy)
+{
+    if (mesh_pts.empty() || edge_maps.empty()) return 1e6;
+
+    // Dùng trọng tâm bề mặt lưới (mesh_center) thay cho tâm bbox (cad_min+cad_max)/2
+    // để xoay quanh trục trụ tại chỗ (không làm văng thân cốc lệch ngang vì quai nhô ra).
+    cv::Vec3d mesh_center(0.0, 0.0, 0.0);
+    const size_t mc_step = std::max<size_t>(1, mesh_pts.size() / 500);
+    int mc_cnt = 0;
+    for (size_t i = 0; i < mesh_pts.size(); i += mc_step) {
+        mesh_center += cv::Vec3d(mesh_pts[i]);
+        ++mc_cnt;
+    }
+    if (mc_cnt > 0) mesh_center *= (1.0 / static_cast<double>(mc_cnt));
+    else mesh_center = 0.5 * (cad_min + cad_max);
+    const cv::Vec3d world_center = R * mesh_center + t;
+
+    auto evalAngle = [&](double deg, cv::Matx33d& out_R, cv::Vec3d& out_t) -> double {
+        const double rad = deg * kPi / 180.0;
+        const cv::Matx33d R_delta = axisAngleToMat33(weak_axis_cam, rad);
+        out_R = R_delta * R;
+        out_t = world_center - out_R * mesh_center;
+        const double sil_cost = computeRgbSilhouetteChamferCost(
+            out_R, out_t, mesh_pts, mesh_normals, edge_maps, fx, fy, cx, cy);
+        return sil_cost + 0.008 * std::abs(deg);
+    };
+
+    cv::Matx33d best_R = R;
+    cv::Vec3d best_t = t;
+    double best_deg = 0.0;
+    const double base_cost = evalAngle(0.0, best_R, best_t);
+    double best_cost = base_cost;
+
+    // 1. Quét thô [-9°, +9°], bước 1.5°
+    for (double deg = -9.0; deg <= 9.01; deg += 1.5) {
+        if (std::abs(deg) < 1e-3) continue;
+        cv::Matx33d R_try;
+        cv::Vec3d t_try;
+        const double c = evalAngle(deg, R_try, t_try);
+        if (c < best_cost) {
+            best_cost = c;
+            best_deg = deg;
+            best_R = R_try;
+            best_t = t_try;
+        }
+    }
+
+    // 2. Quét mịn quanh góc tốt nhất [best_deg - 1.5°, best_deg + 1.5°], bước 0.5°
+    const double center_deg = best_deg;
+    for (double deg = center_deg - 1.5; deg <= center_deg + 1.51; deg += 0.5) {
+        if (std::abs(deg - center_deg) < 1e-3) continue;
+        cv::Matx33d R_try;
+        cv::Vec3d t_try;
+        const double c = evalAngle(deg, R_try, t_try);
+        if (c < best_cost) {
+            best_cost = c;
+            best_deg = deg;
+            best_R = R_try;
+            best_t = t_try;
+        }
+    }
+
+    if (best_cost + 0.03 < base_cost) {
+        R = best_R;
+        t = best_t;
+        return best_cost;
+    }
+    return base_cost;
 }
 
 BidirectionalConsensus evaluateBidirectionalConsensus(const cv::Matx33d& R,
@@ -1276,11 +1378,19 @@ void runPointToPlaneIcpGeneric(const cv::Matx33d& R_init,
                                int img_w,
                                int img_h,
                                cv::Matx33d& out_R,
-                               cv::Vec3d& out_t)
+                               cv::Vec3d& out_t,
+                               const cv::Matx33d* R_prior = nullptr,
+                               double prior_rot_weight = 0.0,
+                               IcpObservabilityInfo* out_obs = nullptr)
 {
     out_R = R_init;
     out_t = t_init;
+    if (out_obs) *out_obs = IcpObservabilityInfo{};
     if (mesh_pts.empty() || fg_pts.size() < 18) return;
+
+    cv::Vec3d weak_axis_cad(0.0, 0.0, 1.0);
+    bool has_obs_cad = false;
+    double obs_cond_ratio = 1.0;
 
     fg_stride = std::max<size_t>(1, fg_stride);
     cv::Matx33d R_icp = R_init.t();
@@ -1358,7 +1468,41 @@ void runPointToPlaneIcpGeneric(const cv::Matx33d& R_init,
             }
 
             if (n_corr < 14) break;
+
+            // Đo độ quan sát hình học 3D của khối xoay 3x3 (TRƯỚC khi cộng prior/damping)
+            if (out_obs != nullptr) {
+                cv::Matx33d H_rot_data;
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        H_rot_data(r, c) = JtJ(r, c);
+                cv::Mat eig_vals, eig_vecs;
+                cv::eigen(cv::Mat(H_rot_data), eig_vals, eig_vecs);
+                const double lam_max = std::max(1e-9, eig_vals.at<double>(0, 0));
+                const double lam_min = std::max(1e-9, eig_vals.at<double>(2, 0));
+                obs_cond_ratio = lam_max / lam_min;
+                weak_axis_cad = cv::Vec3d(
+                    eig_vecs.at<double>(2, 0),
+                    eig_vecs.at<double>(2, 1),
+                    eig_vecs.at<double>(2, 2));
+                const double wn = cv::norm(weak_axis_cad);
+                if (wn > 1e-6) weak_axis_cad *= (1.0 / wn);
+                has_obs_cad = true;
+            }
+
             for (int d = 0; d < 6; ++d) JtJ(d, d) += 1e-5;
+
+            // Temporal Prior Regularization (chỉ bật trong nhánh Tracking khi R_prior != nullptr):
+            // Tự động ghì trục xoay suy biến (như trục trụ của cốc/chai khi mất Depth quai) về R_prior
+            // mà không làm trễ các trục có ràng buộc hình học 3D mạnh.
+            if (R_prior != nullptr && prior_rot_weight > 0.0) {
+                const cv::Matx33d R_prior_icp = R_prior->t();
+                const cv::Vec3d r_to_prior = so3Log(R_prior_icp * R_icp.t());
+                const double lambda_r = prior_rot_weight * static_cast<double>(n_corr);
+                for (int d = 0; d < 3; ++d) {
+                    JtJ(d, d) += lambda_r;
+                    Jtb(d, 0) += lambda_r * r_to_prior[d];
+                }
+            }
 
             cv::Matx61d delta;
             if (!cv::solve(JtJ, Jtb, delta, cv::DECOMP_CHOLESKY)) {
@@ -1392,6 +1536,14 @@ void runPointToPlaneIcpGeneric(const cv::Matx33d& R_init,
 
     out_R = R_icp.t();
     out_t = -out_R * t_icp;
+    if (out_obs != nullptr && has_obs_cad) {
+        out_obs->rot_cond_ratio = obs_cond_ratio;
+        out_obs->has_weak_rot_axis = (obs_cond_ratio > 8.0);
+        cv::Vec3d axis_cam = out_R * weak_axis_cad;
+        const double an = cv::norm(axis_cam);
+        if (an > 1e-6) axis_cam *= (1.0 / an);
+        out_obs->weak_axis_cam = axis_cam;
+    }
 }
 
 cv::Vec3d computeVisibleSurfaceOffset(const cv::Matx33d& R,
@@ -3172,7 +3324,9 @@ void UniversalPoseEstimator::refineMultiScaleMeshICP(const std::vector<cv::Vec3f
                 }
             }
 
-            constexpr double kFloorPriorBonus = 0.025;
+            const double kFloorPriorBonus = _tracker.isTrackingActive()
+                ? (_tracker.currentPose().floor_locked ? 0.030 : 0.015)
+                : 0.025;
             const bool rmse_not_degraded =
                 (cons_floor.rmse_m <= cons_free.rmse_m * 1.15 + 0.002);
 
@@ -4314,7 +4468,8 @@ std::vector<ObjectPose> UniversalPoseEstimator::proposeDepthHoleSeeds(
 PoseRefinerCallbacks UniversalPoseEstimator::makeTrackerCallbacks() const
 {
     PoseRefinerCallbacks cb;
-    cb.runLocalIcp = [this](const std::vector<cv::Vec3f>& local_fg, ObjectPose& cand, const CameraIntrinsics& intr) {
+    cb.runLocalIcp = [this](const cv::Mat& rgb, const cv::Mat& depth_z16,
+                            const std::vector<cv::Vec3f>& local_fg, ObjectPose& cand, const CameraIntrinsics& intr) {
         const size_t icp_step = std::max<size_t>(1, local_fg.size() / 600);
         std::vector<cv::Vec3d> fg_icp;
         fg_icp.reserve(local_fg.size() / icp_step + 1);
@@ -4341,9 +4496,15 @@ PoseRefinerCallbacks UniversalPoseEstimator::makeTrackerCallbacks() const
                 std::clamp(0.045 * diag, 0.007, 0.018),
                 std::clamp(0.020 * diag, 0.004, 0.009)
               };
+        // Neo Temporal Prior vào cand.R (đã được cập nhật bởi PyrLK+PnP nếu vật xoay tại chỗ),
+        // tránh kéo ngược lại _tracker.currentPose().R làm triệt tiêu chuyển động xoay của PyrLK!
+        const cv::Matx33d R_prior = cand.R;
+        const double prior_rot_w = 0.005 * diag * diag;
+        IcpObservabilityInfo obs_info;
         runPointToPlaneIcpGeneric(cand.R, cand.t, _mesh_pts, _mesh_normals, fg_icp,
                                   1, std::max<size_t>(1, _mesh_pts.size() / 1600),
-                                  tr_scales, 10, fx, fy, cx, cy, w, h, R_icp, t_icp);
+                                  tr_scales, 10, fx, fy, cx, cy, w, h, R_icp, t_icp,
+                                  &R_prior, prior_rot_w, &obs_info);
         if (_is_floor_standing && cand.floor_locked) {
             cv::Vec3d n_fl(cand.R(0, 2), cand.R(1, 2), cand.R(2, 2));
             const double n_norm = cv::norm(n_fl);
@@ -4371,6 +4532,128 @@ PoseRefinerCallbacks UniversalPoseEstimator::makeTrackerCallbacks() const
         if (isInTargetWorkspace(t_icp) && cv::norm(t_icp - cand.t) <= std::clamp(0.22 * diag, 0.045, 0.160)) {
             cand.R = R_icp;
             cand.t = t_icp;
+        }
+
+        // PHƯƠNG ÁN 3: Khi Hessian 3D tự phát hiện trục xoay yếu (cond_ratio > 8, vd trụ tròn mất Depth quai),
+        // quét tinh chỉnh 1D quanh đúng weak_axis_cam bằng Background-Depth-Gated Oriented 2D RGB Contour.
+        if (!_is_floor_standing && obs_info.has_weak_rot_axis && !rgb.empty() && !_mesh_pts.empty()) {
+            const int rw = rgb.cols;
+            const int rh = rgb.rows;
+            const double scale = (intr.depth_scale > 0.0) ? intr.depth_scale : 0.001;
+            cv::Mat proj_mask = cv::Mat::zeros(rh, rw, CV_8UC1);
+            const size_t p_step = std::max<size_t>(1, _mesh_pts.size() / 900);
+            int min_pu = rw, max_pu = 0, min_pv = rh, max_pv = 0;
+            for (size_t i = 0; i < _mesh_pts.size(); i += p_step) {
+                const cv::Vec3d pc = cand.R * cv::Vec3d(_mesh_pts[i]) + cand.t;
+                if (pc[2] < 0.08) continue;
+                const int pu = static_cast<int>(std::round(fx * pc[0] / pc[2] + cx));
+                const int pv = static_cast<int>(std::round(fy * pc[1] / pc[2] + cy));
+                if (pu >= 0 && pu < rw && pv >= 0 && pv < rh) {
+                    proj_mask.at<uint8_t>(pv, pu) = 255;
+                    if (pu < min_pu) min_pu = pu;
+                    if (pu > max_pu) max_pu = pu;
+                    if (pv < min_pv) min_pv = pv;
+                    if (pv > max_pv) max_pv = pv;
+                }
+            }
+            const float bbox_diag_px = (max_pu > min_pu && max_pv > min_pv)
+                ? std::hypot(static_cast<float>(max_pu - min_pu), static_cast<float>(max_pv - min_pv))
+                : std::hypot(cand.bbox_2d.width, cand.bbox_2d.height);
+            const int ksize = std::clamp(static_cast<int>(std::round(bbox_diag_px * 0.14f)) | 1, 11, 35);
+            cv::dilate(proj_mask, proj_mask, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(ksize, ksize)));
+
+            // Xóa sạch nền sâu phía sau (depth > t[2] + 0.5 * diag, vd chữ trắng trên màn hình) khỏi ảnh RGB trước Canny
+            cv::Mat rgb_gated = rgb;
+            if (!depth_z16.empty() && depth_z16.size() == rgb.size() && depth_z16.type() == CV_16UC1) {
+                const double z_bg_m = cand.t[2] + 0.50 * diag;
+                const uint16_t z_bg_raw = static_cast<uint16_t>(std::min(65534.0, std::round(z_bg_m / std::max(1e-6, scale))));
+                cv::Mat bg_mask = (depth_z16 > z_bg_raw);
+                if (cv::countNonZero(bg_mask) > 0) {
+                    rgb_gated = rgb.clone();
+                    rgb_gated.setTo(cv::Scalar(0, 0, 0), bg_mask);
+                }
+            }
+            const RgbEdgeMaps edge_maps = buildRgbCannyDistanceTransform(
+                rgb_gated, proj_mask, false, depth_z16, scale, cand.t[2], diag);
+            if (!edge_maps.empty()) {
+                refineWeakAxisWithRgbContour(
+                    cand.R, cand.t, obs_info.weak_axis_cam, _cad_min, _cad_max,
+                    _mesh_pts, _mesh_normals, edge_maps, fx, fy, cx, cy);
+            }
+        }
+
+        // 12-GÓC WEAK-AXIS 360° RE-CHECK (~10 ms, thay cho 1000 ms Full Global Detection):
+        // Chỉ kích hoạt khi có trục xoay yếu + RMSE trôi tương đối > 1.35 * baseline_rmse (và > 0.045 * diag)
+        // trong 3 frame liên tiếp, kèm cooldown 15 frame chống thrashing.
+        if (!_is_floor_standing) {
+            if (_weak_recheck_cooldown > 0) --_weak_recheck_cooldown;
+            const double prev_rmse = _tracker.isTrackingActive() ? _tracker.currentPose().rmse_m : cand.rmse_m;
+            if (prev_rmse > 1e-5) {
+                if (_baseline_rmse_m <= 1e-5) {
+                    _baseline_rmse_m = std::clamp(prev_rmse, 0.0025, 0.020);
+                } else if (prev_rmse < _baseline_rmse_m) {
+                    _baseline_rmse_m = 0.85 * _baseline_rmse_m + 0.15 * prev_rmse;
+                }
+            }
+            const bool drifted = obs_info.has_weak_rot_axis &&
+                                 (_baseline_rmse_m > 1e-5) &&
+                                 (prev_rmse > 0.045 * diag) &&
+                                 (prev_rmse > 1.35 * _baseline_rmse_m);
+            _rmse_drift_streak = drifted ? (_rmse_drift_streak + 1) : 0;
+
+            if (_rmse_drift_streak >= 3 && _weak_recheck_cooldown == 0) {
+                _rmse_drift_streak = 0;
+                _weak_recheck_cooldown = 15;
+                const BidirectionalConsensus cur_cons = evaluateBidirectionalConsensus(
+                    cand.R, cand.t, diag, _mesh_pts, _mesh_normals, fg_icp, fx, fy, cx, cy, w, h, false);
+                cv::Vec3d mesh_center(0.0, 0.0, 0.0);
+                const size_t mc_step = std::max<size_t>(1, _mesh_pts.size() / 500);
+                int mc_cnt = 0;
+                for (size_t i = 0; i < _mesh_pts.size(); i += mc_step) {
+                    mesh_center += cv::Vec3d(_mesh_pts[i]);
+                    ++mc_cnt;
+                }
+                if (mc_cnt > 0) mesh_center *= (1.0 / static_cast<double>(mc_cnt));
+                else mesh_center = 0.5 * (_cad_min + _cad_max);
+                const cv::Vec3d world_center = cand.R * mesh_center + cand.t;
+
+                cv::Matx33d best_R = cand.R;
+                cv::Vec3d best_t = cand.t;
+                BidirectionalConsensus best_cons = cur_cons;
+                bool improved = false;
+
+                for (int k = 1; k < 12; ++k) {
+                    const double rad = (30.0 * k) * kPi / 180.0;
+                    const cv::Matx33d R_try = axisAngleToMat33(obs_info.weak_axis_cam, rad) * cand.R;
+                    const cv::Vec3d t_try = world_center - R_try * mesh_center;
+                    if (!isInTargetWorkspace(t_try)) continue;
+                    const BidirectionalConsensus c_try = evaluateBidirectionalConsensus(
+                        R_try, t_try, diag, _mesh_pts, _mesh_normals, fg_icp, fx, fy, cx, cy, w, h, false);
+                    if (c_try.score > best_cons.score) {
+                        best_cons = c_try;
+                        best_R = R_try;
+                        best_t = t_try;
+                        improved = true;
+                    }
+                }
+
+                if (improved) {
+                    cv::Matx33d R_ref = best_R;
+                    cv::Vec3d t_ref = best_t;
+                    runPointToPlaneIcpGeneric(best_R, best_t, _mesh_pts, _mesh_normals, fg_icp,
+                                              1, std::max<size_t>(1, _mesh_pts.size() / 1600),
+                                              tr_scales, 6, fx, fy, cx, cy, w, h, R_ref, t_ref);
+                    const BidirectionalConsensus ref_cons = evaluateBidirectionalConsensus(
+                        R_ref, t_ref, diag, _mesh_pts, _mesh_normals, fg_icp, fx, fy, cx, cy, w, h, false);
+                    if (isInTargetWorkspace(t_ref) &&
+                        (ref_cons.rmse_m < 0.85 * cur_cons.rmse_m || ref_cons.score > cur_cons.score + 0.03)) {
+                        cand.R = R_ref;
+                        cand.t = t_ref;
+                        cand.method = "weak_axis_recheck";
+                        _baseline_rmse_m = std::clamp(ref_cons.rmse_m, 0.0025, 0.020);
+                    }
+                }
+            }
         }
     };
 

@@ -365,7 +365,7 @@ bool TemporalPoseTracker::trackFrame(const cv::Mat& rgb,
         : 0.0;
 
     if (cb.runLocalIcp && (eta_depth >= 0.30 || !pnp_used) && out_local_fg.size() >= 20) {
-        cb.runLocalIcp(out_local_fg, cand, intr);
+        cb.runLocalIcp(rgb, depth_z16, out_local_fg, cand, intr);
     }
 
     double sil_cost = 0.0;
@@ -377,8 +377,9 @@ bool TemporalPoseTracker::trackFrame(const cv::Mat& rgb,
         cb.finalizeGeometry(cand, intr, w, h);
     }
 
-    // 4. Symmetry-Aware Pose Jump Guard
-    if (!passesPoseJumpGuard(cand)) {
+    // 4. Symmetry-Aware Pose Jump Guard (cho phép weak_axis_recheck cập nhật góc xoay mới khi đã xác minh 3D)
+    const bool is_weak_recheck = (cand.method == "weak_axis_recheck");
+    if (!is_weak_recheck && !passesPoseJumpGuard(cand)) {
         return false;
     }
 
@@ -395,9 +396,33 @@ bool TemporalPoseTracker::trackFrame(const cv::Mat& rgb,
         return false;
     }
 
-    // Re-seed 2D keypoints whenever count drops below 25
-    if (!curr_gray.empty() && !_is_floor_standing && _kpts_2d.size() < 25) {
+    // Re-seed 2D keypoints whenever count drops below 25 or after a weak-axis 360° snap
+    if (!curr_gray.empty() && !_is_floor_standing && (is_weak_recheck || _kpts_2d.size() < 25)) {
         seedKeypoints2D(curr_gray, cand, intr, cb);
+    }
+
+    // 6. Lọc mượt EMA nhẹ cố định (không dùng ngưỡng đứng yên gán cứng hay mở alpha theo d_rot_deg):
+    //    Toàn bộ ổn định trục trụ và xoay tại chỗ do Hessian Temporal Prior + Weak-Axis 2D RGB quyết định.
+    if (_track_pose.valid && !is_weak_recheck) {
+        constexpr double alpha_t = 0.60;
+        constexpr double alpha_r = 0.55;
+        const cv::Matx33d R_rel = _track_pose.R.t() * cand.R;
+        cv::Vec3d rvec(0.0, 0.0, 0.0);
+        cv::Rodrigues(cv::Mat(R_rel), rvec);
+        const double ang_rad = cv::norm(rvec);
+        const double ang_deg = ang_rad * 180.0 / 3.14159265358979323846;
+
+        cand.t = (1.0 - alpha_t) * _track_pose.t + alpha_t * cand.t;
+        if (ang_rad > 1e-6 && ang_deg < 40.0) {
+            cv::Mat R_step_m;
+            cv::Rodrigues(rvec * alpha_r, R_step_m);
+            cv::Matx33d R_step;
+            R_step_m.copyTo(R_step);
+            cand.R = _track_pose.R * R_step;
+        }
+        if (cb.finalizeGeometry) {
+            cb.finalizeGeometry(cand, intr, w, h);
+        }
     }
 
     _state = TrackState::TRACKING;

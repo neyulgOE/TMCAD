@@ -554,10 +554,19 @@ bool CADSceneSegmenter::fitSupportPlaneRANSAC(const std::vector<cv::Vec3f>& pts,
 
     if (_floor_standing_mode) {
         // FLOOR_STANDING branch preserved verbatim for TABLE-DEMO accuracy
+        // Lấy 35% điểm thấp nhất (p[1] lớn nhất trong hệ OpenCV +Y xuống) làm ứng viên sàn
+        // để không bao giờ gom nhầm mặt bàn khi camera đặt cao > 1.36 m nhìn chúc xuống.
+        std::vector<float> ys;
+        ys.reserve(pts.size());
+        for (const auto& p : pts) ys.push_back(p[1]);
+        const size_t q65_idx = (ys.size() * 65) / 100;
+        std::nth_element(ys.begin(), ys.begin() + static_cast<std::ptrdiff_t>(q65_idx), ys.end());
+        const float y_floor_cut = ys[q65_idx];
+
         std::vector<cv::Vec3f> floor_cands;
         floor_cands.reserve(pts.size() / 2);
         for (const auto& p : pts) {
-            if (p[1] > -0.05f) floor_cands.push_back(p);
+            if (p[1] >= y_floor_cut) floor_cands.push_back(p);
         }
         if (floor_cands.size() < 50) floor_cands = pts;
 
@@ -630,7 +639,7 @@ bool CADSceneSegmenter::fitSupportPlaneRANSAC(const std::vector<cv::Vec3f>& pts,
             best_plane = cv::Vec4d(n_svd[0], n_svd[1], n_svd[2], d_svd);
         }
 
-        if (best_plane[1] > -0.72) {
+        if (best_plane[1] > -0.30) {
             out_above_floor = pts;
             return false;
         }
